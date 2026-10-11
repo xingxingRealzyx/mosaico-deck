@@ -51,7 +51,7 @@ fi
 IMAGES=(
     0x2000  "$BUILD/bootloader/bootloader.bin"
     0x8000  "$BUILD/partition_table/partition-table.bin"
-    0x10000 "$BUILD/mosaico-fluidbox.bin"
+    0x10000 "$BUILD/mosaico-deck.bin"
 )
 for ((i = 1; i < ${#IMAGES[@]}; i += 2)); do
     if [ ! -f "${IMAGES[$i]}" ]; then
