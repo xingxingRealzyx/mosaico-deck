@@ -111,11 +111,20 @@ class Bridge:
             pass
 
     def _on_tap(self, x: int, y: int) -> None:
+        # **没有待回答的问询时，忽略点击。**
+        #
+        # 实测会多收到一次点击：手指点下去触发一次，而 ask_user 返回后立刻重画了
+        # 状态页（self.buttons 被换成状态页的按钮），紧接着松手/触摸抖动又上报
+        # 一次，落在同一个坐标上却已经没有对应按钮了 —— 日志里表现为
+        # "点中按钮 0" 紧跟一条 "点在空白处 (同样的坐标)"。
+        # 无害，但会让日志难读，而且以后给状态页接上"批准/拒绝"之后，这多出来
+        # 的一下可能会误触。
+        if self.pending is None or self.pending.done():
+            return
         for b in self.buttons:
             if b.hit(x, y):
                 print(f"[bridge] 点中按钮 {b.value} ({x},{y})", file=sys.stderr)
-                if self.pending is not None and not self.pending.done():
-                    self.pending.set_result(b.value)
+                self.pending.set_result(b.value)
                 return
         print(f"[bridge] 点在空白处 ({x},{y})", file=sys.stderr)
 
