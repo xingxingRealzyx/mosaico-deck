@@ -33,6 +33,7 @@ if [ -d "$DEST" ]; then
     cp "$HERE/plugin/render.py" "$DEST/render.py"
     cp "$HERE/plugin/package.json" "$DEST/package.json"
     cp "$HERE/plugin/cordis.patch.yml" "$DEST/cordis.patch.yml"
+    cp "$HERE/plugin/selftest.mjs" "$DEST/selftest.mjs"
 else
     echo "  首次安装（需要 profile 里声明 bundle）"
     "$DSH" plugin --profile "$PROFILE" add "file:$HERE/plugin"
@@ -48,6 +49,19 @@ if 'dsh-mosaico-deck' not in b:
 else:
     print('  bundles 里已经有了')
 PY
+fi
+
+echo
+# 自检必须在**安装后的副本**上跑 —— ESM 的裸模块名（@deepseek-ai/*）是按
+# 导入方所在路径解析的，从仓库里那份跑会找不到。
+NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
+if [ -x "$NODE" ] && [ -f "$DEST/selftest.mjs" ]; then
+    echo
+    echo "=== 加载自检（重启前预演，防止插件异常导致 DSH 起不来）==="
+    ( cd "$DSH_HOME/profiles/$PROFILE" && "$NODE" "$DEST/selftest.mjs" ) || {
+        echo "❌ 自检没过，**先别重启**"
+        exit 1
+    }
 fi
 
 echo
