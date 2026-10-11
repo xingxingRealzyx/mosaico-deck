@@ -41,7 +41,11 @@ import { render, checkEnvironment } from './render.js';
 export const name = 'mosaico-deck';
 export const inject = ['tools'];
 
-// Reconnect backoff. **Do not poll the port aggressively.**
+// Port polling policy: **at most one attempt at startup, then nothing.**
+//
+// There is only one CDC port on this board (CONFIG_TINYUSB_CDC_COUNT=1), so the
+// plugin and the flasher cannot share it. Even a couple of retries is enough to
+// yank a chip out of ROM download mode at the wrong moment.
 //
 // On this board, opening /dev/cu.usbmodem* asserts DTR and RTS -- that is a
 // hardware fact, not a firmware quirk (flash-rom.sh documents the same trap).
@@ -54,8 +58,6 @@ export const inject = ['tools'];
 // So: try at startup, then back off hard and stop retrying. If the board shows
 // up later, the user can reconnect from the host; what must never happen is
 // this plugin fighting an ongoing flash.
-const RECONNECT_MS = 5000;
-const RECONNECT_MAX = 3; // then give up and leave the port alone
 const TICK_MS = 1000;
 
 // Wait this long after connecting before pushing the first frame. The board is
@@ -243,19 +245,13 @@ export function apply(ctx) {
         return true;
     }
 
-    connect();
-    let attempts = 1;
-    const reconnectTimer = setInterval(() => {
-        if (deck.connected || attempts >= RECONNECT_MAX) {
-            if (attempts >= RECONNECT_MAX && !deck.connected) {
-                clearInterval(reconnectTimer);
-                ctx.logger?.info?.('mosaico-deck: board not found, stopped probing the port');
-            }
-            return;
-        }
-        attempts += 1;
-        connect();
-    }, RECONNECT_MS);
+    if (!connect()) {
+        ctx.logger?.info?.(
+            'mosaico-deck: board not found. Not probing again -- opening the port '
+            + 'asserts DTR/RTS and would kick a chip out of ROM download mode. '
+            + 'Call deck_connect once the board is running.',
+        );
+    }
 
     const tickTimer = setInterval(() => {
         if (!deck.connected) return;
@@ -269,7 +265,6 @@ export function apply(ctx) {
     }, TICK_MS);
 
     ctx.on('dispose', () => {
-        clearInterval(reconnectTimer);
         clearInterval(tickTimer);
         deck.close();
     });
@@ -281,6 +276,24 @@ export function apply(ctx) {
         schema: { type: 'json' },
         render: (_args, value) => [{ type: 'text', text: pick(value) }],
     });
+
+    ctx.tools.register(defineTool({
+        name: 'deck_connect',
+        description:
+            'Connect to the mosaico-deck device. The plugin tries once at startup; if the '
+            + 'device was not attached then (not plugged in, or the chip was in ROM '
+            + 'download mode) call this after it is running. Opening the serial port '
+            + 'asserts DTR/RTS, which is the reset signal in download mode, so this is '
+            + 'deliberately explicit rather than automatic.',
+        parameters: {},
+        output: textOutput((v) => v.message),
+        async execute() {
+            if (deck.connected) return { message: 'already connected' };
+            if (!connect()) return { message: `no board found on ${findPort() ?? 'any port'}` };
+            return { message: `connected to ${deck.port}` };
+        },
+        presentCall: () => ({ card: 'generic', kind: 'read', title: 'Connect to device' }),
+    }));
 
     ctx.tools.register(defineTool({
         name: 'deck_speak',
