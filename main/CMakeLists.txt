@@ -5,7 +5,8 @@ idf_component_register(
         config
         osal
         display
-        link
+        hostlink
+        audio
         input
         touch
         usb_console

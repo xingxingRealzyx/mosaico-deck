@@ -33,8 +33,9 @@
 #include "display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "audio.h"
 #include "input.h"
-#include "link.h"
+#include "hostlink.h"
 #include "osal.h"
 #include "touch.h"
 #include "usb_console.h"
@@ -240,7 +241,7 @@ void RenderTask(void* arg) {
     bool first = true;
     bool gave_up = false;
     for (;;) {
-        if (link::RemoteOwnsScreen()) {
+        if (hostlink::RemoteOwnsScreen()) {
             if (!gave_up) {
                 gave_up = true;
                 ESP_LOGI(kTag, "PC 已接管屏幕，本地自检图案停止");
@@ -268,31 +269,54 @@ void RenderTask(void* arg) {
 void TouchTask(void* arg) {
     (void)arg;
     bool was_active = false;
+    bool rec_held = false;
     int64_t last_button_us = osal::TimeUs();
     for (;;) {
         g_touch.Poll();
         const fluidbox::touch::State ts = g_touch.Get();
         if (ts.active != was_active) {
             was_active = ts.active;
-            link::SendTouch(ts.active, ts.x, ts.y);
+            hostlink::SendTouch(ts.active, ts.x, ts.y);
             ESP_LOGI(kTag, "触摸 %s (%d,%d)", ts.active ? "按下" : "抬起", ts.x, ts.y);
         }
 
         // 按键也在这里轮询 —— 单独起一个任务只为了每 25ms 读一次 GPIO 不值得。
+        //
+        // 按键的两个用途：
+        //   · **按住 = 说话**（最自然的交互：想说就说，不用在屏幕上找按钮）
+        //   · 单击 = 取消当前的问询（PC 侧处理）
         const int64_t now = osal::TimeUs();
         if (now - last_button_us >= 25 * 1000) {
             last_button_us = now;
-            switch (g_button.Poll()) {
-                case input::ResetButton::Event::kShortPress:
-                    link::SendKey("short");
-                    ESP_LOGI(kTag, "按键：短按");
-                    break;
-                case input::ResetButton::Event::kLongPress:
-                    link::SendKey("long");
-                    ESP_LOGI(kTag, "按键：长按");
-                    break;
-                default:
-                    break;
+
+            // 先看电平：按住期间持续录音。
+            const bool held = g_button.IsPressed();
+            if (held != rec_held) {
+                rec_held = held;
+                if (held) {
+                    hostlink::StartCapture();
+                    ESP_LOGI(kTag, "按键按下 -> 开始录音");
+                } else {
+                    hostlink::StopCapture();
+                    ESP_LOGI(kTag, "按键松开 -> 停止录音");
+                    hostlink::SendKey("voice_end");
+                }
+                // 录音期间的按下/松开不再当作短按长按上报，避免 PC 侧收到
+                // 一个"短按"然后又收到一段语音，语义打架。
+                (void)g_button.Poll();
+            } else {
+                switch (g_button.Poll()) {
+                    case input::ResetButton::Event::kShortPress:
+                        hostlink::SendKey("short");
+                        ESP_LOGI(kTag, "按键：短按");
+                        break;
+                    case input::ResetButton::Event::kLongPress:
+                        hostlink::SendKey("long");
+                        ESP_LOGI(kTag, "按键：长按");
+                        break;
+                    default:
+                        break;
+                }
             }
         }
 
@@ -323,7 +347,10 @@ void StatsTask(void* arg) {
         // 之前 db 直接打出来，于是 1872 这个"每 2 秒的次数"看着像频率，
         // 和 58.5 fps 对不上（1872/58.5 不是整数）。除以 dt 之后是 936 band/s
         // = 58.5 fps × 16 条，才对得上。
-        const link::Stats ls = link::GetStats();
+        const hostlink::Stats ls = hostlink::GetStats();
+        ESP_LOGI(kTag, "音频 放音%u 录音%u 块 | %s",
+                 static_cast<unsigned>(ls.audio_in), static_cast<unsigned>(ls.audio_out),
+                 hostlink::Capturing() ? "正在录音" : "空闲");
         ESP_LOGI(kTag, "链路 帧%u band%u 整屏%u 控制%u | 坏帧头%u 坏长度%u 超时%u | RX溢出%u",
                  static_cast<unsigned>(ls.frames), static_cast<unsigned>(ls.bands),
                  static_cast<unsigned>(ls.full), static_cast<unsigned>(ls.ctrl),
@@ -407,11 +434,20 @@ extern "C" void app_main(void) {
     // 控制脚，屏幕要是还亮着，烧 flash 的电流尖峰就可能把供电拉崩。
     usb_console::SetPreRestartHook([]() { g_panel.PrepareForBootloader(); });
 
+    // ---- 音频 ----
+    // ES8311 挂在 I2C 上，所以必须在 I2C 总线建好之后。
+    // 失败了不影响显示和触摸，只是不能说话/听。
+    if (g_i2c_bus != nullptr) {
+        if (audio::Init(g_i2c_bus) != ESP_OK) {
+            ESP_LOGW(kTag, "音频初始化失败，设备不能说话也不能听");
+        }
+    }
+
     // ---- 链路 ----
     // SetPanel 必须在 Init 之前 —— link 不认识面板从哪来，由 main 决定。
     // 面板没就绪时传 nullptr 也合法：link 照常收帧、只是不显示（否则流会错位）。
-    link::SetPanel(g_panel.ready() ? &g_panel : nullptr);
-    link::Init();
+    hostlink::SetPanel(g_panel.ready() ? &g_panel : nullptr);
+    hostlink::Init();
 
     // ---- 起任务 ----
     static osal::Task render_task;

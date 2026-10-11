@@ -1,7 +1,14 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// link.h —— PC ↔ 板子的 USB 链路
+// hostlink.h —— PC ↔ 板子的 USB 链路
+//
+// 名字为什么不是 link
+// ----------------
+// **`link` 是 POSIX 的系统调用名**（unistd.h 里的 `int link(const char*, const char*)`）。
+// 用它当命名空间，一旦某个头文件间接牵进 unistd.h 就会报
+// "redeclared as different kind of entity" —— 而且报错点在系统头里，很难看出原因。
+// 本工程实际踩过这一次。
 //
 // 协议
 // ----
@@ -15,6 +22,8 @@
 //     type 0x01 = 一条 band：payload = idx(1B) + 480×30×2 像素（RGB565，已转字节序）
 //     type 0x02 = 整屏：    payload = 480×480×2 像素
 //     type 0x10 = 控制：    payload = 一行 JSON（UTF-8，不带换行）
+//     type 0x20 = 放音：    payload = 交错立体声 16 位 PCM（48kHz）
+//     type 0x21 = 录音控制：payload = 一行 JSON（{"cmd":"start"|"stop"}）
 //
 // 板子 → PC：**JSON 行**（都是小消息，可读性比省几个字节重要）
 //
@@ -24,6 +33,12 @@
 //     {"t":"key","ev":"short"|"long"}
 //     {"t":"ack","band":3}
 //     {"t":"err","msg":"..."}
+//     {"t":"audio","bytes":N}\n 后跟 N 字节 PCM —— **录音走这条**
+//
+// 录音为什么是"先一行 JSON 报长度、再跟裸数据"而不是纯二进制帧：
+// 板子到 PC 这个方向平时全是 JSON 行，PC 侧按行读最省事。只有音频要传二进制，
+// 于是用"长度先行的行 + 裸数据"最小限度地把两种形态拼在一起 —— PC 侧读一行、
+// 再按长度读 N 字节即可，不需要在流里重新找同步点。
 //
 // 为什么板子侧**不需要帧缓冲**
 // ------------------------
@@ -38,7 +53,7 @@
 
 #include "esp_err.h"
 
-namespace link {
+namespace hostlink {
 
 // 注入要驱动的面板。**必须在 Init() 之前调用** —— link 不认识面板从哪来，
 // 由 main 决定（这样 link 也不依赖 display 的具体构造方式）。
@@ -47,6 +62,14 @@ void SetPanel(void* panel);
 
 // 建 RX 任务并挂上输入上报。USB 控制台必须先 Init()。
 esp_err_t Init();
+
+// 开始/停止把麦克风的数据推给 PC。
+//
+// 由 AI 按键驱动（按住录、松开停）—— 这是最自然的交互：想说就说，不用在屏幕上
+// 找按钮。PCM 是 48kHz 交错立体声 16 位，约 192KB/s，USB 完全带得动。
+void StartCapture();
+void StopCapture();
+bool Capturing();
 
 // 上报输入。由触摸/按键任务调用 —— 内部会加锁，可以多任务并发。
 void SendTouch(bool down, int x, int y);
@@ -70,7 +93,9 @@ struct Stats {
     uint32_t bad_magic = 0;  // 帧头对不上（通常意味着前面丢了字节）
     uint32_t bad_len = 0;   // 长度越界
     uint32_t rx_timeout = 0;  // 收 payload 时超时（对方断流了）
+    uint32_t audio_in = 0;    // 收到的放音帧数
+    uint32_t audio_out = 0;   // 推上去的录音块数
 };
 Stats GetStats();
 
-}  // namespace link
+}  // namespace hostlink

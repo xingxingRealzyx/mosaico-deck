@@ -32,6 +32,8 @@ MAGIC = b"\xde\xad"
 TYPE_BAND = 0x01
 TYPE_FULL = 0x02
 TYPE_CTRL = 0x10
+TYPE_AUDIO = 0x20   # PC -> 板子：放音 PCM
+TYPE_REC = 0x21     # PC -> 板子：录音控制
 
 H_RES = 480
 V_RES = 480
@@ -74,9 +76,11 @@ class Deck:
     线程安全：发送有锁。事件由后台线程读，通过回调交出去。
     """
 
-    def __init__(self, port: str, on_event: Callable[[dict], None] | None = None):
+    def __init__(self, port: str, on_event: Callable[[dict], None] | None = None,
+                 on_audio: Callable[[bytes], None] | None = None):
         self.port = port
         self.on_event = on_event
+        self.on_audio = on_audio
         self._ser: serial.Serial | None = None
         self._tx = threading.Lock()
         self._last: Image.Image | None = None
@@ -84,6 +88,7 @@ class Deck:
         self._stop = threading.Event()
         self.stats = Stats()
         self._rx_buf = b""
+        self._pending_audio: int | None = None
 
     # ---- 连接 --------------------------------------------------------------
     def open(self, wait_ready: float = 6.0) -> None:
@@ -150,6 +155,49 @@ class Deck:
         self.stats.last_send_ms = (time.time() - t0) * 1000
         return len(changed)
 
+    # ---- 音频 --------------------------------------------------------------
+    def speak_pcm(self, pcm: bytes, chunk: int = 2048, pace: bool = True) -> float:
+        """把 48kHz 交错立体声 16 位 PCM 推给板子播放。返回耗时秒数。
+
+        **必须按播放速率发送，不能一口气灌进去。**
+
+        这里踩过一个坑：一开始分块 8192 字节、循环里直接连着发，结果 99 个分块
+        板子只收到 5 个 —— 板子的 RX 环形缓冲（32KB）瞬间被灌满，剩下的全丢了。
+
+        原因是板子**边收边播**，而播放是实时的：`audio::Play()` 会阻塞到 I2S DMA
+        收下这段，所以板子的消费速度被钉死在 192KB/s（48kHz×立体声×16位）。
+        PC 一口气发是 ~1.4MB/s，比它快 7 倍以上，缓冲再大也没用。
+
+        所以按真实速率发。代价是"发送"本身要花掉音频时长，但反正它也要播这么久
+        —— 而且**第一个分块立刻就播**，所以从调用到出声只有十几毫秒。
+
+        **超前量必须控制住，不能拍脑袋定。** 第一次用 0.9 倍速（超前 11%），
+        4.2 秒的语音攒出 88KB 的超前，而板子的环形缓冲只有 32KB —— 照样溢出。
+        0.97 的话 4.2 秒只超前 16KB，稳在缓冲之内。
+        """
+        bytes_per_sec = 48000 * 4  # 48kHz × 立体声 × 16bit
+        t0 = time.time()
+        sent = 0
+        for i in range(0, len(pcm), chunk):
+            piece = pcm[i:i + chunk]
+            self._send_frame(TYPE_AUDIO, piece)
+            sent += len(piece)
+            if pace and len(piece) == chunk:
+                # 目标：发完 N 字节时，理想时刻是 N/bytes_per_sec。
+                # 0.97 = 超前 3%：4 秒的音频只领先约 16KB，而板子的环形缓冲是
+                # 64KB —— 既保证不欠载，又不会把它灌满。
+                target = t0 + sent / bytes_per_sec * 0.97
+                slack = target - time.time()
+                if slack > 0:
+                    time.sleep(slack)
+        return time.time() - t0
+
+    def start_capture(self) -> None:
+        self._send_frame(TYPE_REC, b'{"cmd":"start"}')
+
+    def stop_capture(self) -> None:
+        self._send_frame(TYPE_REC, b'{"cmd":"stop"}')
+
     def send_ctrl(self, obj: dict) -> None:
         import json
 
@@ -167,8 +215,27 @@ class Deck:
         if n:
             self._rx_buf += self._ser.read(n)
 
-        while b"\n" in self._rx_buf:
-            line, self._rx_buf = self._rx_buf.split(b"\n", 1)
+        while True:
+            # 先看有没有"音频头 + 裸数据"待收。
+            #
+            # 板子到 PC 这个方向平时全是 JSON 行，只有录音会发二进制：先一行
+            # {"t":"audio","bytes":N}，紧跟 N 字节 PCM。所以要先按行找到那个头，
+            # 再按长度把裸数据读走 —— **不能当行读**，PCM 里全是 \n。
+            if self._pending_audio is not None:
+                need = self._pending_audio
+                if len(self._rx_buf) < need:
+                    return  # 等数据
+                pcm = self._rx_buf[:need]
+                self._rx_buf = self._rx_buf[need:]
+                self._pending_audio = None
+                if self.on_audio is not None:
+                    self.on_audio(pcm)
+                continue
+
+            nl = self._rx_buf.find(b"\n")
+            if nl < 0:
+                return
+            line, self._rx_buf = self._rx_buf[:nl], self._rx_buf[nl + 1:]
             text = line.decode("utf-8", "replace").strip()
             if not text:
                 continue
@@ -180,6 +247,10 @@ class Deck:
             try:
                 ev = json.loads(text)
             except json.JSONDecodeError:
+                continue
+            if ev.get("t") == "audio" and isinstance(ev.get("bytes"), int):
+                # 记下要读多少裸数据，下一轮循环处理
+                self._pending_audio = ev["bytes"]
                 continue
             if self.on_event is not None:
                 self.on_event(ev)

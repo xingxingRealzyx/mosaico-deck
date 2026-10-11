@@ -3,22 +3,26 @@
 //
 // link.cpp —— PC ↔ 板子的 USB 链路
 
-#include "link.h"
+#include "hostlink.h"
 
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
+#include <atomic>
+#include <cstdio>
+
+#include "audio.h"
 #include "display.h"
 #include "esp_log.h"
 #include "fbox/config.h"
 #include "osal.h"
 #include "usb_console.h"
 
-namespace link {
+namespace hostlink {
 namespace {
 
-constexpr const char* kTag = "link";
+constexpr const char* kTag = "hostlink";
 
 // 二进制帧的魔数。用两个字节而不是一个：流一旦错位，单字节魔数很容易碰巧命中，
 // 双字节就基本不会（1/65536），而且错位之后能靠它重新对齐。
@@ -28,9 +32,32 @@ constexpr uint8_t kMagic1 = 0xAD;
 constexpr uint8_t kTypeBand = 0x01;
 constexpr uint8_t kTypeFull = 0x02;
 constexpr uint8_t kTypeCtrl = 0x10;
+constexpr uint8_t kTypeAudio = 0x20;
+constexpr uint8_t kTypeRec = 0x21;
+
+// 放音/录音的分块大小。
+//
+// 放音时 PC 一次发多少我们收多少，但**不能收一大块再播** —— 那样延迟会累积。
+// 2KB 在 48kHz 立体声下是 10.7ms，正好在"不卡"和"不碎"之间。
+//
+// ⚠️ **这个缓冲必须是 static，不能放栈上。**
+// 最初写成 `uint8_t buf[kAudioChunk]`（4096）而 link_rx 任务栈也正好是 4096 ——
+// 一进 HandleAudio 就爆栈复位。症状是"一发音频板子就重启"，而且没有任何
+// 可读的错误信息（栈溢出不会打 backtrace，直接复位）。
+// 嵌入式的栈通常只有几 KB，任何超过几百字节的缓冲都不该放栈上。
+constexpr size_t kAudioChunk = 2048;
+
+// 录音每次读多少推上去。
+constexpr size_t kRecChunk = 4096;
 
 constexpr size_t kBandPayload = 1 + fluidbox::config::kBandPixels * 2;      // idx + 像素
 constexpr size_t kFullPayload = fluidbox::config::kLcdHRes * fluidbox::config::kLcdVRes * 2;
+
+// 单个音频帧的 payload 上限：1 秒的 48kHz 立体声 = 192KB。
+// 给 256KB 的余量，再大就是协议出问题了。
+constexpr uint32_t kAudioPayloadMax = 256 * 1024;
+
+std::atomic<bool> g_capturing{false};
 
 display::Panel* g_panel = nullptr;
 Stats g_stats;
@@ -104,23 +131,43 @@ RxStream g_rx;
 // ---------------------------------------------------------------------------
 void SendLine(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
-void SendLine(const char* fmt, ...) {
+// 发一行的内部实现。**调用方必须已经持有 g_tx_lock。**
+size_t SendLineLocked(const char* fmt, va_list ap) {
     char buf[192];
-    va_list ap;
-    va_start(ap, fmt);
     const int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
-    va_end(ap);
     if (n <= 0) {
-        return;
+        return 0;
     }
     size_t len = (static_cast<size_t>(n) < sizeof(buf) - 2) ? static_cast<size_t>(n)
                                                             : sizeof(buf) - 2;
     buf[len++] = '\n';
-    buf[len] = '\0';
-
-    // 加锁：触摸任务和按键任务都会走到这里。
-    osal::LockGuard<osal::Mutex> guard(*g_tx_lock);
     usb_console::Write(reinterpret_cast<const uint8_t*>(buf), len);
+    return len;
+}
+
+void SendLine(const char* fmt, ...) {
+    osal::LockGuard<osal::Mutex> guard(*g_tx_lock);
+    va_list ap;
+    va_start(ap, fmt);
+    SendLineLocked(fmt, ap);
+    va_end(ap);
+}
+
+// **一行 JSON 紧跟一段裸二进制，必须在同一个锁里发完。**
+//
+// 否则日志会插到中间 —— PC 侧按"读一行、再读 N 字节"解析，插一行日志就全乱了。
+// （一开始想用可变参数把数据一起传进来，但 va_list 里取不到二进制指针，
+//   所以拆成这个专门的函数，头和行为一体。）
+void SendAudioUp(const void* data, size_t len) {
+    osal::LockGuard<osal::Mutex> guard(*g_tx_lock);
+    char head[96];
+    const int n = snprintf(head, sizeof(head), "{\"t\":\"audio\",\"bytes\":%u}\n",
+                           static_cast<unsigned>(len));
+    if (n > 0) {
+        usb_console::Write(reinterpret_cast<const uint8_t*>(head),
+                           static_cast<size_t>(n));
+    }
+    usb_console::Write(static_cast<const uint8_t*>(data), len);
 }
 
 void HandleCtrl(const uint8_t* payload, size_t len) {
@@ -230,6 +277,65 @@ void HandleBand(bool full_frame) {
     }
 }
 
+// 收一块放一块 —— **不做整段缓冲**。
+//
+// 一次 speak 可能几百 KB（5 秒的 48kHz 立体声就快 1MB），全收下来再播既慢又占内存。
+// 边收边播的话，从 PC 开始发到出声只有几十毫秒。
+void HandleAudio(uint32_t len) {
+    if (!audio::ready()) {
+        // 音频没起来也要把数据读掉，否则流会错位
+        uint8_t sink[256];
+        uint32_t left = len;
+        while (left > 0) {
+            const size_t n = (left < sizeof(sink)) ? left : sizeof(sink);
+            if (g_rx.Read(sink, n, 1000) != n) {
+                g_stats.rx_timeout = g_stats.rx_timeout + 1;
+                return;
+            }
+            left -= static_cast<uint32_t>(n);
+        }
+        return;
+    }
+
+    // static：见上面 kAudioChunk 的说明。只有一个调用者（link_rx 任务），
+    // 所以不需要加锁。
+    static uint8_t buf[kAudioChunk];
+    uint32_t left = len;
+    while (left > 0) {
+        const size_t n = (left < sizeof(buf)) ? left : sizeof(buf);
+        if (g_rx.Read(buf, n, 1000) != n) {
+            g_stats.rx_timeout = g_stats.rx_timeout + 1;
+            return;
+        }
+        audio::Play(buf, n, 1000);
+        left -= static_cast<uint32_t>(n);
+    }
+    g_stats.audio_in = g_stats.audio_in + 1;
+}
+
+// 录音：读麦克风 -> 推给 PC。
+//
+// 由 AI 按键驱动（按住录、松开停）。速率是 48kHz 立体声 = 192KB/s，
+// 而 USB 满速是 1.5MB/s，带宽绰绰有余。
+void CaptureTask(void* arg) {
+    (void)arg;
+    static uint8_t buf[kRecChunk];
+
+    for (;;) {
+        if (!g_capturing.load()) {
+            osal::Delay(10);
+            continue;
+        }
+        const size_t got = audio::Record(buf, sizeof(buf), 100);
+        if (got == 0) {
+            osal::Delay(1);
+            continue;
+        }
+        SendAudioUp(buf, got);
+        g_stats.audio_out = g_stats.audio_out + 1;
+    }
+}
+
 void RxTask(void* arg) {
     (void)arg;
     ESP_LOGI(kTag, "链路接收任务启动");
@@ -262,9 +368,11 @@ void RxTask(void* arg) {
                              (static_cast<uint32_t>(header[4]) << 24);
 
         // 长度上限检查。不检查的话一个坏长度会让板子去等几 MB 的数据。
-        const uint32_t max_len = (type == kTypeFull)  ? kFullPayload
-                                 : (type == kTypeBand) ? kBandPayload
-                                                       : kCtrlMax;
+        const uint32_t max_len = (type == kTypeFull)    ? kFullPayload
+                                 : (type == kTypeBand)  ? kBandPayload
+                                 : (type == kTypeAudio) ? kAudioPayloadMax
+                                 : (type == kTypeRec)   ? kCtrlMax
+                                                        : kCtrlMax;
         if (len > max_len) {
             g_stats.bad_len = g_stats.bad_len + 1;
             ESP_LOGW(kTag, "帧长度越界 type=0x%02X len=%u (上限 %u)", type,
@@ -279,6 +387,21 @@ void RxTask(void* arg) {
             HandleBand(false);
         } else if (type == kTypeFull) {
             HandleBand(true);
+        } else if (type == kTypeAudio) {
+            HandleAudio(len);
+        } else if (type == kTypeRec) {
+            // 录音控制：{"cmd":"start"} / {"cmd":"stop"}
+            uint8_t payload[kCtrlMax];
+            if (g_rx.Read(payload, len, 1000) == len) {
+                payload[len < kCtrlMax ? len : kCtrlMax - 1] = '\0';
+                const bool start = strstr(reinterpret_cast<char*>(payload), "start") != nullptr;
+                g_capturing.store(start);
+                ESP_LOGI(kTag, "录音 %s", start ? "开始" : "停止");
+                SendLine("{\"t\":\"ack\",\"rec\":%s}", start ? "true" : "false");
+            } else {
+                g_stats.rx_timeout = g_stats.rx_timeout + 1;
+                g_rx.Resync();
+            }
         } else if (type == kTypeCtrl) {
             uint8_t payload[kCtrlMax];
             if (g_rx.Read(payload, len, 1000) == len) {
@@ -317,14 +440,25 @@ esp_err_t Init() {
     // 优先级更高的接收任务抢占、立刻取走 —— 缓冲再也不会积压。
     //
     // 不会饿死 USB：接收任务阻塞在环形缓冲的 Receive 上，没数据就主动让出。
+    static osal::Task capture_task;
+    capture_task.Create(CaptureTask, nullptr,
+                        {.name = "link_cap", .stack_size = 4096, .priority = 5,
+                         .core = osal::CoreAffinity::kCore1});
+
+    // 栈给 6144：这条任务要走 HandleAudio / HandleBand / HandleCtrl 三条路径，
+    // 都比"只收一行 JSON"重。之前 4096 配一个 4096 的栈上缓冲直接爆过。
     static osal::Task rx_task;
     rx_task.Create(RxTask, nullptr,
-                   {.name = "link_rx", .stack_size = 4096, .priority = 6,
+                   {.name = "link_rx", .stack_size = 6144, .priority = 6,
                     .core = osal::CoreAffinity::kCore1});
 
     ESP_LOGI(kTag, "链路已启动");
     return ESP_OK;
 }
+
+void StartCapture() { g_capturing.store(true); }
+void StopCapture() { g_capturing.store(false); }
+bool Capturing() { return g_capturing.load(); }
 
 void SendTouch(bool down, int x, int y) {
     if (g_tx_lock == nullptr) {
@@ -356,4 +490,4 @@ bool RemoteOwnsScreen() {
 
 Stats GetStats() { return g_stats; }
 
-}  // namespace link
+}  // namespace hostlink

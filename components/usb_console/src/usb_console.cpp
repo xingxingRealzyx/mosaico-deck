@@ -85,7 +85,8 @@ PreRestartHook g_pre_restart_hook = nullptr;
 
 // 收到的字节先进这里，由调用方取出解析。
 //
-// **32KB** —— 必须放得下一条 band 的 payload（480×30×2 = 28800 字节）。
+// **64KB** —— 必须放得下一条 band 的 payload（480×30×2 = 28800 字节），
+// 另外放音时 PC 会按播放速率推 PCM，超前量要吃得下（实测 4 秒音频约超前 16KB）。
 // 一开始给的是 4KB，结果传一条 band 中途必然溢出，而当时"满了就 break"的写法
 // 会让回调停止消费 USB FIFO → FIFO 满 → CDC 端点 NAK → **PC 侧 write 永久阻塞**。
 // 表现就是"PC 一发 28KB，两边一起卡死"。
@@ -255,7 +256,7 @@ esp_err_t Init() {
 
     // 2.5 接收环形缓冲 + RX 回调已经在上面注册。
     if (g_rx == nullptr) {
-        g_rx = new osal::RingBuffer(32768);
+        g_rx = new osal::RingBuffer(65536);
     }
 
     // 3. 重启定时器。

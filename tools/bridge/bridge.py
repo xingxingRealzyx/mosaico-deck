@@ -72,7 +72,7 @@ class Bridge:
     """
 
     def __init__(self, port: str):
-        self.deck = Deck(port, on_event=self._on_deck_event)
+        self.deck = Deck(port, on_event=self._on_deck_event, on_audio=self._on_deck_audio)
         self.state = DeckState()
         self.buttons: list[ui.Button] = []
         self.pending: asyncio.Future | None = None
@@ -81,6 +81,14 @@ class Bridge:
         self._dirty = False
         self.ask_options: list[str] = []
         self.auto_answer: int | None = None
+
+        # 录音：板子在 AI 按键按住期间把 PCM 推上来，这里攒起来。
+        self._rec_lock = threading.Lock()
+        self._rec_pcm = bytearray()
+        self._recording = False
+
+        # 状态页上的"批准/拒绝"用这个 future 接。
+        self.approval: asyncio.Future | None = None
 
     # ---- 生命周期 ----------------------------------------------------------
     async def start(self) -> None:
@@ -98,14 +106,23 @@ class Bridge:
             return
         self.loop.call_soon_threadsafe(self._handle_event, ev)
 
+    def _on_deck_audio(self, pcm: bytes) -> None:
+        """板子推上来的录音数据。**在接收线程里，只做攒数据。**"""
+        with self._rec_lock:
+            self._rec_pcm.extend(pcm)
+
     def _handle_event(self, ev: dict) -> None:
         kind = ev.get("t")
         if kind == "touch":
             if ev.get("ev") == "down":
                 self._on_tap(int(ev.get("x", 0)), int(ev.get("y", 0)))
         elif kind == "key":
-            # AI 按键 = 取消当前问询。物理按键比在屏幕上找"取消"更顺手。
-            if self.pending is not None and not self.pending.done():
+            ev_name = ev.get("ev", "")
+            if ev_name == "voice_end":
+                # 松开 AI 按键 = 说完了。交给录音的等待方。
+                print(f"[bridge] 录音结束（收到 {len(self._rec_pcm)} 字节）", file=sys.stderr)
+            elif self.pending is not None and not self.pending.done():
+                # 其他按键 = 取消当前问询。物理按键比在屏幕上找"取消"更顺手。
                 self.pending.set_result(None)
         elif kind == "ack":
             pass
@@ -119,13 +136,17 @@ class Bridge:
         # "点中按钮 0" 紧跟一条 "点在空白处 (同样的坐标)"。
         # 无害，但会让日志难读，而且以后给状态页接上"批准/拒绝"之后，这多出来
         # 的一下可能会误触。
-        if self.pending is None or self.pending.done():
-            return
         for b in self.buttons:
-            if b.hit(x, y):
-                print(f"[bridge] 点中按钮 {b.value} ({x},{y})", file=sys.stderr)
+            if not b.hit(x, y):
+                continue
+            print(f"[bridge] 点中按钮 {b.value} ({x},{y})", file=sys.stderr)
+            # 问询页的按钮和状态页的"批准/拒绝"共用一个按钮列表，
+            # 谁在等就交给谁。
+            if self.pending is not None and not self.pending.done():
                 self.pending.set_result(b.value)
-                return
+            elif self.approval is not None and not self.approval.done():
+                self.approval.set_result(b.value)
+            return
         print(f"[bridge] 点在空白处 ({x},{y})", file=sys.stderr)
 
     # ---- 渲染 --------------------------------------------------------------
@@ -143,9 +164,10 @@ class Bridge:
                 tests_passed=self.state.tests_passed,
                 tests_total=self.state.tests_total,
                 log=self.state.log,
-                buttons=[("批准", "approve"), ("继续", "continue")]
-                if self.state.state == "waiting"
-                else None,
+                # 有人在等批准时才画按钮 —— 平时画着是噪音，而且误触代价大。
+                buttons=([("批准", "approve"), ("拒绝", "deny")]
+                         if self.approval is not None and not self.approval.done()
+                         else None),
             )
         n = await asyncio.to_thread(self.deck.send_image, img, force_full)
         return n
@@ -232,6 +254,143 @@ class Bridge:
             return options[idx]
         return str(value)
 
+    async def speak(self, text: str, voice: str, rate: int) -> str:
+        """让设备说话。
+
+        用 macOS 的 `say` 合成、`ffmpeg` 转成板子要的格式，再按播放速率推下去。
+
+        **为什么 TTS 放在 PC 上**：板子只有 512KB SRAM、没有神经网络加速，
+        跑不了任何像样的 TTS。而 PC 上的 `say` 是系统自带的、音质好、还支持中文。
+        板子只负责把 PCM 播出来 —— 这也是整个架构的思路。
+        """
+        import subprocess
+        import tempfile
+
+        if not text.strip():
+            return "文本为空"
+
+        with tempfile.TemporaryDirectory() as td:
+            aiff = f"{td}/t.aiff"
+            pcm = f"{td}/t.pcm"
+            cmd = ["say", "-o", aiff]
+            if voice:
+                cmd += ["-v", voice]
+            if rate > 0:
+                cmd += ["-r", str(rate)]
+            cmd.append(text)
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", aiff,
+                     "-f", "s16le", "-acodec", "pcm_s16le",
+                     "-ar", "48000", "-ac", "2", pcm],
+                    check=True, capture_output=True, timeout=60)
+            except FileNotFoundError as e:
+                return f"缺少命令: {e.filename}（macOS 自带 say；ffmpeg 需要 brew install）"
+            except subprocess.CalledProcessError as e:
+                return f"合成失败: {e}"
+            except subprocess.TimeoutExpired:
+                return "合成超时"
+
+            data = Path(pcm).read_bytes()
+
+        secs = len(data) / 48000 / 4
+        await asyncio.to_thread(self.deck.speak_pcm, data)
+        return f"说完了（{secs:.1f} 秒）"
+
+    async def listen(self, timeout_s: float) -> tuple[str, str]:
+        """等用户按住 AI 按键说一段话，把 WAV 存下来并尝试转成文字。
+
+        返回 (文本, 说明)。**STT 是可配置的** —— 本地没有装识别引擎，
+        所以默认只存 WAV 并告诉你路径；配了 DECK_STT_CMD 就自动转文字。
+        """
+        import os
+        import subprocess
+        import tempfile
+        import wave
+
+        with self._rec_lock:
+            self._rec_pcm.clear()
+
+        await self.display_status(state="waiting", detail="按住 AI 按键说话",
+                                  target="松手结束", log_line="在等你的语音")
+        print("[bridge] 等用户按住 AI 按键…", file=sys.stderr)
+
+        # 等录音开始（板子收到按键后开始推数据），再等它结束。
+        t0 = time.time()
+        started = False
+        while time.time() - t0 < timeout_s:
+            if not started and len(self._rec_pcm) > 0:
+                started = True
+                print("[bridge] 检测到录音开始", file=sys.stderr)
+            if started and len(self._rec_pcm) > 0:
+                # 连续 700ms 没有新数据就认为说完了
+                n = len(self._rec_pcm)
+                await asyncio.sleep(0.7)
+                if len(self._rec_pcm) == n:
+                    break
+            await asyncio.sleep(0.05)
+
+        with self._rec_lock:
+            data = bytes(self._rec_pcm)
+
+        if not data:
+            return "", "没听到任何声音（按住 AI 按键时才会录音）"
+
+        out_dir = Path(tempfile.gettempdir()) / "mosaico-deck"
+        out_dir.mkdir(exist_ok=True)
+        wav_path = out_dir / f"voice_{int(time.time())}.wav"
+        with wave.open(str(wav_path), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(48000)
+            w.writeframes(data)
+
+        secs = len(data) / 48000 / 4
+        stt_cmd = os.environ.get("DECK_STT_CMD", "")
+        if not stt_cmd:
+            return "", (f"录到 {secs:.1f} 秒，已存到 {wav_path}。"
+                        f"要自动转文字，设环境变量 DECK_STT_CMD 为一条"
+                        f"「接收 wav 路径、往 stdout 打文字」的命令。")
+
+        try:
+            # 用 shell 是为了让用户能写带参数的命令（例如 `whisper --model small`）
+            r = subprocess.run(f'{stt_cmd} "{wav_path}"', shell=True,
+                               capture_output=True, text=True, timeout=300)
+            text = r.stdout.strip()
+            if not text:
+                return "", f"识别命令没有输出（stderr: {r.stderr.strip()[:200]}）"
+            return text, f"识别自 {secs:.1f} 秒语音（{wav_path}）"
+        except subprocess.TimeoutExpired:
+            return "", "识别超时"
+        except Exception as e:  # noqa: BLE001
+            return "", f"识别失败: {e}"
+
+    async def request_approval(self, summary: str, detail: str) -> str:
+        """显示一个待批准的改动，等用户在设备上按「批准」或「拒绝」。
+
+        和 ask_user 的区别：这个是状态页 + 两个固定按钮，适合"我要动一个危险操作，
+        你确认一下"这种场景；ask_user 是问一个问题、给若干选项。
+        """
+        loop = asyncio.get_running_loop()
+        self.approval = loop.create_future()
+        self.state.state = "waiting"
+        self.state.detail = summary
+        self.state.target = detail
+        self.state.log.append("等你批准")
+        await self.redraw(force_full=True)
+
+        try:
+            value = await asyncio.wait_for(self.approval, timeout=300)
+        except asyncio.TimeoutError:
+            value = "timeout"
+        finally:
+            self.approval = None
+            self.state.state = "running" if value == "approve" else "idle"
+            self.state.detail = f"你选择了：{value}"
+            await self.redraw(force_full=True)
+        return value
+
     async def notify(self, text: str, state: str = "waiting") -> str:
         """不阻塞地提示一下（状态页上加一行 + 状态变色）。"""
         self.state.log.append(text)
@@ -309,6 +468,43 @@ def build_mcp(bridge: Bridge):
         options 给 2~5 个（再多人就点不准了，屏幕只有 480×480）。
         """
         return await bridge.ask_user(question, options, timeout_s)
+
+    @mcp.tool(
+        description="**让设备开口说话。** 用当前机器的语音合成，通过 USB 送给设备播出来。"
+                    "适合「活干完了」「需要你看一眼」这类不需要打断但希望被知道的时刻 ——"
+                    "比弹通知好，因为它就在你桌上，而且不用你抬手。"
+    )
+    async def speak(text: str, voice: str = "", rate: int = 0) -> str:
+        """让设备把 text 念出来。
+
+        voice 是 macOS 的音色名（`say -v '?'` 可以列，中文常用 Tingting）。
+        空字符串表示用系统默认。rate 是语速（词/分），0 表示默认。
+        """
+        return await bridge.speak(text, voice, rate)
+
+    @mcp.tool(
+        description="**听用户说一段话。** 调用后设备会提示「按住 AI 按键说话」，"
+                    "用户按住说话、松手结束，然后把语音转成文字返回。"
+                    "适合需要用户给出较长、开放的回答时 —— 比在 480×480 上选按钮自然得多。"
+    )
+    async def listen(timeout_s: float = 60.0) -> str:
+        """等用户按住 AI 按键说一段话，返回识别出的文字。
+
+        如果这台机器没配语音识别（环境变量 DECK_STT_CMD），会返回一条说明，
+        里面带着录音 WAV 的路径。
+        """
+        text, note = await bridge.listen(timeout_s)
+        if text:
+            return f"{text}\n（{note}）"
+        return note
+
+    @mcp.tool(
+        description="在设备上请求人工批准一个危险或不可逆的操作，阻塞等待用户按"
+                    "「批准」或「拒绝」。返回 'approve' / 'deny' / 'timeout'。"
+    )
+    async def request_approval(summary: str, detail: str = "") -> str:
+        """显示一个待批准的操作，等用户按设备上的按钮。"""
+        return await bridge.request_approval(summary, detail)
 
     @mcp.tool(description="在设备上提示一条信息（不阻塞，立刻返回）。")
     async def notify(text: str, state: str = "waiting") -> str:

@@ -1,0 +1,24 @@
+{
+  "name": "dsh-mosaico-deck",
+  "version": "0.1.0",
+  "description": "把 DeepSeek Harness 的状态显示在桌面上的 mosaico-deck 设备上，并让它说话、问你问题",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/cordis": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./device.js": "./lib/device.js",
+    "./render.js": "./lib/render.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  }
+}

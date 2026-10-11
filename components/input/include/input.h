@@ -52,6 +52,12 @@ class ResetButton {
     // 力度，手一松就能立刻去摸屏幕感受新力度），等松手才反馈的话人已经离开屏幕了。
     Event Poll();
 
+    // 当前是否按着（去抖后的电平）。
+    //
+    // "按住说话"需要知道**持续按住**这件事，而不是按下/松开两个边沿 —— 用
+    // Poll() 的事件流来实现的话，得在 PC 侧记状态、还要处理丢事件的情况。
+    bool IsPressed() const { return raw_pressed_; }
+
  private:
     bool raw_pressed_ = false;   // 去抖后的电平
     bool stable_ = false;
