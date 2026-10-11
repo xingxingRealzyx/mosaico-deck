@@ -1,4 +1,0 @@
-# PC 侧 bridge 的依赖
-Pillow>=10.0      # 渲染 480x480 的界面（系统字体画中文/抗锯齿）
-pyserial>=3.5     # 和板子通信
-mcp>=2.0          # MCP server（高层接口 MCPServer）

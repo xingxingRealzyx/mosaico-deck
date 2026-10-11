@@ -43,46 +43,48 @@
 
 ## 现在能用了
 
-固件 + PC 侧桥都已跑通，端到端验证过。
+**做成 DeepSeek Harness 原生插件**（不是 MCP）。
 
 ```bash
 # 1. 烧固件（免按键烧录，可反复烧）
 ./flash.sh
 
-# 2. 装 bridge 依赖
-python3 -m venv .venv && .venv/bin/pip install -r tools/bridge/requirements.txt
+# 2. 装插件（装完自动跑加载自检）
+./install-plugin.sh desktop
 
-# 3. 跑一遍 demo，屏幕上就能看到效果
-.venv/bin/python tools/bridge/bridge.py --demo
+# 3. 重启 DeepSeek Harness
 ```
 
-配到 agent 里（任何支持 MCP 的都能用）：
+重启后设备上的状态**自动跟着 agent 走** —— 模型一个字都不用说。见
+[plugin/](plugin/)。
 
-```json
-{
-  "mcpServers": {
-    "mosaico-deck": {
-      "command": "/path/to/mosaico-deck/.venv/bin/python",
-      "args": ["/path/to/mosaico-deck/tools/bridge/bridge.py"]
-    }
-  }
-}
+### 为什么是原生插件而不是 MCP
+
+插件直接挂 DSH 自己的生命周期：
+
+```
+agent/status  tools/pre-execute  tools/post-execute
+assistant/message  agent/error
 ```
 
-三个工具：`display_status`（更新状态页）、**`ask_user`（在设备上问人并等待回答）**、
-`notify`。详见 [tools/bridge/README.md](tools/bridge/README.md)。
+好处有两条，**MCP 都做不到**：
 
-### 实测的带宽（band 差分）
+1. **界面自动跟着走。** MCP 工具得模型主动想起来调，而它经常想不起来。
+2. **显示的是事实，不是模型的自我报告。** 状态来自宿主事件里真实的工具名和
+   参数，而不是模型说"我在跑测试" —— 那句话可能是编的。
 
-| 场景 | 发出 | 耗时 |
-|---|---|---|
-| 首次整屏 | 16 条 band / 450 KB | 131 ms |
-| 内容完全没变 | **0 条 band** | **0.3 ms** |
-| 加一行日志 | 1 条 band / 28 KB | **8.7 ms** |
-| 改进度条 | 2 条 band / 56 KB | 16.6 ms |
+三个工具（`deck_speak` / `deck_ask` / `deck_show`）是补充，不是主力。
 
-8.7ms 落在一次面板刷新（17ms）之内，**所以不会撕裂** —— 而整屏 450KB 要 15.4ms，
-几乎等于一个刷新周期，稍微一抖就会跨越刷新、画面撕裂。
+### 实测（band 差分）
+
+| 场景 | 发出 | 
+|---|---|
+| 首次整屏 | 16 条 band / 450 KB |
+| 内容完全没变 | **0 条 band** |
+| 改一行字 | 2 条 band |
+
+只发改动的 band，所以更新稳稳落在一次面板刷新（17ms）之内，**不会撕裂**；
+而整屏 450KB 在 60MHz QSPI 上要 15.4ms，几乎等于刷新周期，稍微一抖就撕裂。
 
 ## 复用了什么
 
