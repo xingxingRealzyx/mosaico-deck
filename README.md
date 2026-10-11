@@ -41,6 +41,49 @@
 而且板子是通过 USB 连在电脑上的 —— 带宽和供电都不是问题。整屏 450KB 传一次约
 0.5 秒；**只传变化的那几条 band 的话是几 KB、几十毫秒**（这才是有意义的模式）。
 
+## 现在能用了
+
+固件 + PC 侧桥都已跑通，端到端验证过。
+
+```bash
+# 1. 烧固件（免按键烧录，可反复烧）
+./flash.sh
+
+# 2. 装 bridge 依赖
+python3 -m venv .venv && .venv/bin/pip install -r tools/bridge/requirements.txt
+
+# 3. 跑一遍 demo，屏幕上就能看到效果
+.venv/bin/python tools/bridge/bridge.py --demo
+```
+
+配到 agent 里（任何支持 MCP 的都能用）：
+
+```json
+{
+  "mcpServers": {
+    "mosaico-deck": {
+      "command": "/path/to/mosaico-deck/.venv/bin/python",
+      "args": ["/path/to/mosaico-deck/tools/bridge/bridge.py"]
+    }
+  }
+}
+```
+
+三个工具：`display_status`（更新状态页）、**`ask_user`（在设备上问人并等待回答）**、
+`notify`。详见 [tools/bridge/README.md](tools/bridge/README.md)。
+
+### 实测的带宽（band 差分）
+
+| 场景 | 发出 | 耗时 |
+|---|---|---|
+| 首次整屏 | 16 条 band / 450 KB | 131 ms |
+| 内容完全没变 | **0 条 band** | **0.3 ms** |
+| 加一行日志 | 1 条 band / 28 KB | **8.7 ms** |
+| 改进度条 | 2 条 band / 56 KB | 16.6 ms |
+
+8.7ms 落在一次面板刷新（17ms）之内，**所以不会撕裂** —— 而整屏 450KB 要 15.4ms，
+几乎等于一个刷新周期，稍微一抖就会跨越刷新、画面撕裂。
+
 ## 复用了什么
 
 显示、触摸、板级识别这三块从 [mosaico-fluidbox](../mosaico-fluidbox) **逐字节原样移植**
