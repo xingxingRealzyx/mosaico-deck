@@ -17,6 +17,7 @@
 // 而且板子是通过 USB 连在电脑上的，带宽和供电都不成问题 —— 450KB 一帧整屏传也就
 // 0.5 秒；只传变化的 band 的话是几 KB、几十毫秒。
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -34,6 +35,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "audio.h"
+#include "dh_logo.h"
 #include "input.h"
 #include "hostlink.h"
 #include "osal.h"
@@ -134,87 +136,172 @@ int ScanBusOnPins(int sda, int scl, uint32_t hz) {
 // 1.4~4.2ms 就传完了，稳稳落在一次刷新之内，**根本不会撕裂**。
 //
 // 所以正确的做法不是"让动画慢下来"（那只是把问题藏起来），而是只发变化的部分。
-// 这个图案就是按真实方式画的：
-//   · 第一帧画满 16 条（初始化整屏）
-//   · 之后每帧只重画亮条经过的那几条 band
-constexpr int kBarTop = 150;
-constexpr int kBarBottom = 230;  // 亮条占据的行范围
-constexpr int kBarWidth = 16;
+//
+// ---------------------------------------------------------------------------
+// 开机动画：DeepSeek Harness 的鲸鱼 logo -> 碎成粒子散开 -> 交给 PC
+// ---------------------------------------------------------------------------
+// **动画必须在板子上跑。** PC 推帧的话一帧是 16 条 band / 450KB，光传输就要
+// 15.4ms，加上渲染往返根本做不出流畅效果；而板子本地画只受 QSPI 带宽限制，
+// 实测能到 ~40fps，足够了。
+//
+// 三个阶段：
+//   ① 浮现（0.0~0.7s）  logo 由暗到亮淡入
+//   ② 散开（0.7~2.2s）  logo 的像素变成粒子，向外飞散并淡出
+//   ③ 交棒（2.2s 之后）  黑屏等待 —— PC 一旦送来第一帧就永久让位
+//
+// 粒子位置用解析式算（p = p0 + v*t）而不是逐帧累加：一来不会有浮点漂移，
+// 二来任意时刻都能直接算出来，不受掉帧影响。
+namespace boot {
 
-void DrawBringUpPattern(int frame, bool full_redraw) {
-    // 面板是**圆角矩形**：实测在 (0,0)/(460,0)/(0,460)/(460,460) 画的 20×20 白块
-    // 完全看不到。所以角标往里缩。这个边距 PC 侧渲染 UI 时同样适用。
-    constexpr int kCornerInset = 60;
-    constexpr int kCornerSize = 24;
+using fluidbox::config::kBandCount;
+using fluidbox::config::kBandPixels;
+using fluidbox::config::kBandRows;
+using fluidbox::config::kLcdHRes;
+using fluidbox::config::kLcdVRes;
 
-    auto swap16 = [](uint16_t v) -> uint16_t {
-        return static_cast<uint16_t>((v >> 8) | (v << 8));
-    };
-    const uint16_t white = swap16(0xFFFF);
+constexpr int64_t kFadeInUs = 700 * 1000;
+constexpr int64_t kScatterUs = 1500 * 1000;
+constexpr int64_t kTotalUs = kFadeInUs + kScatterUs;
 
-    // 亮条位置：2px/帧 左右往返
-    const int phase = frame % 480;
-    const int x = (phase < 240) ? (phase * 2) : ((479 - phase) * 2);
+// logo 居中
+constexpr int kLogoX = (kLcdHRes - deck::kLogoSize) / 2;
+constexpr int kLogoY = (kLcdVRes - deck::kLogoSize) / 2;
 
-    // 只有这几条 band 会被重画（第一帧除外）
-    const int bar_b0 = kBarTop / fluidbox::config::kBandRows;
-    const int bar_b1 = (kBarBottom - 1) / fluidbox::config::kBandRows;
+// 采样间隔：蒙版里每隔 kSample 个像素取一个粒子。
+// 3 -> 约 1100 个粒子，散开时足够密，又不至于每帧算不过来。
+constexpr int kSample = 3;
+constexpr int kMaxParticles = (deck::kLogoSize / kSample) * (deck::kLogoSize / kSample);
 
-    for (int band = 0; band < fluidbox::config::kBandCount; band++) {
-        const bool in_bar = (band >= bar_b0 && band <= bar_b1);
-        if (!full_redraw && !in_bar) {
-            continue;  // **跳过没变的 band** —— 这就是省下来的带宽
+struct Particle {
+    float x0, y0;   // 起点（相对屏幕中心）
+    float vx, vy;   // 速度（像素/秒）
+    float delay;    // 各自的起飞延迟，让散开有层次而不是"整块平移"
+};
+
+Particle g_particles[kMaxParticles];
+int g_count = 0;
+
+// 一个确定性的伪随机 —— 不用 rand() 是因为它要 srand 且结果依赖 libc 版本，
+// 换个工具链开机动画就变了。这里用整数 hash，结果永远一样。
+inline uint32_t Hash(uint32_t v) {
+    v ^= v >> 16;
+    v *= 0x7feb352dU;
+    v ^= v >> 15;
+    v *= 0x846ca68bU;
+    v ^= v >> 16;
+    return v;
+}
+
+void InitParticles() {
+    if (g_count > 0) {
+        return;
+    }
+    const int half = deck::kLogoSize / 2;
+    for (int y = 0; y < deck::kLogoSize; y += kSample) {
+        for (int x = 0; x < deck::kLogoSize; x += kSample) {
+            const uint8_t byte = deck::kLogoMask[y * deck::kLogoStride + (x >> 3)];
+            if ((byte & (0x80 >> (x & 7))) == 0) {
+                continue;  // 不属于 logo
+            }
+            if (g_count >= kMaxParticles) {
+                break;
+            }
+            const float dx = static_cast<float>(x - half);
+            const float dy = static_cast<float>(y - half);
+            // 离中心越远飞得越快 —— 视觉上就是"从中间炸开"
+            const float dist = sqrtf(dx * dx + dy * dy) + 1.0f;
+            const uint32_t h = Hash(static_cast<uint32_t>(y * 1000 + x));
+            const float jitter = 0.75f + static_cast<float>(h % 1000) / 1000.0f * 0.7f;
+            const float speed = (90.0f + dist * 1.9f) * jitter;
+
+            Particle& p = g_particles[g_count++];
+            p.x0 = dx;
+            p.y0 = dy;
+            p.vx = dx / dist * speed;
+            p.vy = dy / dist * speed;
+            // 延迟 0~180ms，按 hash 散开
+            p.delay = static_cast<float>((h >> 10) % 180) / 1000.0f;
         }
+    }
+    ESP_LOGI(kTag, "开机动画：%d 个粒子", g_count);
+}
 
+// 把某条 band 的一行像素填成黑（RGB565 且高字节在前，和 PC 侧一致）
+inline uint16_t Rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    const uint16_t v = static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    return static_cast<uint16_t>((v << 8) | (v >> 8));  // 字节交换
+}
+
+const uint16_t kBlack = Rgb565(0, 0, 0);
+
+// 画一帧。full_redraw 时 16 条全画（第一帧初始化整屏）。
+void DrawFrame(int64_t elapsed_us, bool full_redraw) {
+    InitParticles();
+    const bool scattering = elapsed_us >= kFadeInUs;
+    const float st = static_cast<float>(elapsed_us - kFadeInUs) / 1e6f;  // 散开已进行的秒数
+
+    for (int band = 0; band < kBandCount; band++) {
+        const int y0 = band * kBandRows;
         uint16_t* buf = g_panel.AcquireBand();
         if (buf == nullptr) {
-            continue;
+            return;  // 超时，这一帧就放弃（下一帧再来）
+        }
+        for (int i = 0; i < kBandPixels; i++) {
+            buf[i] = kBlack;
         }
 
-        const int y0 = band * fluidbox::config::kBandRows;
-        const int y1 = y0 + fluidbox::config::kBandRows;
+        if (!scattering) {
+            // ---- 阶段①：logo 淡入 ----
+            const float t = static_cast<float>(elapsed_us) / static_cast<float>(kFadeInUs);
+            const uint8_t level = static_cast<uint8_t>(t * 255.0f);
+            const uint16_t color = Rgb565(level, level, level);
 
-        // 底色：按 band 序号从**蓝渐变到红**（绿通道恒为 0，中间经过洋红）。
-        // 漏掉任何一条 band 都会在渐变里看成一条硬边。
-        const int t = band * 255 / (fluidbox::config::kBandCount - 1);
-        const uint16_t r5 = static_cast<uint16_t>(t * 31 / 255);
-        const uint16_t b5 = static_cast<uint16_t>((255 - t) * 31 / 255);
-        const uint16_t bg = swap16(static_cast<uint16_t>((r5 << 11) | b5));
-        for (int i = 0; i < fluidbox::config::kBandPixels; i++) {
-            buf[i] = bg;
-        }
-
-        // 移动的亮条
-        if (in_bar) {
-            for (int y = (y0 > kBarTop ? y0 : kBarTop);
-                 y < (y1 < kBarBottom ? y1 : kBarBottom); y++) {
-                uint16_t* row = buf + (y - y0) * fluidbox::config::kLcdHRes;
-                for (int dx = 0; dx < kBarWidth; dx++) {
-                    const int px = x + dx;
-                    if (px >= 0 && px < fluidbox::config::kLcdHRes) {
-                        row[px] = white;
+            for (int y = 0; y < deck::kLogoSize; y++) {
+                const int sy = kLogoY + y;
+                if (sy < y0 || sy >= y0 + kBandRows) {
+                    continue;
+                }
+                uint16_t* row = buf + (sy - y0) * kLcdHRes;
+                const uint8_t* mask_row = &deck::kLogoMask[y * deck::kLogoStride];
+                for (int x = 0; x < deck::kLogoSize; x++) {
+                    if ((mask_row[x >> 3] & (0x80 >> (x & 7))) != 0) {
+                        row[kLogoX + x] = color;
                     }
                 }
             }
-        }
-
-        // 四角角标：往里缩避开圆角
-        const int xs[2] = {kCornerInset,
-                           fluidbox::config::kLcdHRes - kCornerInset - kCornerSize};
-        const int ys[2] = {kCornerInset,
-                           fluidbox::config::kLcdVRes - kCornerInset - kCornerSize};
-        for (int cy = 0; cy < 2; cy++) {
-            for (int cx = 0; cx < 2; cx++) {
-                for (int y = ys[cy]; y < ys[cy] + kCornerSize; y++) {
-                    if (y < y0 || y >= y1) {
-                        continue;
-                    }
-                    uint16_t* row = buf + (y - y0) * fluidbox::config::kLcdHRes;
-                    for (int px = xs[cx]; px < xs[cx] + kCornerSize; px++) {
-                        if (px >= 0 && px < fluidbox::config::kLcdHRes) {
-                            row[px] = white;
-                        }
-                    }
+        } else {
+            // ---- 阶段②：粒子散开 ----
+            // 每个粒子画 2×2，保证远看还是"有点东西"而不是稀疏的点
+            for (int i = 0; i < g_count; i++) {
+                const Particle& p = g_particles[i];
+                const float local = st - p.delay;
+                if (local <= 0.0f) {
+                    continue;
+                }
+                // 亮度和速度都随时间衰减 —— 用平方衰减，尾巴收得干脆
+                const float fade = 1.0f - local / 1.5f;
+                if (fade <= 0.0f) {
+                    continue;
+                }
+                const float px = kLcdHRes * 0.5f + p.x0 + p.vx * local;
+                const float py = kLcdVRes * 0.5f + p.y0 + p.vy * local;
+                const int ix = static_cast<int>(px);
+                const int iy = static_cast<int>(py);
+                if (iy < y0 || iy >= y0 + kBandRows) {
+                    continue;
+                }
+                if (ix < 0 || ix >= kLcdHRes - 1) {
+                    continue;
+                }
+                const uint8_t level = static_cast<uint8_t>(fade * fade * 255.0f);
+                const uint16_t color = Rgb565(level, level, level);
+                uint16_t* row = buf + (iy - y0) * kLcdHRes;
+                row[ix] = color;
+                row[ix + 1] = color;
+                if (iy + 1 < y0 + kBandRows) {
+                    uint16_t* row2 = row + kLcdHRes;
+                    row2[ix] = color;
+                    row2[ix + 1] = color;
                 }
             }
         }
@@ -224,6 +311,8 @@ void DrawBringUpPattern(int frame, bool full_redraw) {
         }
     }
 }
+
+}  // namespace boot
 
 // ---------------------------------------------------------------------------
 // 任务
@@ -237,14 +326,28 @@ void RenderTask(void* arg) {
     // 为什么必须让出去：两个任务同时画会抢 SPI 总线（实测 `acquire spi bus failed`
     // + `ESP_ERR_INVALID_STATE`），而且消费任务被总线卡住之后没空读环形缓冲 ——
     // 表现为大量 RX 溢出。屏幕的所有权只能有一个主人。
-    int frame = 0;
+    const int64_t boot_start_us = osal::TimeUs();
     bool first = true;
     bool gave_up = false;
+    bool anim_done = false;
     for (;;) {
         if (hostlink::RemoteOwnsScreen()) {
             if (!gave_up) {
                 gave_up = true;
-                ESP_LOGI(kTag, "PC 已接管屏幕，本地自检图案停止");
+                ESP_LOGI(kTag, "PC 已接管屏幕，开机动画让位");
+            }
+            osal::Delay(50);
+            continue;
+        }
+
+        // 动画放完就停手，屏幕保持黑 —— 等 PC 送第一帧。
+        // **不能继续画**：PC 随时可能接管，两边同时画会抢 SPI 总线
+        //（实测 acquire spi bus failed），而且消费任务被卡住会导致 RX 溢出。
+        const int64_t elapsed = osal::TimeUs() - boot_start_us;
+        if (elapsed > boot::kTotalUs) {
+            if (!anim_done) {
+                anim_done = true;
+                ESP_LOGI(kTag, "开机动画结束（%.1fs），等 PC 接管", elapsed / 1e6);
             }
             osal::Delay(50);
             continue;
@@ -256,9 +359,8 @@ void RenderTask(void* arg) {
         if (g_panel.WaitForTeTick(30)) {
             // 和 link 抢的是同一把锁 —— 见 display::Panel::DrawMutex()。
             osal::LockGuard<osal::Mutex> draw_guard(g_panel.DrawMutex());
-            DrawBringUpPattern(frame, first);
+            boot::DrawFrame(elapsed, first);
             first = false;
-            frame++;
             g_frames = g_frames + 1;
         }
     }
