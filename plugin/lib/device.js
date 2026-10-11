@@ -225,11 +225,21 @@ export class Deck extends EventEmitter {
             let j = 1;
             for (let i = b * BAND_PIXELS; i < (b + 1) * BAND_PIXELS; i++) {
                 const r = rgb[i * 3], g = rgb[i * 3 + 1], bl = rgb[i * 3 + 2];
-                // RGB565 + 字节交换：面板和 CPU 的字节序相反，固件侧也是这么做的，
-                // 两边必须一致，否则颜色会串。
-                let v = ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (bl >> 3);
-                payload[j++] = v & 0xff;
+                // 标准 RGB565，高字节是 R5G3、低字节是 G3B5。
+                const v = ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (bl >> 3);
+                // ⚠️ **必须高字节在前。**
+                //
+                // 固件那边是 `buf[i] = swap16((r5 << 11) | b5)`，而 buf 是
+                // uint16_t、CPU 是小端 —— 所以落到内存里的顺序是
+                // [RGB565 高字节][低字节]。
+                //
+                // 这里一开始写反了（低字节在前），症状很有迷惑性：
+                //   · 黑 0x0000 交换后还是黑 -> 背景看着正常
+                //   · 白 0xFFFF 交换后还是白 -> 主文字看着正常
+                //   · **彩色全串** -> 强调色文字、进度条、状态点颜色全错
+                // 于是看起来就像"字体颜色不对"。
                 payload[j++] = (v >> 8) & 0xff;
+                payload[j++] = v & 0xff;
             }
             this._frame(TYPE_BAND, payload);
         }
