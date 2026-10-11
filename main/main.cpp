@@ -120,56 +120,74 @@ int ScanBusOnPins(int sda, int scl, uint32_t hz) {
 // 图案：整屏竖向渐变（每条 band 的底色不同 → 漏掉一条会看出一条硬边），
 // 加一根横向移动的亮条（证明在持续刷新），四角各一个白方块（证明边界覆盖）。
 void DrawBringUpPattern(int frame) {
+    // 面板是**圆角矩形**：实测在 (0,0)/(460,0)/(0,460)/(460,460) 画的 20×20 白块
+    // 完全看不到。所以角标要往里缩。这个边距 PC 侧渲染 UI 时同样适用 ——
+    // 不要把内容放在四角。
+    constexpr int kCornerInset = 60;
+    constexpr int kCornerSize = 24;
+
+    // 亮条速度：**1 px/帧**。
+    //
+    // 原来写的是 4 px/帧（约 234 px/s），结果条是弯的 —— 不是画错了，是撕裂：
+    // 16 条 band 推完要 22ms，跨越了一次面板刷新（17ms），于是上半屏是新位置、
+    // 下半屏还是旧位置。这是这套显示的物理特性，TE 同步只能对齐帧的**起点**，
+    // 消不掉"一帧比一次刷新还长"这件事。
+    //
+    // 1 px/帧 时 22ms 内只移动 1.3px，看不出来。真实 UI 应该避免快速移动的元素，
+    // 或者一次刷新内发完整屏。
+    const int phase = frame % 480;
+    const int x = (phase < 240) ? (phase * 2) : ((479 - phase) * 2);
+
+    auto swap16 = [](uint16_t v) -> uint16_t {
+        return static_cast<uint16_t>((v >> 8) | (v << 8));
+    };
+    const uint16_t white = swap16(0xFFFF);
+
     for (int band = 0; band < fluidbox::config::kBandCount; band++) {
         uint16_t* buf = g_panel.AcquireBand();
         if (buf == nullptr) {
             continue;
         }
 
-        // 底色：按 band 序号在深蓝→深紫之间渐变。RGB565 要先转字节序，
-        // 面板要的字节序和 CPU 存 uint16_t 的相反。
+        const int y0 = band * fluidbox::config::kBandRows;
+        const int y1 = y0 + fluidbox::config::kBandRows;
+
+        // 底色：按 band 序号在深蓝→深紫之间渐变。漏掉任何一条都会看成一条硬边。
         const int t = band * 255 / (fluidbox::config::kBandCount - 1);
-        auto swap16 = [](uint16_t v) -> uint16_t { return static_cast<uint16_t>((v >> 8) | (v << 8)); };
         const uint16_t r5 = static_cast<uint16_t>(t * 31 / 255);
         const uint16_t b5 = static_cast<uint16_t>((255 - t) * 31 / 255);
         const uint16_t bg = swap16(static_cast<uint16_t>((r5 << 11) | b5));
-
         for (int i = 0; i < fluidbox::config::kBandPixels; i++) {
             buf[i] = bg;
         }
 
-        // 横向移动的亮条：周期 240 帧，来回扫。
-        const int phase = frame % 240;
-        const int x = (phase < 120) ? (phase * 4) : ((239 - phase) * 4);
-        const int y0 = band * fluidbox::config::kBandRows;
-        const int y1 = y0 + fluidbox::config::kBandRows;
-        if (y1 > 200 && y0 < 280) {
-            const uint16_t bright = swap16(0xFFFF);
-            for (int y = (y0 > 200 ? y0 : 200); y < (y1 < 280 ? y1 : 280); y++) {
+        // 移动的亮条（屏幕中间偏上，避开中心方便以后放真实内容）
+        if (y1 > 150 && y0 < 230) {
+            for (int y = (y0 > 150 ? y0 : 150); y < (y1 < 230 ? y1 : 230); y++) {
                 uint16_t* row = buf + (y - y0) * fluidbox::config::kLcdHRes;
-                for (int dx = 0; dx < 12; dx++) {
+                for (int dx = 0; dx < 16; dx++) {
                     const int px = x + dx;
                     if (px >= 0 && px < fluidbox::config::kLcdHRes) {
-                        row[px] = bright;
+                        row[px] = white;
                     }
                 }
             }
         }
 
-        // 四角的白方块：证明屏幕四边都被真正覆盖到。
-        const uint16_t white = swap16(0xFFFF);
-        const int corners[4][2] = {{0, 0}, {fluidbox::config::kLcdHRes - 20, 0},
-                                   {0, fluidbox::config::kLcdVRes - 20},
-                                   {fluidbox::config::kLcdHRes - 20, fluidbox::config::kLcdVRes - 20}};
-        for (auto& c : corners) {
-            for (int y = c[1]; y < c[1] + 20; y++) {
-                if (y < y0 || y >= y1) {
-                    continue;
-                }
-                uint16_t* row = buf + (y - y0) * fluidbox::config::kLcdHRes;
-                for (int x = c[0]; x < c[0] + 20; x++) {
-                    if (x >= 0 && x < fluidbox::config::kLcdHRes) {
-                        row[x] = white;
+        // 四角角标：**往里缩**，避开圆角。
+        const int xs[2] = {kCornerInset, fluidbox::config::kLcdHRes - kCornerInset - kCornerSize};
+        const int ys[2] = {kCornerInset, fluidbox::config::kLcdVRes - kCornerInset - kCornerSize};
+        for (int cy = 0; cy < 2; cy++) {
+            for (int cx = 0; cx < 2; cx++) {
+                for (int y = ys[cy]; y < ys[cy] + kCornerSize; y++) {
+                    if (y < y0 || y >= y1) {
+                        continue;
+                    }
+                    uint16_t* row = buf + (y - y0) * fluidbox::config::kLcdHRes;
+                    for (int px = xs[cx]; px < xs[cx] + kCornerSize; px++) {
+                        if (px >= 0 && px < fluidbox::config::kLcdHRes) {
+                            row[px] = white;
+                        }
                     }
                 }
             }
