@@ -24,7 +24,26 @@ namespace usb_console {
 namespace {
 
 constexpr const char* kTag = "usb_console";
-constexpr tinyusb_cdcacm_itf_t kCdcItf = TINYUSB_CDC_ACM_0;
+// Two CDC ports, deliberately split by role:
+//
+//   kFlashItf (port 0) -- owns the control-line callback. Toggling DTR/RTS here
+//                         is what puts the chip into download mode, so this is
+//                         the port a flasher talks to.
+//   kCdcItf   (port 1) -- the data/protocol port used by the host plugin. It has
+//                         NO line-state callback, and, more importantly, it is a
+//                         different /dev node, so the plugin holding it open does
+//                         not lock the flasher out.
+//
+// Why the split matters, both reasons learned the hard way:
+//   1. Opening a macOS serial node asserts DTR/RTS. On the flashing port those
+//      lines are the reset signal, so a host program that merely opens the port
+//      to "check whether the board is there" kicks the chip out of ROM download
+//      mode and makes flashing impossible.
+//   2. Even with that fixed, a permanently open port is an exclusively held
+//      port: esptool gets "Serial data stream stopped" and cannot flash at all.
+// Two ports solve both.
+constexpr tinyusb_cdcacm_itf_t kFlashItf = TINYUSB_CDC_ACM_0;
+constexpr tinyusb_cdcacm_itf_t kCdcItf = TINYUSB_CDC_ACM_1;
 
 // ---------------------------------------------------------------------------
 // Copied directly from the USB descriptors of the ROM download-mode device
@@ -270,12 +289,29 @@ esp_err_t Init() {
         return err;
     }
 
-    // 2. CDC-ACM + control-line callback (the core of button-free flashing).
+    // 2a. Flashing port: control-line callback only, no RX.
+    //
+    // This is the core of button-free flashing and it stays on port 0. The
+    // plugin never opens this port, so nothing the host does for ordinary
+    // display traffic can reset the chip.
+    const tinyusb_config_cdcacm_t flash_cfg = {
+        .cdc_port = kFlashItf,
+        .callback_rx = nullptr,
+        .callback_rx_wanted_char = nullptr,
+        .callback_line_state_changed = LineStateChangedCallback,
+        .callback_line_coding_changed = nullptr,
+    };
+    const esp_err_t flash_err = tinyusb_cdcacm_init(&flash_cfg);
+    if (flash_err != ESP_OK) {
+        return flash_err;
+    }
+
+    // 2b. Data port: RX callback, no control-line callback.
     const tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = kCdcItf,
         .callback_rx = RxCallback,
         .callback_rx_wanted_char = nullptr,
-        .callback_line_state_changed = LineStateChangedCallback,
+        .callback_line_state_changed = nullptr,
         .callback_line_coding_changed = nullptr,
     };
     const esp_err_t acm_err = tinyusb_cdcacm_init(&acm_cfg);

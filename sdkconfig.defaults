@@ -50,7 +50,7 @@ CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
 # 必须显式打开：esp_tinyusb 的 tinyusb_cdc_acm.h 里有一个 #error 检查，
 # 不开的话 usb_console 直接编译失败。
 CONFIG_TINYUSB_CDC_ENABLED=y
-CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_COUNT=2
 # 描述符由 usb_console 自己在代码里提供（要伪装成 ROM 下载模式设备），
 # 所以下面这些默认字符串/VID/PID 都不会被真正用到。
 CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=y
