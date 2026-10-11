@@ -159,9 +159,16 @@ using fluidbox::config::kBandRows;
 using fluidbox::config::kLcdHRes;
 using fluidbox::config::kLcdVRes;
 
-constexpr int64_t kFadeInUs = 700 * 1000;
-constexpr int64_t kScatterUs = 1500 * 1000;
-constexpr int64_t kTotalUs = kFadeInUs + kScatterUs;
+constexpr int64_t kFadeInUs = 600 * 1000;    // ① 浮现
+constexpr int64_t kScatterUs = 1100 * 1000;  // ② 散开
+// ③ 余韵：不再"结束"，而是落进一个安静的状态**一直陪着**，直到 PC 送第一帧。
+//
+// 这里踩过一次：原来动画在 2.2s 硬结束然后黑屏等 PC。但粒子带各自的起飞延迟，
+// 最晚的 ~1.7s 就淡完了，于是最后 0.5s 是纯黑；再加上 PC 侧建立连接的 1.2s，
+// 用户看到的是"炸开之后黑了好一会儿"。
+//
+// 现在动画不存在"结束"这个状态 —— 屏幕永远有东西，PC 一来就自然接走。
+constexpr int64_t kScatterEndUs = kFadeInUs + kScatterUs;
 
 // logo 居中
 constexpr int kLogoX = (kLcdHRes - deck::kLogoSize) / 2;
@@ -235,10 +242,17 @@ inline uint16_t Rgb565(uint8_t r, uint8_t g, uint8_t b) {
 const uint16_t kBlack = Rgb565(0, 0, 0);
 
 // 画一帧。full_redraw 时 16 条全画（第一帧初始化整屏）。
+//
+// **这个函数没有"结束"**：elapsed_us 一直涨，画出来的东西自然从"散开"过渡到
+// "余韵"，永远有内容。PC 接管由渲染循环判断，不在这里。
 void DrawFrame(int64_t elapsed_us, bool full_redraw) {
     InitParticles();
     const bool scattering = elapsed_us >= kFadeInUs;
-    const float st = static_cast<float>(elapsed_us - kFadeInUs) / 1e6f;  // 散开已进行的秒数
+    const float st = static_cast<float>(elapsed_us - kFadeInUs) / 1e6f;
+    // 散开结束后的秒数（余韵阶段用）
+    const float after = (elapsed_us > kScatterEndUs)
+                            ? static_cast<float>(elapsed_us - kScatterEndUs) / 1e6f
+                            : 0.0f;
 
     for (int band = 0; band < kBandCount; band++) {
         const int y0 = band * kBandRows;
@@ -270,19 +284,46 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
                 }
             }
         } else {
-            // ---- 阶段②：粒子散开 ----
-            // 每个粒子画 2×2，保证远看还是"有点东西"而不是稀疏的点
+            // ---- 阶段②③：粒子散开 -> 余韵 ----
+            // 每个粒子画 2×2，保证远看还是"有点东西"而不是稀疏的点。
+            //
+            // 亮度衰减用的是 (1 - local/1.5)^2，所以最晚的粒子（delay 最大 0.18s）
+            // 在 st≈1.68s 就彻底暗了 —— 而散开阶段是 1.1s，也就是说**粒子还没飞完
+            // 就已经看不见了**。这正是"炸开之后黑一段"的一半原因。
+            // 现在 fade 的分母拉到和整个散开时长一致，并且余韵阶段保留一点余光。
             for (int i = 0; i < g_count; i++) {
                 const Particle& p = g_particles[i];
                 const float local = st - p.delay;
                 if (local <= 0.0f) {
                     continue;
                 }
-                // 亮度和速度都随时间衰减 —— 用平方衰减，尾巴收得干脆
-                const float fade = 1.0f - local / 1.5f;
+                float fade = 1.0f - local / 1.35f;
                 if (fade <= 0.0f) {
+                    // 余韵：只剩极少数粒子还在缓慢外飘，给屏幕留一点"呼吸"
+                    // 用 (i % 23) 挑，比例约 4%，看起来是零星的星点而不是噪点
+                    if ((i % 23) != 0) {
+                        continue;
+                    }
+                    fade = 0.16f + 0.10f * sinf(after * 1.6f + static_cast<float>(i));
+                    if (fade <= 0.0f) {
+                        continue;
+                    }
+                    const float slow = local * 0.35f;  // 余韵阶段几乎停住
+                    const float px0 = kLcdHRes * 0.5f + p.x0 + p.vx * slow;
+                    const float py0 = kLcdVRes * 0.5f + p.y0 + p.vy * slow;
+                    const int ix0 = static_cast<int>(px0);
+                    const int iy0 = static_cast<int>(py0);
+                    if (iy0 >= y0 && iy0 < y0 + kBandRows && ix0 >= 0 && ix0 < kLcdHRes - 1) {
+                        const uint8_t lv = static_cast<uint8_t>(fade * 255.0f);
+                        const uint16_t c = Rgb565(lv, lv, lv);
+                        uint16_t* r0 = buf + (iy0 - y0) * kLcdHRes;
+                        r0[ix0] = c;
+                        r0[ix0 + 1] = c;
+                    }
                     continue;
                 }
+                // 散开阶段：亮度按平方衰减，尾巴收得干脆
+                fade = fade * fade;
                 const float px = kLcdHRes * 0.5f + p.x0 + p.vx * local;
                 const float py = kLcdVRes * 0.5f + p.y0 + p.vy * local;
                 const int ix = static_cast<int>(px);
@@ -293,7 +334,7 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
                 if (ix < 0 || ix >= kLcdHRes - 1) {
                     continue;
                 }
-                const uint8_t level = static_cast<uint8_t>(fade * fade * 255.0f);
+                const uint8_t level = static_cast<uint8_t>(fade * 255.0f);
                 const uint16_t color = Rgb565(level, level, level);
                 uint16_t* row = buf + (iy - y0) * kLcdHRes;
                 row[ix] = color;
@@ -340,17 +381,20 @@ void RenderTask(void* arg) {
             continue;
         }
 
-        // 动画放完就停手，屏幕保持黑 —— 等 PC 送第一帧。
-        // **不能继续画**：PC 随时可能接管，两边同时画会抢 SPI 总线
-        //（实测 acquire spi bus failed），而且消费任务被卡住会导致 RX 溢出。
+        // **动画没有"结束"，一直画到 PC 接管为止。**
+        //
+        // 原来是在 2.2s 硬停下来黑屏等 PC，结果"炸开之后黑了好一会儿"——
+        // 因为粒子带延迟，最晚的 1.7s 就淡完了，剩下的时间是纯黑；再叠上 PC
+        // 建立连接的时间就更长。现在动画落进一个安静的余韵状态陪着屏幕，
+        // PC 一来自然被接走。
+        //
+        // 唯一要守的规矩：**PC 一接管就必须立刻停手** —— 两边同时画会抢 SPI
+        // 总线（实测 acquire spi bus failed），而且消费任务被卡住会导致 RX 溢出。
+        // 这个由循环开头的 RemoteOwnsScreen() 保证。
         const int64_t elapsed = osal::TimeUs() - boot_start_us;
-        if (elapsed > boot::kTotalUs) {
-            if (!anim_done) {
-                anim_done = true;
-                ESP_LOGI(kTag, "开机动画结束（%.1fs），等 PC 接管", elapsed / 1e6);
-            }
-            osal::Delay(50);
-            continue;
+        if (!anim_done && elapsed > boot::kScatterEndUs + 1500 * 1000) {
+            anim_done = true;
+            ESP_LOGI(kTag, "开机动画进入余韵（%.1fs）", elapsed / 1e6);
         }
 
         // 等面板的一个刷新周期再推帧。面板刷新率（约 58.5Hz）才是这个系统的真实

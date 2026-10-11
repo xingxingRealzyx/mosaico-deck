@@ -95,8 +95,14 @@ export function apply(ctx) {
         if (deck.connected) return true;
         if (!deck.open()) return false;
         state.connected = true;
-        // 板子刚上电时可能还在打启动日志，等它一会儿再画第一帧。
-        setTimeout(() => paint({ force: true }), 1200);
+        // 板子刚上电时还在跑开机动画（约 1.9s），这时候推帧会：
+        //   · 和动画抢 SPI 总线
+        //   · 把动画打断
+        // 但**不能等太久** —— 板子的动画现在没有"终点"，它会一直画到 PC 接管，
+        // 所以这里等 1.6s（动画主体差不多放完）就接手，屏幕不会出现空档。
+        // 原来写的是 1200ms 固定等，加上动画自己尾巴的黑屏，用户看到的是
+        // "炸开之后黑了好一会儿"。
+        setTimeout(() => paint({ force: true }), 1600);
         return true;
     }
 
