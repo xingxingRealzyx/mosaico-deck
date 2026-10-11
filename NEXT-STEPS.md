@@ -29,6 +29,24 @@ This fixes two separate, measured problems:
 2. An open port is an exclusively held port. `lsof` showed three DeepSeek fds on
    `/dev/cu.usbmodem21201` and esptool failed with "Serial data stream stopped".
 
+## What tonight added
+
+- `flash-rom.sh` referenced `mosaico-fluidbox.bin` (leftover from the previous
+  project) instead of `mosaico-deck.bin`, so the ROM-mode recovery path -- the
+  only one that works when the board will not enumerate normally -- always
+  bailed out. Fixed.
+- **A restart does not necessarily release the serial port.** After restarting
+  Harness at 03:48 the port was still held, and `ps` showed a leftover process
+  from the 03:24 instance (PID 33484) that had never been reaped. That process
+  was still alive and still holding `/dev/cu.usbmodem21201`. It had to be killed
+  explicitly; nothing else freed the port. Worth checking with
+  `lsof /dev/cu.usbmodem*` and `ps -o lstart= -p <pid>` whenever the port is
+  busy, because the owner may not be the session you think it is.
+- The board now enumerates only intermittently: it appears for a few seconds,
+  flashing fails with "port is busy" or a pySerial ioctl error, and then it
+  disappears again (`ioreg` back to 0). It never stays up long enough for
+  esptool to complete.
+
 ## Resume here
 
 1. Get the board enumerating again: unplug USB, wait 10s, replug. If that does
