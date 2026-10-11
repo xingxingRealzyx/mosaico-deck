@@ -7,7 +7,12 @@
 // 而**如果插件在加载时抛异常，可能连 DSH 都起不来** —— 那时候连改回来的机会
 // 都没有。所以重启前先用一个模拟的 cordis ctx 把 apply() 真跑一遍。
 //
-//   node plugin/selftest.mjs
+//   # **必须在 profile 目录下跑**（插件里 import 的 @deepseek-ai/* 在
+//   # ~/.dsh/profiles/node_modules 里，从源码目录往上找不到）
+//   cd ~/.dsh/profiles/desktop && node <repo>/plugin/selftest.mjs
+//
+//   默认检查已安装的那份；也可以显式给路径：
+//   node selftest.mjs /path/to/lib/index.js
 //
 // 它检查：模块能 import、导出了 name/inject/apply、apply() 不抛异常、
 // 工具注册成功、事件处理器在收到空/null payload 时也不崩。
@@ -25,6 +30,7 @@ const ctx = {
     logger: { info: (m) => logs.push(`I ${m}`), debug: (m) => logs.push(`D ${m}`) },
 };
 
+// 默认检查**安装后的那一份** —— 那才是重启时真正会被加载的代码。
 const spec = process.argv[2] || 'dsh-mosaico-deck';
 let mod;
 try {
