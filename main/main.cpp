@@ -220,8 +220,12 @@ void StatsTask(void* arg) {
         last_flushes = g_band_flushes;
 
         const fluidbox::touch::State ts = g_touch.Get();
-        ESP_LOGI(kTag, "%.1f fps | %u band/s | TE %u | 触摸 %s(%d,%d) | SRAM %u B",
-                 static_cast<double>(df) / dt, static_cast<unsigned>(db),
+        // df/dt 和 db/dt —— **两个数都要除以 dt**。
+        // 之前 db 直接打出来，于是 1872 这个"每 2 秒的次数"看着像频率，
+        // 和 58.5 fps 对不上（1872/58.5 不是整数）。除以 dt 之后是 936 band/s
+        // = 58.5 fps × 16 条，才对得上。
+        ESP_LOGI(kTag, "%.1f fps | %.0f band/s | TE %u | 触摸 %s(%d,%d) | SRAM %u B",
+                 static_cast<double>(df) / dt, static_cast<double>(db) / dt,
                  static_cast<unsigned>(g_panel.TeEdges()),
                  ts.active ? "按下" : "抬起", ts.x, ts.y,
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
