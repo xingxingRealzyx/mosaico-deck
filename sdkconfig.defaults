@@ -1,0 +1,67 @@
+# =============================================================================
+# ESP-Mosaico (ESP32-S31) FluidBox — sdkconfig 默认值
+#
+# 需要 ESP-IDF v6.1 或更新（esp32s31 自 v6.1 起受支持）。
+# =============================================================================
+
+CONFIG_IDF_TARGET="esp32s31"
+
+# ---- CPU --------------------------------------------------------------------
+# S31 默认就是 320 MHz 双核 RISC-V，这里显式写出来免得被别的默认值带走。
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_320=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=320
+
+# ---- Flash：板载 16 MB NOR (GD25Q128, c8 4018) ------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM：封装内 16 MB，200 MHz Octal --------------------------------------
+# 渲染器和求解器都刻意留在内部 SRAM（PSRAM 延迟高 10 倍，而且要和 DMA 抢
+# 同一条总线）。PSRAM 打开只是给将来留余量。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n
+# 关键：不要允许 .bss 落到 PSRAM —— 求解器的数组必须在内部 SRAM。
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=n
+CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=n
+
+# ---- 编译器 ----------------------------------------------------------------
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# 求解器内层循环是纯浮点、不需要保留 NaN/Inf 语义，放宽是安全的。
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=n
+
+# ---- FreeRTOS --------------------------------------------------------------
+# 1 kHz tick，让渲染/求解两个任务能精确节流。
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# ---- 日志 ------------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+# 每帧都刷日志会毁掉帧率，运行时用 esp_log_level_set 控制。
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+
+# ---- TinyUSB（usb_console 组件用它做 CDC 控制台 + 免按键烧录）----------------
+# 必须显式打开：esp_tinyusb 的 tinyusb_cdc_acm.h 里有一个 #error 检查，
+# 不开的话 usb_console 直接编译失败。
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+# 描述符由 usb_console 自己在代码里提供（要伪装成 ROM 下载模式设备），
+# 所以下面这些默认字符串/VID/PID 都不会被真正用到。
+CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=y
+
+# ---- 控制台 ------------------------------------------------------------------
+# 保留默认 UART 控制台：IDF 的日志宏需要有一个已配置的控制台才会工作。
+# 运行时 usb_console::AttachToLogger() 会把 vprintf 重定向到 USB CDC。
+# S31 的 UART0 默认在 GPIO58/59，和板上的 I2C0(GPIO0/1) 不冲突。
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# 次要控制台必须关掉。默认值是 USB Serial/JTAG，而乐鑫官方 FAQ 明确说
+# **USB-OTG 与 USB Serial/JTAG 是互斥的，同一时刻只有一个能工作** ——
+# 我们整条 USB 通路都归 TinyUSB（免按键烧录用），不能被 USJ 抢走 PHY。
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
