@@ -1,20 +1,37 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// index.js —— mosaico-deck 的 DeepSeek Harness 原生插件
+// index.js — mosaico-deck as a native DeepSeek Harness plugin.
 //
-// 它做两件 MCP 做不到的事
-// ---------------------
-// **1. 界面自动跟着 agent 走，模型一个字都不用说。**
-//    挂上 `agent/status`、`tools/pre-execute`、`assistant/message`，屏幕上就
-//    自动出现"思考中 / 正在跑 bash / 说什么"—— 模型完全不需要记得调工具。
-//    MCP 工具做不到这一点：模型得主动想起来调，而它经常想不起来。
+// Two things this does that an MCP tool cannot:
 //
-// **2. 状态是宿主事件驱动的，不是模型描述的。**
-//    模型说"我在跑测试"可能是在编；而 `tools/pre-execute` 里拿到的是真的
-//    工具名和参数。设备上显示的因此是**事实**，不是模型的自我报告。
+// 1. The screen follows the agent automatically, with zero cooperation from the
+//    model. It listens to agent/status, tools/pre-execute, tools/post-execute
+//    and assistant/message, so the display moves on its own.
 //
-// 三个工具是补充，不是主力：speak（说话）、ask（问人）、deck_show（手工改）。
+// 2. What is shown is host-observed fact, not the model's self-report. The tool
+//    name comes from the runtime; "I am running the tests" comes from the model
+//    and may be fiction.
+//
+// ---------------------------------------------------------------------------
+// Event modes: check before subscribing
+// ---------------------------------------------------------------------------
+// Cordis events have several modes and the handler signature depends on which.
+// Getting it wrong does not fail at load time — it breaks the pipeline at call
+// time. That happened here: tools/pre-execute is a `waterfall`, the handler was
+// written as a plain `emit` listener and never called next(), so every tool
+// call in the host threw:
+//
+//     Cannot read properties of undefined (reading 'kind')
+//
+// Actual signatures, from dsh-tools/lib/types:
+//   tools/pre-execute   (exec, next) => Promise<PreToolDecision>           waterfall
+//   tools/post-execute  (exec, result, next) => Promise<PostToolDecision>  waterfall
+//   agent/status        (payload: { agent, status }) => void                emit
+//   agent/error         (payload) => void                                   emit
+//
+// Handlers below forward `next` when it exists and return undefined when it
+// does not, which is correct for both modes.
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
@@ -25,7 +42,13 @@ export const name = 'mosaico-deck';
 export const inject = ['tools'];
 
 const RECONNECT_MS = 5000;
-const TICK_MS = 1000; // 计时器走秒，用来刷新顶部时间
+const TICK_MS = 1000;
+
+// Wait this long after connecting before pushing the first frame. The board is
+// running its boot animation (~1.9s) and painting over it would fight for the
+// SPI bus. The animation ends at boot::kScatterEndUs in main.cpp and then idles
+// in a settle state, so this is a coordination constant, not a guess.
+const FIRST_PAINT_MS = 1600;
 
 export function apply(ctx) {
     const state = {
@@ -38,111 +61,106 @@ export function apply(ctx) {
         elapsed: 0,
         startedAt: 0,
         log: [],
-        asking: null, // 正在等用户回答时的 { resolve, hits, options }
+        asking: null, // { resolve, options } while waiting for a tap
+        audio: Buffer.alloc(0), // captured PCM while the user holds the key
     };
 
-    let deck = new Deck(null);
+    const deck = new Deck(null);
     let buttons = [];
-    let pending = false; // 防止渲染并发
-    let timer = null;
+    let painting = false;
 
-    // ---- 设备 ------------------------------------------------------------
     const pushLog = (line) => {
         state.log.push(line);
         state.log = state.log.slice(-6);
     };
 
-    const page = () => ({
-        page: 'status',
-        project: state.project,
-        state: state.status,
-        detail: state.detail,
-        target: state.target,
-        progress: state.progress,
-        elapsed: state.elapsed,
-        log: state.log,
-        buttons: state.asking ? null : undefined,
-    });
-
     async function paint({ force = false } = {}) {
-        if (!deck.connected || pending) return 0;
-        pending = true;
+        if (!deck.connected || painting) return 0;
+        painting = true;
         try {
-            const job = page();
-            const { rgb } = await render(job);
+            const { rgb } = await render({
+                page: 'status',
+                project: state.project,
+                state: state.status,
+                detail: state.detail,
+                target: state.target,
+                progress: state.progress,
+                elapsed: state.elapsed,
+                log: state.log,
+                files: state.files,
+                testsPassed: state.testsPassed,
+                testsTotal: state.testsTotal,
+                // Tap targets exist only while a question is pending. Drawing
+                // them otherwise is noise, and a stray tap is expensive.
+                buttons: state.asking ? null : undefined,
+            });
             return deck.sendRgb(rgb, { force });
         } catch (err) {
-            // 渲染或串口出错不该影响 agent 干活 —— 这块屏是锦上添花。
-            ctx.logger?.debug?.(`mosaico-deck: ${err.message}`);
+            // A broken screen must never take the agent down with it.
+            ctx.logger?.debug?.(`mosaico-deck: paint failed: ${err.message}`);
             return 0;
         } finally {
-            pending = false;
+            painting = false;
         }
     }
 
-    async function showAsk(question, options) {
-        const { rgb, hits } = await render({
-            page: 'ask',
-            question,
-            options,
-            footer: '点一下选择，或按 AI 键取消',
-        });
-        buttons = hits;
-        await deck.sendRgb(rgb, { force: true });
-    }
-
-    function connect() {
-        if (deck.connected) return true;
-        if (!deck.open()) return false;
-        state.connected = true;
-        // 板子刚上电时还在跑开机动画（约 1.9s），这时候推帧会：
-        //   · 和动画抢 SPI 总线
-        //   · 把动画打断
-        // 但**不能等太久** —— 板子的动画现在没有"终点"，它会一直画到 PC 接管，
-        // 所以这里等 1.6s（动画主体差不多放完）就接手，屏幕不会出现空档。
-        // 原来写的是 1200ms 固定等，加上动画自己尾巴的黑屏，用户看到的是
-        // "炸开之后黑了好一会儿"。
-        setTimeout(() => paint({ force: true }), 1600);
-        return true;
+    /** Pull a readable tool name and argument out of a ToolExecution.
+     *
+     * The exact payload shape is not a contract worth relying on, so probe a
+     * few plausible fields and degrade to a generic label.
+     */
+    function describeTool(exec) {
+        const call = exec?.call ?? exec?.toolCall ?? exec?.tool ?? exec;
+        const rawName = call?.name ?? call?.toolName ?? call?.tool ?? 'tool';
+        const args = call?.arguments ?? call?.args ?? exec?.arguments;
+        let target = '';
+        if (args && typeof args === 'object') {
+            const first = args.command ?? args.path ?? args.file_path ?? args.query;
+            if (first) target = String(first);
+        }
+        return { toolName: String(rawName), target };
     }
 
     deck.on('event', (ev) => {
-        if (ev.t === 'touch' && ev.ev === 'down') {
+        if (ev.t === 'touch' && ev.ev === 'down' && state.asking) {
             const hit = buttons.find(
-                (b) =>
-                    ev.x >= b.x - 6 && ev.x <= b.x + b.w + 6 &&
-                    ev.y >= b.y - 6 && ev.y <= b.y + b.h + 6,
+                (b) => ev.x >= b.x - 6 && ev.x <= b.x + b.w + 6
+                    && ev.y >= b.y - 6 && ev.y <= b.y + b.h + 6,
             );
-            if (hit && state.asking) {
-                const r = state.asking;
-                state.asking = null;
-                buttons = [];
-                r.resolve(Number.isInteger(+hit.value)
-                    ? r.options[+hit.value]
-                    : hit.value);
-            }
-        } else if (ev.t === 'key' && state.asking) {
-            // 物理按键 = 取消。比在屏幕上找"取消"顺手。
-            const r = state.asking;
+            if (!hit) return;
+            const pending = state.asking;
             state.asking = null;
             buttons = [];
-            r.resolve('cancelled');
+            const value = String(hit.value);
+            pending.resolve(Number.isInteger(+value) ? pending.options[+value] : value);
         }
     });
 
-    deck.on('audio', (pcm) => {
-        state._audio = Buffer.concat([state._audio || Buffer.alloc(0), pcm]);
+    deck.on('key', () => {
+        // The physical key cancels a pending question. Easier to find by touch
+        // than an on-screen cancel.
+        if (!state.asking) return;
+        const pending = state.asking;
+        state.asking = null;
+        buttons = [];
+        pending.resolve('cancelled');
     });
 
-    // ---- 生命周期：界面自动跟着走 ----------------------------------------
-    ctx.on('agent/status', ({ status }) => {
-        if (status === 'running') {
+    deck.on('audio', (pcm) => {
+        state.audio = Buffer.concat([state.audio, pcm]);
+    });
+
+    // -----------------------------------------------------------------------
+    // Lifecycle: this is what makes the screen follow the agent
+    // -----------------------------------------------------------------------
+    ctx.on('agent/status', (payload) => {
+        if (payload?.status === 'running') {
             if (state.status === 'idle') {
                 state.startedAt = Date.now();
                 state.log = [];
             }
             state.status = 'thinking';
-            state.detail = '正在处理';
+            state.detail = 'Working';
             state.target = '';
         } else {
             state.status = 'idle';
@@ -150,64 +168,76 @@ export function apply(ctx) {
         void paint();
     });
 
-    ctx.on('tools/pre-execute', (payload) => {
+    // waterfall: must forward next()
+    ctx.on('tools/pre-execute', (exec, next) => {
         try {
-            const call = payload?.call ?? payload?.toolCall ?? payload;
-            const toolName = call?.name ?? call?.tool ?? 'tool';
+            const { toolName, target } = describeTool(exec);
             state.status = 'tool';
-            state.detail = `正在调用 ${toolName}`;
-            const args = call?.arguments ?? call?.args;
-            if (args && typeof args === 'object') {
-                const first = args.command || args.path || args.file_path || args.query;
-                if (first) state.target = String(first).slice(0, 34);
-            }
-            pushLog(`调用 ${toolName}`);
+            state.detail = `Calling ${toolName}`;
+            if (target) state.target = target.slice(0, 34);
             state.progress = null;
+            pushLog(`called ${toolName}`);
         } catch {
-            /* 事件结构变了也不该崩 */
+            /* payload shape changed; never break the tool pipeline over this */
         }
         void paint();
+        return typeof next === 'function' ? next() : undefined;
     });
 
-    ctx.on('tools/post-execute', () => {
-        state.status = 'thinking';
-        state.detail = '工具跑完了';
-        void paint();
-    });
-
-    ctx.on('assistant/message', (payload) => {
+    // waterfall with three parameters: (exec, result, next)
+    ctx.on('tools/post-execute', (exec, result, next) => {
         try {
-            const text = payload?.message?.content
-                ?.map?.((c) => c?.text ?? '')
-                .join('') ?? '';
+            state.status = 'thinking';
+            state.detail = 'Tool finished';
+        } catch {
+            /* ignore */
+        }
+        void paint();
+        return typeof next === 'function' ? next() : undefined;
+    });
+
+    ctx.on('assistant/message', (payload, next) => {
+        try {
+            const content = payload?.message?.content;
+            const text = Array.isArray(content)
+                ? content.map((c) => c?.text ?? '').join('')
+                : '';
             if (text) {
                 state.status = 'running';
                 state.detail = text.replace(/\s+/g, ' ').slice(0, 30);
-                pushLog('回复了一段');
+                pushLog('replied');
             }
         } catch {
-            /* 同上 */
+            /* ignore */
         }
         void paint();
+        return typeof next === 'function' ? next() : undefined;
     });
 
     ctx.on('agent/error', () => {
         state.status = 'error';
-        state.detail = '出错了';
-        pushLog('出错');
+        state.detail = 'Error';
+        pushLog('error');
         void paint({ force: true });
     });
 
-    // ---- 连接维护 --------------------------------------------------------
+    function connect() {
+        if (deck.connected) return true;
+        if (!deck.open()) return false;
+        state.connected = true;
+        setTimeout(() => paint({ force: true }), FIRST_PAINT_MS);
+        return true;
+    }
+
     connect();
-    const reconnect = setInterval(() => {
-        if (deck.connected) return;
-        connect();
+    const reconnectTimer = setInterval(() => {
+        if (!deck.connected) connect();
     }, RECONNECT_MS);
 
-    timer = setInterval(() => {
+    const tickTimer = setInterval(() => {
         if (!deck.connected) return;
-        const next = state.status === 'idle' ? 0
+        const next = state.status === 'idle'
+            ? 0
             : Math.floor((Date.now() - state.startedAt) / 1000);
         if (next !== state.elapsed) {
             state.elapsed = next;
@@ -216,79 +246,124 @@ export function apply(ctx) {
     }, TICK_MS);
 
     ctx.on('dispose', () => {
-        clearInterval(reconnect);
-        clearInterval(timer);
+        clearInterval(reconnectTimer);
+        clearInterval(tickTimer);
         deck.close();
     });
 
-    // ---- 工具 ------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Tools
+    // -----------------------------------------------------------------------
+    const textOutput = (pick) => ({
+        schema: { type: 'json' },
+        render: (_args, value) => [{ type: 'text', text: pick(value) }],
+    });
+
     ctx.tools.register(defineTool({
         name: 'deck_speak',
         description:
-            '让桌上的 mosaico-deck 设备把这句话念出来。适合「干完了」「需要你看一眼」'
-            + '这类不打断但希望被知道的时刻 —— 它就在你桌上。',
+            'Speak a sentence through the mosaico-deck device on the desk. Use it for '
+            + 'done or take-a-look moments that should not interrupt the user but should '
+            + 'be noticed.',
         parameters: {
-            text: { type: 'string', required: true, description: '要说的内容' },
-            voice: { type: 'string', description: 'macOS 音色名，中文常用 Tingting' },
+            text: { type: 'string', required: true, description: 'What to say.' },
+            voice: { type: 'string', description: 'macOS voice name, for example Tingting.' },
         },
-        output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
+        output: textOutput((v) => v.message),
         async execute(args) {
-            if (!deck.connected) return { ok: false, message: '设备没连上' };
+            if (!deck.connected) return { ok: false, message: 'device not connected' };
             const pcm = await textToPcm(args.text, args.voice);
             const ms = await deck.speakPcm(pcm);
-            return { ok: true, message: `说完了（${(pcm.length / 192000).toFixed(1)} 秒，用时 ${ms}ms）` };
+            return { ok: true, message: `spoke ${(pcm.length / 192000).toFixed(1)}s of audio in ${ms}ms` };
         },
-        presentCall: (a) => ({ card: 'generic', kind: 'read', title: `说话：${a.text?.slice(0, 20) ?? ''}` }),
+        presentCall: (a) => ({
+            card: 'generic',
+            kind: 'read',
+            title: `Speak: ${(a.text ?? '').slice(0, 20)}`,
+        }),
     }));
 
     ctx.tools.register(defineTool({
         name: 'deck_ask',
         description:
-            '在 mosaico-deck 设备上向用户提问并阻塞等待回答。**这是这个设备最有用的地方**'
-            + ' —— 人不用切窗口、不用在终端里找提示，设备亮起来、他按一下就回答了。'
-            + '返回选项原文；超时返回 timeout，用户按键取消返回 cancelled。',
+            'Ask the user a question on the mosaico-deck device and block until they '
+            + 'answer. This is the most useful thing the device does: the user does not '
+            + 'have to switch windows or find a prompt in a terminal, the device lights up '
+            + 'and one tap answers it. Returns the chosen option text, or "timeout" if '
+            + 'nobody answered, or "cancelled" if the user pressed the physical key.',
         parameters: {
             question: { type: 'string', required: true },
-            options: { type: 'array', items: { type: 'string' }, required: true, description: '2~5 个选项' },
-            timeoutSec: { type: 'number', description: '默认 120' },
+            options: {
+                type: 'array',
+                items: { type: 'string' },
+                required: true,
+                description: 'Two to five options; more than five cannot be tapped reliably.',
+            },
+            timeoutSec: { type: 'number', description: 'Default 120.' },
         },
-        output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.answer }] },
+        output: textOutput((v) => v.answer),
         async execute(args, exec) {
-            if (!deck.connected) return { answer: '设备没连上' };
-            const options = (args.options || []).slice(0, 5);
-            const timeout = (args.timeoutSec || 120) * 1000;
+            if (!deck.connected) return { answer: 'device not connected' };
+            const options = (args.options ?? []).slice(0, 5);
+            const timeoutMs = (args.timeoutSec ?? 120) * 1000;
+
             const answer = await new Promise((resolve) => {
                 state.asking = { resolve, options };
-                void showAsk(args.question, options);
-                const t = setTimeout(() => {
-                    if (state.asking) {
-                        state.asking = null;
-                        buttons = [];
-                        resolve('timeout');
-                    }
-                }, timeout);
+                void (async () => {
+                    const { rgb, hits } = await render({
+                        page: 'ask',
+                        question: args.question,
+                        options,
+                        footer: 'Tap an option, or press the AI key to cancel',
+                    });
+                    buttons = hits;
+                    await deck.sendRgb(rgb, { force: true });
+                })();
+
+                const timer = setTimeout(() => {
+                    if (!state.asking) return;
+                    state.asking = null;
+                    buttons = [];
+                    resolve('timeout');
+                }, timeoutMs);
+
+                // If the agent turn is aborted, stop waiting so the device does
+                // not stay stuck on the question page.
                 exec?.signal?.addEventListener?.('abort', () => {
-                    clearTimeout(t);
-                    if (state.asking) { state.asking = null; buttons = []; resolve('cancelled'); }
-                });
+                    clearTimeout(timer);
+                    if (!state.asking) return;
+                    state.asking = null;
+                    buttons = [];
+                    resolve('cancelled');
+                }, { once: true });
             });
+
             void paint({ force: true });
             return { answer };
         },
-        presentCall: (a) => ({ card: 'generic', kind: 'read', title: `问用户：${a.question?.slice(0, 20) ?? ''}` }),
+        presentCall: (a) => ({
+            card: 'generic',
+            kind: 'read',
+            title: `Ask: ${(a.question ?? '').slice(0, 20)}`,
+        }),
     }));
 
     ctx.tools.register(defineTool({
         name: 'deck_show',
-        description: '直接设置 mosaico-deck 上显示的状态（一般不用 —— 状态会自动跟着 agent 走）。',
+        description:
+            'Set what the mosaico-deck displays. Rarely needed: the display already '
+            + 'follows the agent automatically through host events.',
         parameters: {
             detail: { type: 'string' },
             target: { type: 'string' },
-            state: { type: 'string', enum: ['idle', 'thinking', 'running', 'editing', 'testing', 'waiting', 'done', 'error'] },
-            progress: { type: 'number' },
+            state: {
+                type: 'string',
+                enum: ['idle', 'thinking', 'running', 'editing', 'testing', 'waiting', 'done', 'error'],
+            },
+            progress: { type: 'number', description: 'Zero to one.' },
             logLine: { type: 'string' },
         },
-        output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
+        output: textOutput((v) => v.message),
         async execute(args) {
             if (args.detail !== undefined) state.detail = String(args.detail);
             if (args.target !== undefined) state.target = String(args.target);
@@ -296,18 +371,24 @@ export function apply(ctx) {
             if (args.progress !== undefined) state.progress = Number(args.progress);
             if (args.logLine) pushLog(String(args.logLine));
             const n = await paint();
-            return { message: n ? `已更新（${n} 条 band）` : '没变化' };
+            return { message: n ? `updated (${n} bands)` : 'no change' };
         },
-        presentCall: () => ({ card: 'generic', kind: 'read', title: '更新设备状态' }),
+        presentCall: () => ({ card: 'generic', kind: 'read', title: 'Update device display' }),
     }));
 
-    ctx.logger?.info?.(`mosaico-deck: ${checkEnvironment().python} / 端口 ${findPort() || '未找到'}`);
+    ctx.logger?.info?.(
+        `mosaico-deck: python=${checkEnvironment().python} port=${findPort() ?? 'none'}`,
+    );
 }
 
-/** 用 macOS 的 say + ffmpeg 生成板子要的 48kHz 立体声 PCM。
+/** Synthesize speech into the PCM format the board expects.
  *
- * TTS 放在 PC 上：板子只有 512KB SRAM、没有神经网络加速，跑不了任何像样的
- * TTS；而系统自带的 `say` 音质好、支持中文。板子只负责把 PCM 播出来。
+ * TTS lives on the PC on purpose: the board has 512 KB of SRAM and no neural
+ * acceleration, so it cannot run any real TTS. macOS say is high quality and
+ * speaks Chinese out of the box. The board only plays the samples.
+ *
+ * Output must be 48 kHz interleaved stereo 16-bit, matching the I2S/codec
+ * configuration in components/audio.
  */
 async function textToPcm(text, voice) {
     const { execFile } = await import('node:child_process');
@@ -325,9 +406,10 @@ async function textToPcm(text, voice) {
         if (voice) sayArgs.push('-v', voice);
         sayArgs.push(text);
         await run('say', sayArgs, { timeout: 60000 });
-        await run('ffmpeg', ['-y', '-loglevel', 'error', '-i', aiff,
-            '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '48000', '-ac', '2', pcm],
-            { timeout: 60000 });
+        await run('ffmpeg', [
+            '-y', '-loglevel', 'error', '-i', aiff,
+            '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '48000', '-ac', '2', pcm,
+        ], { timeout: 60000 });
         return fs.readFileSync(pcm);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });

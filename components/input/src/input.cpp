@@ -1,14 +1,15 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// input 实现。见 include/input.h 里的原理说明。
+// input implementation. See the rationale in include/input.h.
 //
-// 两个 bool 的分工
-// ----------------
-//   raw_pressed_ —— 已经确认（去抖后）的电平，业务逻辑只看它
-//   stable_      —— 上一次采样值，只用于和本次采样比较
-// 每次调用先和 stable_ 比：不同就只更新 stable_ 并返回，等下一次采样再来确认。
-// 调用周期约 25 ms，所以"连续两次相同"正好是 50 ms 的消抖窗。
+// Division of labour between the two bools
+// ----------------------------------------
+//   raw_pressed_ -- the confirmed (debounced) level; business logic only looks at this
+//   stable_      -- the previous sample value, used only to compare against this sample
+// Each call first compares with stable_: if they differ, only update stable_ and
+// return, then wait for the next sample to confirm. The call period is about
+// 25 ms, so "two identical samples in a row" is exactly a 50 ms debounce window.
 
 #include "input.h"
 
@@ -22,18 +23,24 @@ namespace {
 
 constexpr const char* kTag = "input";
 
-// 板级引脚由 config 组件给出，不写死数字；取个别名免得每处都写全限定名。
+// The board pin comes from the config component rather than a hard-coded number;
+// take an alias so every use does not need the fully qualified name.
 constexpr int kButtonPin = fluidbox::board::kPinButtonAi;
 
-// 短按上限：按下到松开不超过 1.5 秒。更长的按下算长按，不报告（Mosaico 上
-// 没有"长按关机"那套硬件联动，但行为和原项目保持一致）。
-// **长按门限：按住超过它算长按，松开在它之内算短按。**
+// Short-press upper bound: no more than 1.5 seconds from press to release. A
+// longer hold counts as a long press and is not reported (the Mosaico has no
+// "long press to power off" hardware linkage, but the behaviour stays consistent
+// with the original project).
+// **Long-press threshold: holding beyond it counts as a long press, releasing
+// within it counts as a short press.**
 //
-// 原来是 1.5 秒 —— 太长了。实测用户的自然按法是 160~250ms 的轻点（日志里
-// 六次短按分别是 159/203/250/201/190/160 ms），根本够不到 1.5 秒，
-// 于是长按（切换触摸力度）永远触发不了。
+// It used to be 1.5 seconds -- far too long. Measured natural user presses are
+// 160~250 ms taps (six short presses in the log were 159/203/250/201/190/160 ms
+// respectively), nowhere near 1.5 seconds, so the long press (toggle touch force)
+// could never trigger.
 //
-// 0.8 秒仍然明显区别于"轻点"，但按住不放的意图能表达出来。
+// 0.8 seconds is still clearly distinct from a "tap", yet the intent of holding
+// the button down can be expressed.
 constexpr int64_t kShortPressMaxUs = 800'000;
 
 }  // namespace
@@ -42,27 +49,30 @@ esp_err_t ResetButton::Init() {
     gpio_config_t cfg = {};
     cfg.pin_bit_mask = 1ULL << kButtonPin;
     cfg.mode = GPIO_MODE_INPUT;
-    // 按键另一端接 GND、低电平有效，所以必须靠内部上拉给出空闲时的高电平。
+    // The other side of the button goes to GND and it is active low, so the
+    // internal pull-up is required to provide the high level when idle.
     cfg.pull_up_en = GPIO_PULLUP_ENABLE;
     cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     cfg.intr_type = GPIO_INTR_DISABLE;
 
     const esp_err_t err = gpio_config(&cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(kTag, "AI 按键 (GPIO%d) 配置失败: %s", kButtonPin,
+        ESP_LOGE(kTag, "failed to configure AI button (GPIO%d): %s", kButtonPin,
                  esp_err_to_name(err));
         return err;
     }
 
-    // 从上电时的"未按下"状态重新开始，免得 Init 之前残留的采样值造成误报。
+    // Restart from the "not pressed" state as of power-up, so that sample values
+    // left over before Init cannot cause a spurious report.
     raw_pressed_ = false;
     stable_ = false;
     press_start_us_ = 0;
     reported_ = false;
 
-    ESP_LOGI(kTag, "AI 按键就绪 (GPIO%d, 低电平有效)", kButtonPin);
+    ESP_LOGI(kTag, "AI button ready (GPIO%d, active low)", kButtonPin);
     return ESP_OK;
-    // 诊断用：把官方的 BOOT 键脚也配成输入（只读，上拉）。
+    // Diagnostic: also configure the official BOOT key pin as an input
+    // (read-only, pull-up).
     const gpio_config_t probe_cfg = {
         .pin_bit_mask = 1ULL << 61,
         .mode = GPIO_MODE_INPUT,
@@ -75,17 +85,18 @@ esp_err_t ResetButton::Init() {
 }
 
 ResetButton::Event ResetButton::Poll() {
-    // 低电平有效：读到 0 才是按下。
+    // Active low: it counts as pressed only when 0 is read.
     const bool pressed = (gpio_get_level(static_cast<gpio_num_t>(kButtonPin)) == 0);
     const int64_t now = esp_timer_get_time();
 
-    // 去抖第一步：和上次采样不同，说明还在抖动，先记下来等下一次确认。
+    // Debounce step one: differing from the previous sample means it is still
+    // bouncing; note it down and wait for the next confirmation.
     if (pressed != stable_) {
         stable_ = pressed;
         return Event::kNone;
     }
 
-    // 电平已确认。如果是"刚按下"，只需要起表。
+    // The level is confirmed. If this is a "just pressed", only start the clock.
     if (pressed != raw_pressed_) {
         raw_pressed_ = pressed;
         if (pressed) {
@@ -94,24 +105,25 @@ ResetButton::Event ResetButton::Poll() {
             long_reported_ = false;
             return Event::kNone;
         }
-        // 松开沿：短按在这里判定。
+        // Release edge: the short press is decided here.
         if (reported_) {
             return Event::kNone;
         }
         reported_ = true;
         const int64_t held_us = now - press_start_us_;
         if (held_us >= kShortPressMaxUs) {
-            // 长按已经在按住期间报过了，这里不再重复。
+            // The long press was already reported while held; do not repeat it here.
             return Event::kNone;
         }
-        ESP_LOGI(kTag, "短按 %lld ms", static_cast<long long>(held_us / 1000));
+        ESP_LOGI(kTag, "short press %lld ms", static_cast<long long>(held_us / 1000));
         return Event::kShortPress;
     }
 
-    // 状态没变。如果正按着且已经超过长按门限，就地报一次。
+    // State unchanged. If it is being held and the long-press threshold has
+    // already passed, report it right here, once.
     if (pressed && !long_reported_ && now - press_start_us_ >= kShortPressMaxUs) {
         long_reported_ = true;
-        ESP_LOGI(kTag, "长按 -> 切换触摸力度");
+        ESP_LOGI(kTag, "long press -> toggle touch force");
         return Event::kLongPress;
     }
     return Event::kNone;

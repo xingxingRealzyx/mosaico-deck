@@ -1,21 +1,24 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// selftest.mjs —— 重启前把插件安全地"预演"一遍
+// selftest.mjs -- safely "dry-run" the plugin before restarting
 //
-// 为什么需要它：profile 的 bundle 只在启动时组装，改完插件必须重启 DSH 才生效。
-// 而**如果插件在加载时抛异常，可能连 DSH 都起不来** —— 那时候连改回来的机会
-// 都没有。所以重启前先用一个模拟的 cordis ctx 把 apply() 真跑一遍。
+// Why it is needed: a profile's bundle is only assembled at startup, so after changing
+// the plugin you must restart DSH for it to take effect. And **if the plugin throws while
+// loading, DSH itself may fail to start** -- at which point there is no chance to change
+// it back. So before restarting, run apply() for real with a simulated cordis ctx.
 //
-//   # **必须在 profile 目录下跑**（插件里 import 的 @deepseek-ai/* 在
-//   # ~/.dsh/profiles/node_modules 里，从源码目录往上找不到）
+//   # **must be run from the profile directory** (the @deepseek-ai/* modules imported by
+//   # the plugin live in ~/.dsh/profiles/node_modules, which cannot be found by walking
+//   # up from the source directory)
 //   cd ~/.dsh/profiles/desktop && node <repo>/plugin/selftest.mjs
 //
-//   默认检查已安装的那份；也可以显式给路径：
+//   By default it checks the installed copy; you can also give an explicit path:
 //   node selftest.mjs /path/to/lib/index.js
 //
-// 它检查：模块能 import、导出了 name/inject/apply、apply() 不抛异常、
-// 工具注册成功、事件处理器在收到空/null payload 时也不崩。
+// It checks: the module can be imported, it exports name/inject/apply, apply() does not
+// throw, the tools register successfully, and the event handlers do not crash even when
+// they receive empty/null payloads.
 
 const registered = [];
 const listeners = new Map();
@@ -30,46 +33,47 @@ const ctx = {
     logger: { info: (m) => logs.push(`I ${m}`), debug: (m) => logs.push(`D ${m}`) },
 };
 
-// 默认检查**安装后的那一份** —— 那才是重启时真正会被加载的代码。
+// By default check **the installed copy** -- that is the code actually loaded on restart.
 const spec = process.argv[2] || 'dsh-mosaico-deck';
 let mod;
 try {
     mod = await import(spec);
 } catch (e) {
-    console.log(`  ❌ import 失败: ${e.message.split('\n')[0]}`);
+    console.log(`  [FAIL] import failed: ${e.message.split('\n')[0]}`);
     process.exit(1);
 }
-console.log('  ✅ import 成功');
+console.log('  [ok] import ok');
 
 if (typeof mod.apply !== 'function' || typeof mod.name !== 'string') {
-    console.log('  ❌ 必须导出 name 和 apply');
+    console.log('  [FAIL] must export name and apply');
     process.exit(1);
 }
-console.log(`  ✅ name = ${mod.name}  inject = ${JSON.stringify(mod.inject)}`);
+console.log(`  [ok] name = ${mod.name}  inject = ${JSON.stringify(mod.inject)}`);
 
 try {
     mod.apply(ctx);
 } catch (e) {
-    console.log(`  ❌ apply() 抛异常: ${e.message}`);
+    console.log(`  [FAIL] apply() threw: ${e.message}`);
     console.log(e.stack.split('\n').slice(0, 4).join('\n'));
     process.exit(1);
 }
-console.log('  ✅ apply() 正常返回');
-console.log(`  ✅ 注册了 ${registered.length} 个工具: ${registered.map((t) => t.name).join(', ')}`);
-console.log(`  ✅ 监听了 ${listeners.size} 个事件: ${[...listeners.keys()].join(', ')}`);
+console.log('  [ok] apply() returned normally');
+console.log(`  [ok] registered ${registered.length} tools: ${registered.map((t) => t.name).join(', ')}`);
+console.log(`  [ok] listening to ${listeners.size} events: ${[...listeners.keys()].join(', ')}`);
 
 const fire = (ev, payload) => {
     let ok = true;
     for (const fn of listeners.get(ev) || []) {
         try { fn(payload); } catch (e) {
-            console.log(`  ❌ 事件 ${ev} 的处理器抛异常: ${e.message}`);
+            console.log(`  [FAIL] handler for event ${ev} threw: ${e.message}`);
             ok = false;
         }
     }
     return ok;
 };
 
-// **空 payload 和 null 都要试** —— 宿主事件的结构不保证，插件不能挑食。
+// **Try both empty and null payloads** -- the host's event shapes are not guaranteed,
+// and the plugin must not be picky.
 let ok = true;
 ok = fire('agent/status', { status: 'running' }) && ok;
 ok = fire('agent/status', { status: 'idle' }) && ok;
@@ -77,11 +81,11 @@ ok = fire('tools/pre-execute', { call: { name: 'bash', arguments: { command: 'ls
 ok = fire('tools/pre-execute', {}) && ok;
 ok = fire('tools/pre-execute', null) && ok;
 ok = fire('tools/post-execute', {}) && ok;
-ok = fire('assistant/message', { message: { content: [{ type: 'text', text: '你好' }] } }) && ok;
+ok = fire('assistant/message', { message: { content: [{ type: 'text', text: 'hello' }] } }) && ok;
 ok = fire('assistant/message', {}) && ok;
 ok = fire('agent/error', {}) && ok;
-console.log(ok ? '  ✅ 所有事件处理器都没崩（含空/null payload）' : '  ❌ 有处理器抛异常');
+console.log(ok ? '  [ok] no event handler crashed (including empty/null payloads)' : '  [FAIL] a handler threw');
 
 for (const fn of listeners.get('dispose') || []) fn();
-console.log(`  ✅ dispose 正常  ${logs[0] ? `| ${logs[0].slice(0, 90)}` : ''}`);
-console.log('\n✅ 可以安全重启 DeepSeek Harness');
+console.log(`  [ok] dispose ok  ${logs[0] ? `| ${logs[0].slice(0, 90)}` : ''}`);
+console.log('\n[ok] safe to restart DeepSeek Harness');

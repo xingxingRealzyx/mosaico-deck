@@ -1,7 +1,7 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// touch.cpp —— CST9220 电容触摸
+// touch.cpp -- CST9220 capacitive touch
 
 #include "touch.h"
 
@@ -20,33 +20,44 @@ namespace {
 
 constexpr const char* kTag = "touch";
 
-// 触摸报告里的坐标上限。Mosaico 是 480x480，官方也是这么传的
-//（esp_lcd_touch 的 mirror 是 (max - value)，所以这里要传**最大有效坐标**）。
+// Coordinate maximum in the touch reports. Mosaico is 480x480, and the official
+// code passes it the same way (esp_lcd_touch's mirror is (max - value), so what
+// must be passed here is the **maximum valid coordinate**).
 constexpr uint16_t kTouchXMax = config::kLcdHRes - 1;
 constexpr uint16_t kTouchYMax = config::kLcdVRes - 1;
 
-// 官方 BSP 的 I2C 超时是 100ms。**必须是非 0** —— 底层注释写得很清楚：
-// "Left at 0 the transfer waits forever"。而这里的读发生在渲染/仿真的周期里，
-// 一旦总线被拉死就会把整个画面卡住。
+// The official BSP uses a 100 ms I2C timeout. **It must be non-zero** -- the
+// underlying comment says it plainly: "Left at 0 the transfer waits forever".
+// And this read happens inside the render/simulation cycle, so once the bus is
+// wedged it would freeze the whole picture.
 constexpr uint32_t kTouchI2cTimeoutMs = 100;
 
-// **多久没解出有效的点，才算真的松手（毫秒）。**
+// **How long without a valid point decoded before it really counts as a release
+// (milliseconds).**
 //
-// 这是"触摸疯狂闪断"的解法，而且原因是从日志里抓到的：
+// This is the fix for "touch flickering madly", and the cause was caught from the
+// logs:
 //
 //     W cst9220: Malformed report header: first=0xab marker=0xab
 //
-// **I2C 读回来的报告时不时是坏的**（这条总线和 100Hz 的 IMU 共用）。坏报告解不出
-// 点，而"解不出点"被当成了"松手" —— 于是按住不动时日志里"按下-抬起"成对刷屏，
-// 同一个坐标重复几十次。**受力每几毫秒通断一次**，等于一直在激励系统。
+// **Reports read back over I2C are occasionally corrupt** (this bus is shared
+// with the 100 Hz IMU). A corrupt report yields no point, and "no point decoded"
+// was being treated as "release" -- so while the finger was held still, the log
+// spammed press-release pairs, repeating the same coordinate dozens of times.
+// **The force switched on and off every few milliseconds**, which amounts to
+// constantly exciting the system.
 //
-// 第一版按"连续 4 次空报告"（12ms）去抖，**不够** —— 实测闪断的间隔有几十毫秒。
-// 改成基于时间：100ms 内只要解出过一次有效的点，就认为手指还在。
+// The first version debounced on "4 consecutive empty reports" (12 ms) and that
+// was **not enough** -- measured flicker gaps were tens of milliseconds.
+// Changed to a time-based rule: if a valid point was decoded at least once within
+// 100 ms, the finger is considered still down.
 //
-// 关键是语义要对：**读失败/报告坏 = "不知道"，不能当成"松手"。**
+// The key point is to get the semantics right: **a failed read / corrupt report
+// = "unknown", and must not be treated as "release".**
 constexpr int64_t kReleaseTimeoutUs = 100 * 1000;
 
-// 下面所有对 state_ 的写入都在这个临界区里，和 Get() 配对。
+// All writes to state_ below happen inside this critical section, paired with
+// Get().
 float ClampSpeed(float v) {
     if (v > config::kTouchMaxSpeedPxS) {
         return config::kTouchMaxSpeedPxS;
@@ -61,13 +72,14 @@ float ClampSpeed(float v) {
 
 
 
-// 松手判定：距最后一次解出有效点超过 kReleaseTimeoutUs 才算松手。
+// Release decision: only counts as a release once kReleaseTimeoutUs has passed
+// since the last valid point was decoded.
 void Touchscreen::MaybeRelease(int64_t now_us) {
     if (!state_.active || last_valid_us_ == 0) {
         return;
     }
     if (now_us - last_valid_us_ < kReleaseTimeoutUs) {
-        return;  // 还在容错窗内，认为手指仍然按着
+        return;  // still inside the tolerance window, treat the finger as down
     }
     portENTER_CRITICAL(&lock_);
     state_.active = false;
@@ -81,27 +93,29 @@ esp_err_t Touchscreen::Init(i2c_master_bus_handle_t bus) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!config::kTouchEnable) {
-        ESP_LOGI(kTag, "触摸已按配置关闭");
+        ESP_LOGI(kTag, "touch disabled by configuration");
         return ESP_OK;
     }
 
-    // INT 自己看：配成普通输入即可，驱动那边传 GPIO_NUM_NC。
-    // 两套逻辑同时管同一个脚会互相打架（驱动默认会开 GPIO 中断）。
+    // INT is watched here: configure it as a plain input and pass GPIO_NUM_NC to
+    // the driver. Two pieces of logic managing the same pin at once would fight
+    // each other (the driver would enable a GPIO interrupt by default).
     const gpio_config_t int_cfg = {
         .pin_bit_mask = 1ULL << fluidbox::board::kPinTouchInt,
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,  // INT 低有效，上拉保证松手时是高
+        .pull_up_en = GPIO_PULLUP_ENABLE,  // INT is active low; pull-up keeps it high when released
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     const esp_err_t int_err = gpio_config(&int_cfg);
     if (int_err != ESP_OK) {
-        ESP_LOGW(kTag, "INT 脚 GPIO%d 配置失败: %s",
+        ESP_LOGW(kTag, "failed to configure INT pin GPIO%d: %s",
                  fluidbox::board::kPinTouchInt, esp_err_to_name(int_err));
     }
 
-    // 逐字段赋值：C++ 里用宏初始化聚合体会触到 -Wmissing-field-initializers 和
-    // 指示符顺序的坑（本工程在显示那边踩过）。
+    // Field-by-field assignment: initializing aggregates with macros in C++ runs
+    // into -Wmissing-field-initializers and designated-initializer ordering
+    // pitfalls (this project already hit them on the display side).
     esp_lcd_panel_io_i2c_config_t io_config = {};
     io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_CST9220_ADDRESS;
     io_config.scl_speed_hz = fluidbox::board::kI2cFreqHz;
@@ -115,16 +129,17 @@ esp_err_t Touchscreen::Init(i2c_master_bus_handle_t bus) {
     esp_lcd_panel_io_handle_t io = nullptr;
     esp_err_t err = esp_lcd_new_panel_io_i2c(bus, &io_config, &io);
     if (err != ESP_OK) {
-        ESP_LOGE(kTag, "创建触摸 IO 失败: %s", esp_err_to_name(err));
+        ESP_LOGE(kTag, "failed to create touch IO: %s", esp_err_to_name(err));
         return err;
     }
 
-    // rotation 0 下的方向：官方 BSP 的 BSP_TOUCH_BASE_* 三个都是 false。
+    // Orientation at rotation 0: all three of the official BSP's
+    // BSP_TOUCH_BASE_* values are false.
     const esp_lcd_touch_config_t touch_config = {
         .x_max = kTouchXMax,
         .y_max = kTouchYMax,
-        .rst_gpio_num = GPIO_NUM_NC,  // 官方 BSP_LCD_TOUCH_RST = GPIO_NUM_NC，没接
-        .int_gpio_num = GPIO_NUM_NC,  // 自己看，见上
+        .rst_gpio_num = GPIO_NUM_NC,  // official BSP_LCD_TOUCH_RST = GPIO_NUM_NC, not wired
+        .int_gpio_num = GPIO_NUM_NC,  // watched here instead, see above
         .levels = {.reset = 0, .interrupt = 0},
         .flags = {.swap_xy = 0, .mirror_x = 0, .mirror_y = 0},
     };
@@ -132,7 +147,7 @@ esp_err_t Touchscreen::Init(i2c_master_bus_handle_t bus) {
     esp_lcd_touch_handle_t tp = nullptr;
     err = esp_lcd_touch_new_i2c_cst9220(io, &touch_config, &tp);
     if (err != ESP_OK) {
-        ESP_LOGE(kTag, "CST9220 初始化失败: %s（触摸不可用，其余功能不受影响）",
+        ESP_LOGE(kTag, "CST9220 init failed: %s (touch unavailable, other features unaffected)",
                  esp_err_to_name(err));
         esp_lcd_panel_io_del(io);
         return err;
@@ -140,7 +155,7 @@ esp_err_t Touchscreen::Init(i2c_master_bus_handle_t bus) {
 
     io_ = io;
     tp_ = tp;
-    ESP_LOGI(kTag, "CST9220 就绪 (INT=GPIO%d, 复用 I2C SDA=%d SCL=%d)",
+    ESP_LOGI(kTag, "CST9220 ready (INT=GPIO%d, shared I2C SDA=%d SCL=%d)",
              fluidbox::board::kPinTouchInt, fluidbox::board::Active().i2c_sda,
              fluidbox::board::Active().i2c_scl);
     return ESP_OK;
@@ -158,14 +173,17 @@ void Touchscreen::Poll() {
         return;
     }
 
-    // INT 低有效，且只在有触摸事件（按下/移动/抬起）时才拉低。
+    // INT is active low and is only pulled low when there is a touch event
+    // (press/move/release).
     //
-    // **先看这个脚再决定要不要读 I2C**：底层 read_data 会无条件读一次总线，
-    // 而这条总线还挂着 IMU（100Hz）。不做门控的话，一次没人碰的轮询也要付
-    // 一次 I2C 传输的代价，而且会和 IMU 抢总线。
+    // **Check this pin first before deciding whether to read I2C**: the underlying
+    // read_data reads the bus unconditionally, and this bus also carries the IMU
+    // (100 Hz). Without gating, a poll with nobody touching would still pay for
+    // one I2C transfer and compete with the IMU for the bus.
     if (gpio_get_level(static_cast<gpio_num_t>(fluidbox::board::kPinTouchInt)) != 0) {
-        // 没有新事件 —— 手指可能真的离开了（INT 只在有事件时拉低），
-        // 也可能只是这段空窗。以"最后一次解出有效点"为准，见 kReleaseTimeoutUs。
+        // No new event -- the finger may genuinely have left (INT is only pulled
+        // low while there are events), or this may just be a quiet gap. Go by
+        // "the last valid point decoded", see kReleaseTimeoutUs.
         MaybeRelease(esp_timer_get_time());
         return;
     }
@@ -180,12 +198,15 @@ void Touchscreen::Poll() {
     esp_lcd_touch_point_data_t points[1] = {};
     uint8_t count = 0;
     if (esp_lcd_touch_get_data(tp, points, &count, 1) != ESP_OK || count == 0) {
-        // 抬起事件：CST9220 会发一条状态位被清掉的记录，坐标仍然是旧的，
-        // 所以必须靠 count 判断，不能靠坐标。
+        // Release event: the CST9220 sends a record with the status bit cleared
+        // while the coordinates are still the old ones, so this must be decided by
+        // count, not by the coordinates.
         //
-        // **读不出点 ≠ 松手。** 报告可能是坏的（日志里能抓到 Malformed report
-        // header），也可能是协议上的空报告。只有当"最后一次有效点"超过
-        // kReleaseTimeoutUs 才算真的松手 —— 否则受力会每几毫秒通断一次。
+        // **No point decoded != release.** The report may be corrupt (the log
+        // catches "Malformed report header"), or it may be an empty report per
+        // protocol. Only when the "last valid point" is older than
+        // kReleaseTimeoutUs does it really count as a release -- otherwise the
+        // force would switch on and off every few milliseconds.
         MaybeRelease(now_us);
         return;
     }
@@ -194,17 +215,20 @@ void Touchscreen::Poll() {
     const float x = static_cast<float>(points[0].x);
     const float y = static_cast<float>(points[0].y);
 
-    // 整段收尾在**一个**临界区里：位置、速度、active 必须一起被读者看到，
-    // 否则 Get() 可能拿到"新位置 + 旧速度"这种组合。
+    // The whole tail end is inside **one** critical section: position, velocity
+    // and active must be seen by readers together, otherwise Get() could get a
+    // combination such as "new position + old velocity".
     portENTER_CRITICAL(&lock_);
     if (state_.active && last_us_ > 0) {
         const float dt = static_cast<float>(now_us - last_us_) * 1e-6f;
         if (dt > 1e-4f) {
-            // 差分求速度，再做一阶低通。
+            // Differentiate for velocity, then apply a first-order low-pass.
             //
-            // **低通是必须的**：触摸的坐标有量化抖动，直接微分会得到几百甚至上千
-            // px/s 的假速度，液体就会自己乱抖。时间常数取几十毫秒，跟得上手指、
-            // 又压得住抖动。
+            // **The low-pass is necessary**: the touch coordinates have
+            // quantisation jitter, and differentiating directly would produce
+            // fake velocities of hundreds or even thousands of px/s, making the
+            // fluid jitter on its own. A time constant of tens of milliseconds
+            // keeps up with the finger while suppressing the jitter.
             const float nvx = ClampSpeed((x - static_cast<float>(state_.x)) / dt);
             const float nvy = ClampSpeed((y - static_cast<float>(state_.y)) / dt);
             const float a = dt / (config::kTouchVelLpfTauS + dt);
@@ -212,7 +236,7 @@ void Touchscreen::Poll() {
             state_.vy += (nvy - state_.vy) * a;
         }
     } else {
-        // 刚按下：没有历史，速度从 0 开始。
+        // Just pressed: there is no history, so velocity starts at 0.
         state_.vx = 0.0f;
         state_.vy = 0.0f;
     }

@@ -23,7 +23,7 @@ using InputBuffer = std::basic_string_view<uint8_t>;
 using OutputBuffer = std::basic_string<uint8_t>;
 
 // ---------------------------------------------------------------------------
-// Free functions — time, delay, scheduling
+// Free functions -- time, delay, scheduling
 // ---------------------------------------------------------------------------
 
 /// Convert milliseconds to FreeRTOS ticks.
@@ -166,7 +166,7 @@ class RecursiveMutex {
 };
 
 // ---------------------------------------------------------------------------
-// LockGuard — RAII lock for Mutex / RecursiveMutex
+// LockGuard -- RAII lock for Mutex / RecursiveMutex
 // ---------------------------------------------------------------------------
 
 template <typename MutexType>
@@ -206,7 +206,7 @@ class Semaphore {
 };
 
 // ---------------------------------------------------------------------------
-// CountingSemaphore — used by the display's band double-buffering
+// CountingSemaphore -- used by the display's band double-buffering
 // ---------------------------------------------------------------------------
 
 class CountingSemaphore {
@@ -227,7 +227,7 @@ class CountingSemaphore {
 };
 
 // ---------------------------------------------------------------------------
-// Queue — type-safe FreeRTOS queue
+// Queue -- type-safe FreeRTOS queue
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -299,7 +299,7 @@ class RingBuffer {
     bool Send(InputBuffer buf, uint32_t timeout_ms = UINT32_MAX);
 
     /// Receive data. The returned view points into the ring buffer's internal
-    /// storage — call ReturnItem() when done.  Empty view on timeout.
+    /// storage -- call ReturnItem() when done.  Empty view on timeout.
     InputBuffer Receive(uint32_t timeout_ms = UINT32_MAX);
 
     /// Return a previously received item back to the ring buffer.
@@ -344,7 +344,7 @@ class Timer {
 };
 
 // ---------------------------------------------------------------------------
-// CriticalSection — RAII wrapper for taskENTER/EXIT_CRITICAL
+// CriticalSection -- RAII wrapper for taskENTER/EXIT_CRITICAL
 // ---------------------------------------------------------------------------
 
 class CriticalSection {
@@ -357,7 +357,7 @@ class CriticalSection {
 };
 
 // ---------------------------------------------------------------------------
-// DeltaTimer — measure elapsed time between calls
+// DeltaTimer -- measure elapsed time between calls
 // ---------------------------------------------------------------------------
 
 class DeltaTimer {

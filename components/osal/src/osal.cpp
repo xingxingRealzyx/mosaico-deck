@@ -1,7 +1,7 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// Operating System Abstraction Layer — implementation.
+// Operating System Abstraction Layer -- implementation.
 
 #include "osal.h"
 
@@ -45,10 +45,11 @@ void Delay(uint32_t ms) { vTaskDelay(MsToTicks(ms)); }
 void Yield() { taskYIELD(); }
 
 uint64_t TimeUs() {
-    // 必须用 esp_timer 的**单调**时钟，不能用 gettimeofday：
-    // 后者会被 SNTP 校时 / settimeofday 往前后拉，而仿真步长是靠两次
-    // TimeUs() 相减算出来的 —— 时间被往回拨一次，就会算出一个负的 dt。
-    // input.cpp 一直是直接用 esp_timer_get_time()，这里统一过来。
+    // The **monotonic** clock of esp_timer must be used here, not gettimeofday:
+    // the latter is pulled forwards and backwards by SNTP time sync /
+    // settimeofday, whereas the simulation step is computed by subtracting two
+    // TimeUs() values -- one backwards adjustment produces a negative dt.
+    // input.cpp has always used esp_timer_get_time() directly; this unifies it.
     return static_cast<uint64_t>(esp_timer_get_time());
 }
 
@@ -475,7 +476,7 @@ uint32_t DeltaTimer::ElapsedUs() {
 }  // namespace osal
 
 // ===========================================================================
-// FreeRTOS hook functions (weak — user can override)
+// FreeRTOS hook functions (weak -- user can override)
 // ===========================================================================
 
 extern "C" __attribute__((weak))

@@ -1,20 +1,22 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// audio.h —— ES8311 音频（喇叭 + 麦克风）
+// audio.h -- ES8311 audio (speaker + microphone)
 //
-// 这块板子本质上是个完整的语音设备：ES8311 codec + 功放 + 麦克风 + I2S。
-// 官方 BSP 的 `BSP_CAPS_AUDIO_SPEAKER` 和 `BSP_CAPS_AUDIO_MIC` 都是 1。
+// This board is essentially a complete voice device: ES8311 codec + power amplifier +
+// microphone + I2S. The official BSP's `BSP_CAPS_AUDIO_SPEAKER` and
+// `BSP_CAPS_AUDIO_MIC` are both 1.
 //
-// 引脚（官方 esp_mosaico.h）
-// ------------------------
-//   MCLK=GPIO54  BCLK=GPIO37  WS=GPIO49  DOUT=GPIO52（放）  DIN=GPIO40（录）
-//   PA_CTRL=GPIO45（功放使能，由 codec 驱动代管）
-//   codec 地址 0x19（8 位形式 0x32）
+// Pins (official esp_mosaico.h)
+// ----------------------------
+//   MCLK=GPIO54  BCLK=GPIO37  WS=GPIO49  DOUT=GPIO52 (out)  DIN=GPIO40 (in)
+//   PA_CTRL=GPIO45 (power amplifier enable, managed by the codec driver)
+//   codec address 0x19 (8-bit form 0x32)
 //
-// **codec 供电在 V1.2 上不用管。** 官方 bsp_power_set_codec_3v3() 里有一句
-// `if (!is_v1_0()) return ESP_OK;` —— V1.2 取消了那个控制脚（GPIO56 被挪去当
-// I2C SDA 了）。本工程实测就是 V1.2，所以不碰它。
+// **codec power does not need to be handled on V1.2.** The official
+// bsp_power_set_codec_3v3() contains
+// `if (!is_v1_0()) return ESP_OK;` -- V1.2 removed that control pin (GPIO56 was moved
+// to be I2C SDA). This project has been measured to be V1.2, so we leave it alone.
 
 #pragma once
 
@@ -25,35 +27,37 @@
 
 namespace audio {
 
-// 和官方 BSP 一致：48kHz / 16bit / 立体声。
+// Same as the official BSP: 48kHz / 16bit / stereo.
 //
-// 为什么不做 16kHz 单声道省带宽：codec 的时钟是初始化时按采样率配好的，
-// 换采样率要连同 MCLK 分频一起改，而 USB 的 1.5MB/s 完全带得动 192KB/s。
-// 语音场景 48kHz 是浪费，但省下来的是复杂度，不是瓶颈。
+// Why not use 16kHz mono to save bandwidth: the codec clock is configured for the sample
+// rate at init time, so changing the sample rate means also changing the MCLK divider,
+// and USB's 1.5MB/s carries 192KB/s without any trouble.
+// 48kHz is wasteful for voice, but what it saves is complexity, not a bottleneck.
 inline constexpr int kSampleRate = 48000;
 inline constexpr int kChannels = 2;
 inline constexpr int kBitsPerSample = 16;
 inline constexpr size_t kFrameBytes = kChannels * (kBitsPerSample / 8);  // 4
 
-// I2S + codec（DAC 和 ADC 一起建）。
-// 必须在 I2C 总线建好之后调用 —— codec 是挂在 I2C 上配置的。
+// I2S + codec (DAC and ADC are created together).
+// Must be called after the I2C bus has been created -- the codec is configured over I2C.
 esp_err_t Init(void* i2c_bus);
 
 bool ready();
 
-// ---- 放音 ------------------------------------------------------------------
-// buf 是**交错立体声** 16 位 PCM。size 是字节数。
-// 阻塞写，超时返回实际写入的字节数（可能少于 size）。
+// -- playback --------------------------------
+// buf is **interleaved stereo** 16-bit PCM. size is a byte count.
+// Blocking write; on timeout it returns the number of bytes actually written (may be
+// less than size).
 size_t Play(const void* buf, size_t size, uint32_t timeout_ms);
 
-// 音量 0~100。
+// Volume 0~100.
 esp_err_t SetVolume(int percent);
 
-// ---- 录音 ------------------------------------------------------------------
-// 读出交错立体声 16 位 PCM。返回实际读到的字节数。
+// -- recording -------------------------------
+// Reads out interleaved stereo 16-bit PCM. Returns the number of bytes actually read.
 size_t Record(void* buf, size_t size, uint32_t timeout_ms);
 
-// 麦克风的音量（0~100）。
+// Microphone volume (0~100).
 esp_err_t SetMicGain(int percent);
 
 }  // namespace audio

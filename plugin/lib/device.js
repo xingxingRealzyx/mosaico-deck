@@ -1,25 +1,26 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// device.js —— 和 mosaico-deck 板子通信（纯 Node，无原生模块）
+// device.js -- talks to the mosaico-deck board (pure Node, no native modules)
 //
-// 为什么要"纯 Node"
-// ----------------
-// 这个插件跑在 DeepSeek Harness 里，而 **DSH 是签名过的 app**，任何原生 Node
-// 模块（serialport、sharp 之类）都会加载失败：
+// Why "pure Node"
+// ---------------
+// This plugin runs inside DeepSeek Harness, and **DSH is a signed app**, so any native
+// Node module (serialport, sharp and the like) fails to load:
 //
 //     code signature not valid for use in process:
 //     mapping process and mapped file (non-platform) have different Team IDs
 //
-// 这不是配置问题，是 macOS 的库验证。所以：
+// This is not a configuration problem, it is macOS library validation. So:
 //
-//   · **串口**：`stty` 把 tty 设成 raw，然后用 `fs` 直接读写设备文件。
-//     不需要 serialport。USB CDC 的波特率本来就是虚拟的 —— 设备根本不看，
-//     真正要紧的是**行规程必须关掉**（默认的 canonical 模式会改写二进制数据：
-//     换行被转换、0x11/0x13 被当流控吃掉）。
+//   . **Serial port**: `stty` sets the tty to raw, then we read and write the device
+//     file directly with `fs`. No serialport needed. The baud rate of USB CDC is
+//     virtual anyway -- the device never looks at it. What actually matters is that
+//     **the line discipline must be turned off** (the default canonical mode rewrites
+//     binary data: newlines get converted, 0x11/0x13 get eaten as flow control).
 //
-//   · **渲染**：交给 DSH 自带的那份 Python（3.12 + Pillow 都在 runtime 里），
-//     见 render.js。
+//   . **Rendering**: handed to the Python that ships with DSH (3.12 + Pillow are both
+//     in the runtime), see render.js.
 
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -35,11 +36,11 @@ const MAGIC = Buffer.from([0xde, 0xad]);
 const TYPE_BAND = 0x01;
 const TYPE_AUDIO = 0x20;
 
-const AUDIO_BYTES_PER_SEC = 48000 * 4; // 48kHz 交错立体声 16 位
+const AUDIO_BYTES_PER_SEC = 48000 * 4; // 48kHz interleaved stereo 16-bit
 
-/** 找一个 mosaico-deck 的串口。
+/** Find a mosaico-deck serial port.
  *
- * 按名字优先 —— 系统里可能插着别的 usbmodem 设备。
+ * Matching by name takes priority -- there may be other usbmodem devices plugged in.
  */
 export function findPort() {
     let names = [];
@@ -58,7 +59,7 @@ export class Deck extends EventEmitter {
         super();
         this.port = port;
         this.fd = null;
-        this._last = null; // 上一帧的 RGB，用来做 band 差分
+        this._last = null; // previous frame's RGB, used for band diffing
         this._rx = Buffer.alloc(0);
         this._pendingAudio = 0;
         this._timer = null;
@@ -69,14 +70,15 @@ export class Deck extends EventEmitter {
         return this.fd !== null;
     }
 
-    /** 打开串口。失败返回 false（不抛）—— 板子没插是很正常的状态。 */
+    /** Open the serial port. Returns false on failure (does not throw) -- the board
+     * not being plugged in is a perfectly normal state. */
     open() {
         if (this.fd !== null) return true;
         this.port = this.port || findPort();
         if (!this.port) return false;
         try {
-            // 必须先设 raw 再打开：否则中间那段时间收到的数据已经被行规程
-            // 处理过了。
+            // raw must be set before opening: otherwise any data received in the
+            // meantime has already been processed by the line discipline.
             execFileSync('stty', ['-f', this.port, 'raw', '-echo', '115200'], {
                 stdio: 'ignore',
             });
@@ -103,14 +105,14 @@ export class Deck extends EventEmitter {
             try {
                 fs.closeSync(this.fd);
             } catch {
-                /* 已经没了 */
+                /* already gone */
             }
             this.fd = null;
         }
         this.emit('close');
     }
 
-    // ---- 收 ---------------------------------------------------------------
+    // ---- receive ----------------------------------------------------------
     _pump() {
         if (this.fd === null) return;
         const buf = Buffer.alloc(16384);
@@ -120,7 +122,7 @@ export class Deck extends EventEmitter {
                 n = fs.readSync(this.fd, buf, 0, buf.length, null);
             } catch (e) {
                 if (e.code === 'EAGAIN') break;
-                // 板子被拔了 / 复位了。关掉并让上层去重连。
+                // The board was unplugged / reset. Close and let the caller reconnect.
                 this.close();
                 return;
             }
@@ -132,8 +134,9 @@ export class Deck extends EventEmitter {
 
     _parse() {
         for (;;) {
-            // 录音是"一行 JSON 报长度 + 裸 PCM"，所以要先看有没有待收的裸数据。
-            // **不能当行读** —— PCM 里全是 \n。
+            // A recording is "one line of JSON reporting the length + raw PCM", so we
+            // first check whether there is pending raw data.
+            // **It cannot be read as lines** -- PCM is full of \n.
             if (this._pendingAudio > 0) {
                 if (this._rx.length < this._pendingAudio) return;
                 const pcm = this._rx.subarray(0, this._pendingAudio);
@@ -146,7 +149,7 @@ export class Deck extends EventEmitter {
             if (nl < 0) return;
             const line = this._rx.subarray(0, nl).toString('utf8').trim();
             this._rx = this._rx.subarray(nl + 1);
-            if (!line.startsWith('{')) continue; // 板子的日志，忽略
+            if (!line.startsWith('{')) continue; // board log output, ignore
             let ev;
             try {
                 ev = JSON.parse(line);
@@ -162,12 +165,13 @@ export class Deck extends EventEmitter {
         }
     }
 
-    // ---- 发 ---------------------------------------------------------------
-    /** 往 tty 写，**必须处理 EAGAIN**。
+    // ---- send -------------------------------------------------------------
+    /** Write to the tty; **EAGAIN must be handled**.
      *
-     * 文件是 O_NONBLOCK 打开的，而整屏 450KB 一次写下去会超过 tty 的缓冲，
-     * 于是 writeSync 抛 EAGAIN。这不是错误，只是"现在写不进去，等会儿" ——
-     * 退让一下重试即可，否则一推整屏就崩。
+     * The file is opened with O_NONBLOCK, and writing a full 450KB frame in one call
+     * exceeds the tty buffer, so writeSync throws EAGAIN. That is not an error, it
+     * just means "cannot write right now, try later" -- back off and retry, otherwise
+     * pushing a full frame crashes.
      */
     _writeAll(buf) {
         let off = 0;
@@ -176,8 +180,8 @@ export class Deck extends EventEmitter {
                 off += fs.writeSync(this.fd, buf, off, buf.length - off);
             } catch (e) {
                 if (e.code === 'EAGAIN') {
-                    // 睡 1ms 再试。这里不能 await（调用方是同步的渲染循环），
-                    // 用 Atomics.wait 做一次极短的同步等待。
+                    // Sleep 1ms and retry. This cannot await (the caller is a synchronous
+                    // render loop), so use Atomics.wait for a very short synchronous wait.
                     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
                     continue;
                 }
@@ -194,11 +198,12 @@ export class Deck extends EventEmitter {
         this._writeAll(Buffer.concat([head, payload]));
     }
 
-    /** 把 RGB（480×480×3）推上去，**只发变化的那几条 band**。
+    /** Push RGB (480x480x3) up, **sending only the bands that changed**.
      *
-     * 这是整套设计的关键：整屏 450KB 在 60MHz QSPI 上要 15.4ms，而面板刷新
-     * 周期是 17ms —— 几乎相等，稍微一抖就跨越刷新、画面撕裂。而只发改动的
-     * 那几条（一行字约 1 条 band = 8.7ms）稳稳落在一次刷新之内。
+     * This is the key to the whole design: a full 450KB frame takes 15.4ms over 60MHz
+     * QSPI, while the panel refresh period is 17ms -- almost equal, so the slightest
+     * jitter crosses a refresh and the picture tears. Sending only the changed bands
+     * (one line of text is roughly 1 band = 8.7ms) lands safely inside a single refresh.
      */
     sendRgb(rgb, { force = false } = {}) {
         if (this.fd === null) return 0;
@@ -225,19 +230,21 @@ export class Deck extends EventEmitter {
             let j = 1;
             for (let i = b * BAND_PIXELS; i < (b + 1) * BAND_PIXELS; i++) {
                 const r = rgb[i * 3], g = rgb[i * 3 + 1], bl = rgb[i * 3 + 2];
-                // 标准 RGB565，高字节是 R5G3、低字节是 G3B5。
+                // Standard RGB565, the high byte is R5G3 and the low byte is G3B5.
                 const v = ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (bl >> 3);
-                // ⚠️ **必须高字节在前。**
+                // WARNING: **the high byte must come first.**
                 //
-                // 固件那边是 `buf[i] = swap16((r5 << 11) | b5)`，而 buf 是
-                // uint16_t、CPU 是小端 —— 所以落到内存里的顺序是
-                // [RGB565 高字节][低字节]。
+                // On the firmware side it is `buf[i] = swap16((r5 << 11) | b5)`, and buf is
+                // a uint16_t on a little-endian CPU -- so the order that lands in memory is
+                // [RGB565 high byte][low byte].
                 //
-                // 这里一开始写反了（低字节在前），症状很有迷惑性：
-                //   · 黑 0x0000 交换后还是黑 -> 背景看着正常
-                //   · 白 0xFFFF 交换后还是白 -> 主文字看着正常
-                //   · **彩色全串** -> 强调色文字、进度条、状态点颜色全错
-                // 于是看起来就像"字体颜色不对"。
+                // This was written backwards at first (low byte first) and the symptom was
+                // very misleading:
+                //   . black 0x0000 is still black after the swap -> the background looks fine
+                //   . white 0xFFFF is still white after the swap -> the main text looks fine
+                //   . **all colors are wrong** -> accent-colored text, progress bars and
+                //     status dots all get the wrong color
+                // So it looked like "the font color is wrong".
                 payload[j++] = (v >> 8) & 0xff;
                 payload[j++] = v & 0xff;
             }
@@ -251,14 +258,16 @@ export class Deck extends EventEmitter {
         return changed.length;
     }
 
-    /** 推一段 48kHz 交错立体声 16 位 PCM 去播放。
+    /** Push a block of 48kHz interleaved stereo 16-bit PCM for playback.
      *
-     * **必须按播放速率发。** 板子是边收边播的，播放速度被 I2S DMA 钉死在
-     * 192KB/s；一口气灌进去的话它的接收缓冲瞬间就满了（实测 99 个分块只收到
-     * 5 个）。0.97 倍速是实测出来的：4 秒的音频只超前约 16KB，稳在 64KB 缓冲内。
+     * **It must be sent at the playback rate.** The board plays while it receives, and
+     * the playback speed is pinned at 192KB/s by the I2S DMA; dumping it all in at once
+     * instantly fills its receive buffer (measured: only 5 of 99 chunks were received).
+     * The 0.97 rate factor was measured: 4 seconds of audio runs only about 16KB ahead,
+     * staying inside the 64KB buffer.
      */
     async speakPcm(pcm, { chunk = 2048 } = {}) {
-        if (this.fd === null) throw new Error('板子没连上');
+        if (this.fd === null) throw new Error('board is not connected');
         const t0 = Date.now();
         let sent = 0;
         for (let i = 0; i < pcm.length; i += chunk) {

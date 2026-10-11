@@ -1,7 +1,7 @@
 {
   "name": "dsh-mosaico-deck",
   "version": "0.1.0",
-  "description": "把 DeepSeek Harness 的状态显示在桌面上的 mosaico-deck 设备上，并让它说话、问你问题",
+  "description": "Show DeepSeek Harness status on a mosaico-deck device on your desk, let it speak, and let it ask you questions",
   "type": "module",
   "main": "lib/index.js",
   "license": "MIT",

@@ -5,6 +5,7 @@ idf_component_register(
     PRIV_REQUIRES osal esp_timer esp_system soc
 )
 
-# esp_timer_create_args_t 只初始化我们关心的字段，其余走零值默认。
-# IDF 默认 -Wextra -Werror，在 C++ 下 partial initializer 会变成硬错误。
+# esp_timer_create_args_t only initializes the fields we care about; the rest take
+# zero defaults. IDF enables -Wextra -Werror by default, which turns a partial
+# initializer into a hard error under C++.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=missing-field-initializers)

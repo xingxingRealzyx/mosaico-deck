@@ -5,6 +5,7 @@ idf_component_register(
     PRIV_REQUIRES config esp_driver_gpio esp_driver_i2c esp_timer log
 )
 
-# esp_lcd_touch / gpio 的配置结构体是 C 写的，字段只会越来越多；
-# C++ 这边用聚合初始化必然缺字段。和 display 组件同样的处理。
+# The esp_lcd_touch / gpio configuration structs are written in C and only ever
+# gain more fields; aggregate initialization on the C++ side will inevitably be
+# missing some. Same treatment as the display component.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=missing-field-initializers)

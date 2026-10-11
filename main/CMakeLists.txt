@@ -17,7 +17,7 @@ idf_component_register(
         heap
 )
 
-# IDF 的 i2c_master_bus_config_t / gpio_config_t 只初始化我们关心的字段，
-# 其余走零值默认。IDF 默认 -Wextra -Werror，在 C++ 下 partial initializer
-# 会变成硬错误。
+# For IDF's i2c_master_bus_config_t / gpio_config_t we only initialize the fields
+# we care about; the rest fall back to zero defaults. IDF enables -Wextra -Werror by
+# default, and under C++ a partial initializer becomes a hard error.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=missing-field-initializers)

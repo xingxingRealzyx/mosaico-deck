@@ -1,7 +1,7 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// link.cpp —— PC ↔ 板子的 USB 链路
+// link.cpp -- PC <-> board USB link
 
 #include "hostlink.h"
 
@@ -24,8 +24,9 @@ namespace {
 
 constexpr const char* kTag = "hostlink";
 
-// 二进制帧的魔数。用两个字节而不是一个：流一旦错位，单字节魔数很容易碰巧命中，
-// 双字节就基本不会（1/65536），而且错位之后能靠它重新对齐。
+// Magic number of the binary frame. Two bytes instead of one: once the stream is
+// misaligned, a single-byte magic is easily hit by coincidence, while two bytes almost
+// never are (1/65536) -- and it lets us realign after a slip.
 constexpr uint8_t kMagic0 = 0xDE;
 constexpr uint8_t kMagic1 = 0xAD;
 
@@ -35,26 +36,29 @@ constexpr uint8_t kTypeCtrl = 0x10;
 constexpr uint8_t kTypeAudio = 0x20;
 constexpr uint8_t kTypeRec = 0x21;
 
-// 放音/录音的分块大小。
+// Chunk size for playback/recording.
 //
-// 放音时 PC 一次发多少我们收多少，但**不能收一大块再播** —— 那样延迟会累积。
-// 2KB 在 48kHz 立体声下是 10.7ms，正好在"不卡"和"不碎"之间。
+// During playback we receive exactly as much as the PC sends at a time, but **we must
+// not receive one big block and then play it** -- that would let latency accumulate.
+// 2KB at 48kHz stereo is 10.7ms, right between "no stutter" and "no choppiness".
 //
-// ⚠️ **这个缓冲必须是 static，不能放栈上。**
-// 最初写成 `uint8_t buf[kAudioChunk]`（4096）而 link_rx 任务栈也正好是 4096 ——
-// 一进 HandleAudio 就爆栈复位。症状是"一发音频板子就重启"，而且没有任何
-// 可读的错误信息（栈溢出不会打 backtrace，直接复位）。
-// 嵌入式的栈通常只有几 KB，任何超过几百字节的缓冲都不该放栈上。
+// WARNING: **This buffer must be static; it cannot live on the stack.**
+// It was originally written as `uint8_t buf[kAudioChunk]` (4096) and the link_rx task
+// stack was also exactly 4096 -- entering HandleAudio blew the stack and reset. The
+// symptom was "the board reboots as soon as audio is sent", with no readable error
+// message at all (a stack overflow does not print a backtrace; it just resets).
+// Embedded stacks are usually only a few KB, so any buffer larger than a few hundred
+// bytes should not go on the stack.
 constexpr size_t kAudioChunk = 2048;
 
-// 录音每次读多少推上去。
+// How much recording reads per push.
 constexpr size_t kRecChunk = 4096;
 
-constexpr size_t kBandPayload = 1 + fluidbox::config::kBandPixels * 2;      // idx + 像素
+constexpr size_t kBandPayload = 1 + fluidbox::config::kBandPixels * 2;      // idx + pixels
 constexpr size_t kFullPayload = fluidbox::config::kLcdHRes * fluidbox::config::kLcdVRes * 2;
 
-// 单个音频帧的 payload 上限：1 秒的 48kHz 立体声 = 192KB。
-// 给 256KB 的余量，再大就是协议出问题了。
+// Upper bound on the payload of a single audio frame: 1 second of 48kHz stereo = 192KB.
+// Allow 256KB of headroom; anything larger means the protocol has gone wrong.
 constexpr uint32_t kAudioPayloadMax = 256 * 1024;
 
 std::atomic<bool> g_capturing{false};
@@ -62,28 +66,31 @@ std::atomic<bool> g_capturing{false};
 display::Panel* g_panel = nullptr;
 Stats g_stats;
 
-// 发消息的锁。**必须有**：usb_console::Write 内部没有锁（它自己的注释里写明了），
-// 而触摸任务和按键任务都会发消息，不加锁就会交错。
+// Lock for sending messages. **Mandatory**: usb_console::Write has no internal lock (its
+// own comment says so), and both the touch task and the key task send messages, so
+// without a lock they would interleave.
 osal::Mutex* g_tx_lock = nullptr;
 
-// 控制消息的 payload 上限。都是小 JSON，512 字节足够。
+// Upper bound on a control message payload. They are all small JSON; 512 bytes is plenty.
 constexpr size_t kCtrlMax = 512;
 
-// ---------------------------------------------------------------------------
-// 字节流读取器
-// ---------------------------------------------------------------------------
-// 底层给的是**变长的块**（一次 RX 回调最多 128 字节），而协议要的是"恰好 N 字节"。
-// 块尾多出来的那部分不能丢 —— 它是下一个字段的开头。所以留一个 carry。
+// ---------------------------------------
+// Byte stream reader
+// ---------------------------------------
+// The layer below hands us **variable-length chunks** (one RX callback is at most 128
+// bytes), while the protocol wants "exactly N bytes". The leftover tail of a chunk must
+// not be dropped -- it is the beginning of the next field. So we keep a carry.
 //
-// carry 只需要放得下一个块（128 字节），256 是宽裕的。
+// The carry only needs to hold one chunk (128 bytes); 256 is generous.
 class RxStream {
  public:
-    // 收满 len 字节。返回实际收到的字节数 —— **小于 len 说明超时了**，
-    // 调用方必须当成错误处理，不能假设后面还有数据。
+    // Receive exactly len bytes. Returns the number of bytes actually received --
+    // **less than len means a timeout**, and the caller must treat it as an error and
+    // must not assume more data is coming.
     size_t Read(uint8_t* dst, size_t len, uint32_t timeout_ms) {
         size_t got = 0;
 
-        // 先把上次剩下的吐出来
+        // First spit out whatever was left over from last time
         while (got < len && carry_len_ > 0) {
             const size_t n = (len - got < carry_len_) ? (len - got) : carry_len_;
             memcpy(dst + got, carry_, n);
@@ -95,28 +102,30 @@ class RxStream {
         while (got < len) {
             const osal::InputBuffer chunk = usb_console::ReceiveRx(timeout_ms);
             if (chunk.empty()) {
-                break;  // 超时
+                break;  // timeout
             }
             const size_t need = len - got;
             const size_t take = (chunk.size() < need) ? chunk.size() : need;
             memcpy(dst + got, chunk.data(), take);
             got += take;
 
-            // 块尾多出来的存进 carry，下次先用它
+            // Store the leftover tail of the chunk in carry; use it first next time
             if (take < chunk.size()) {
                 const size_t rest = chunk.size() - take;
                 if (rest <= sizeof(carry_) - carry_len_) {
                     memcpy(carry_ + carry_len_, chunk.data() + take, rest);
                     carry_len_ += rest;
                 }
-                // carry 放不下就是协议出问题了（单块最大 128 字节），丢掉并计数
+                // If carry cannot hold it the protocol has gone wrong (a single chunk is
+                // at most 128 bytes); drop it and count it
             }
             usb_console::ReturnRx(chunk);
         }
         return got;
     }
 
-    // 丢掉 carry 里的一切。帧头对不上时调用 —— 重新找同步点比继续猜安全。
+    // Drop everything in carry. Called when the frame header does not match --
+    // re-finding the sync point is safer than continuing to guess.
     void Resync() { carry_len_ = 0; }
 
  private:
@@ -126,12 +135,12 @@ class RxStream {
 
 RxStream g_rx;
 
-// ---------------------------------------------------------------------------
-// 板子 → PC
-// ---------------------------------------------------------------------------
+// ---------------------------------------
+// board -> PC
+// ---------------------------------------
 void SendLine(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// 发一行的内部实现。**调用方必须已经持有 g_tx_lock。**
+// Internal implementation of sending one line. **The caller must already hold g_tx_lock.**
 size_t SendLineLocked(const char* fmt, va_list ap) {
     char buf[192];
     const int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
@@ -153,11 +162,13 @@ void SendLine(const char* fmt, ...) {
     va_end(ap);
 }
 
-// **一行 JSON 紧跟一段裸二进制，必须在同一个锁里发完。**
+// **One line of JSON immediately followed by raw binary must be sent under the same lock.**
 //
-// 否则日志会插到中间 —— PC 侧按"读一行、再读 N 字节"解析，插一行日志就全乱了。
-// （一开始想用可变参数把数据一起传进来，但 va_list 里取不到二进制指针，
-//   所以拆成这个专门的函数，头和行为一体。）
+// Otherwise a log line would be inserted in the middle -- the PC side parses by "read one
+// line, then read N bytes", and one inserted log line scrambles everything.
+// (At first we wanted to pass the data in through the variadic arguments too, but a
+//  va_list cannot yield a binary pointer, so it was split into this dedicated function,
+//  with the header and the payload as one unit.)
 void SendAudioUp(const void* data, size_t len) {
     osal::LockGuard<osal::Mutex> guard(*g_tx_lock);
     char head[96];
@@ -171,27 +182,30 @@ void SendAudioUp(const void* data, size_t len) {
 }
 
 void HandleCtrl(const uint8_t* payload, size_t len) {
-    // 目前只有一条：把 payload 原样当作一行 JSON 打出来，方便在 PC 侧确认
-    // 板子收到了什么。真正的控制命令以后在这里加分支。
+    // Currently there is only one: print the payload as-is as one line of JSON, so the PC
+    // side can confirm what the board received. Real control commands will get their
+    // branches here later.
     //
-    // 注意 payload 不一定以 '\0' 结尾（协议里不带终止符），所以先拷进栈缓冲。
+    // Note that the payload does not necessarily end with '\0' (the protocol carries no
+    // terminator), so copy it into a stack buffer first.
     char text[kCtrlMax + 1];
     const size_t n = (len < kCtrlMax) ? len : kCtrlMax;
     memcpy(text, payload, n);
     text[n] = '\0';
-    ESP_LOGI(kTag, "控制消息: %s", text);
+    ESP_LOGI(kTag, "control message: %s", text);
     SendLine("{\"t\":\"ack\",\"ctrl\":true}");
 }
 
-// 把一条 band 的像素**流式**收进 band 缓冲。
+// Receive one band's pixels **as a stream** into the band buffer.
 //
-// 这是这个组件最要紧的一段：28800 字节不是先收到一个中转缓冲再拷过去的，
-// 而是直接在环形缓冲和 band 缓冲之间搬 —— 省掉 28KB 的常驻内存，
-// 而这块芯片总共只有 512KB SRAM。
+// This is the most critical piece in this component: the 28800 bytes are not received
+// into an intermediate buffer and then copied over; they are moved directly between the
+// ring buffer and the band buffer -- saving 28KB of resident memory, on a chip that has
+// only 512KB of SRAM in total.
 void HandleBand(bool full_frame) {
     const size_t total = full_frame ? kFullPayload : kBandPayload;
 
-    // 单条 band 时先把 idx 读出来
+    // For a single band, read the idx first
     uint8_t idx = 0;
     if (!full_frame) {
         if (g_rx.Read(&idx, 1, 1000) != 1) {
@@ -200,8 +214,9 @@ void HandleBand(bool full_frame) {
         }
         if (idx >= fluidbox::config::kBandCount) {
             g_stats.bad_len = g_stats.bad_len + 1;
-            // 内容还是要读掉，否则后面全部错位 —— 但既然长度已知，读进临时区丢弃。
-            // 这里用一个小的丢弃循环，不分配内存。
+            // The content still has to be drained, otherwise everything after it is
+            // misaligned -- but since the length is known, read it into a temporary area
+            // and discard it. A small discard loop is used here; no memory is allocated.
             uint8_t sink[128];
             size_t left = total - 1;
             while (left > 0) {
@@ -218,7 +233,8 @@ void HandleBand(bool full_frame) {
     }
 
     if (g_panel == nullptr || !g_panel->ready()) {
-        // 面板没就绪也要把数据读掉，否则流会错位
+        // Even if the panel is not ready the data must be drained, otherwise the stream
+        // gets misaligned
         uint8_t sink[128];
         size_t left = full_frame ? total : (total - 1);
         while (left > 0) {
@@ -233,15 +249,18 @@ void HandleBand(bool full_frame) {
         return;
     }
 
-    // 从这里开始到函数结束，独占显示。
+    // From here to the end of the function, the display is held exclusively.
     //
-    // 过渡的那一瞬仍然可能和本地自检图案撞上（PC 的帧刚到、渲染任务还没看到
-    // 让位标志），那一下会报 `acquire spi bus failed`。这把锁就是兜住它。
+    // At the transitional instant it can still collide with the local self-test pattern
+    // (the PC's frame has just arrived and the render task has not yet seen the yield
+    // flag), and that moment reports `acquire spi bus failed`. This lock is what catches
+    // it.
     osal::LockGuard<osal::Mutex> draw_guard(g_panel->DrawMutex());
 
     if (full_frame) {
-        // 整屏：逐条 band 收，每条 480×30×2 字节。**不需要整帧缓冲** ——
-        // 收到一条就推一条，和部分更新走的是同一条路径。
+        // Full screen: receive band by band, each 480x30x2 bytes. **No full-frame buffer
+        // is needed** -- push each band as it arrives, on the same path as a partial
+        // update.
         for (int band = 0; band < fluidbox::config::kBandCount; band++) {
             uint16_t* buf = g_panel->AcquireBand();
             if (buf == nullptr) {
@@ -271,19 +290,23 @@ void HandleBand(bool full_frame) {
     g_panel->FlushBand(idx, buf);
     g_stats.bands = g_stats.bands + 1;
 
-    // 每 64 条 band 回一个 ack，方便 PC 侧确认链路活着 —— 每条都回太吵。
+    // Send one ack every 64 bands so the PC side can confirm the link is alive --
+    // answering every one would be too noisy.
     if ((g_stats.bands % 64) == 0) {
         SendLine("{\"t\":\"ack\",\"band\":%u}", static_cast<unsigned>(g_stats.bands));
     }
 }
 
-// 收一块放一块 —— **不做整段缓冲**。
+// Receive one block, play one block -- **no whole-segment buffering**.
 //
-// 一次 speak 可能几百 KB（5 秒的 48kHz 立体声就快 1MB），全收下来再播既慢又占内存。
-// 边收边播的话，从 PC 开始发到出声只有几十毫秒。
+// A single speak can be several hundred KB (5 seconds of 48kHz stereo is almost 1MB);
+// receiving it all before playing is both slow and memory-hungry. Receiving and playing
+// at the same time means only a few tens of milliseconds from the PC starting to send to
+// sound coming out.
 void HandleAudio(uint32_t len) {
     if (!audio::ready()) {
-        // 音频没起来也要把数据读掉，否则流会错位
+        // Even if audio is not up the data must be drained, otherwise the stream gets
+        // misaligned
         uint8_t sink[256];
         uint32_t left = len;
         while (left > 0) {
@@ -297,8 +320,8 @@ void HandleAudio(uint32_t len) {
         return;
     }
 
-    // static：见上面 kAudioChunk 的说明。只有一个调用者（link_rx 任务），
-    // 所以不需要加锁。
+    // static: see the note on kAudioChunk above. There is only one caller (the link_rx
+    // task), so no locking is needed.
     static uint8_t buf[kAudioChunk];
     uint32_t left = len;
     while (left > 0) {
@@ -313,10 +336,10 @@ void HandleAudio(uint32_t len) {
     g_stats.audio_in = g_stats.audio_in + 1;
 }
 
-// 录音：读麦克风 -> 推给 PC。
+// Recording: read the microphone -> push to the PC.
 //
-// 由 AI 按键驱动（按住录、松开停）。速率是 48kHz 立体声 = 192KB/s，
-// 而 USB 满速是 1.5MB/s，带宽绰绰有余。
+// Driven by the AI button (hold to record, release to stop). The rate is 48kHz stereo =
+// 192KB/s, while USB full speed is 1.5MB/s, so bandwidth is more than sufficient.
 void CaptureTask(void* arg) {
     (void)arg;
     static uint8_t buf[kRecChunk];
@@ -338,10 +361,12 @@ void CaptureTask(void* arg) {
 
 void RxTask(void* arg) {
     (void)arg;
-    ESP_LOGI(kTag, "链路接收任务启动");
+    ESP_LOGI(kTag, "link receive task started");
 
-    // 找帧头。**必须容忍错位**：一旦上面某次读超时，流里就少了几个字节，
-    // 后面的帧头就对不上了。这里逐字节找 DE AD，找到就重新同步。
+    // Find the frame header. **Misalignment must be tolerated**: as soon as one of the
+    // reads above times out, a few bytes are missing from the stream and the frame
+    // headers after it no longer match. Here we look for DE AD byte by byte and
+    // resynchronize when we find it.
     uint8_t prev = 0;
     for (;;) {
         uint8_t b = 0;
@@ -367,7 +392,8 @@ void RxTask(void* arg) {
                              (static_cast<uint32_t>(header[3]) << 16) |
                              (static_cast<uint32_t>(header[4]) << 24);
 
-        // 长度上限检查。不检查的话一个坏长度会让板子去等几 MB 的数据。
+        // Length upper-bound check. Without it, one bad length would make the board wait
+        // for several MB of data.
         const uint32_t max_len = (type == kTypeFull)    ? kFullPayload
                                  : (type == kTypeBand)  ? kBandPayload
                                  : (type == kTypeAudio) ? kAudioPayloadMax
@@ -375,7 +401,7 @@ void RxTask(void* arg) {
                                                         : kCtrlMax;
         if (len > max_len) {
             g_stats.bad_len = g_stats.bad_len + 1;
-            ESP_LOGW(kTag, "帧长度越界 type=0x%02X len=%u (上限 %u)", type,
+            ESP_LOGW(kTag, "frame length out of range type=0x%02X len=%u (limit %u)", type,
                      static_cast<unsigned>(len), static_cast<unsigned>(max_len));
             g_rx.Resync();
             continue;
@@ -390,13 +416,13 @@ void RxTask(void* arg) {
         } else if (type == kTypeAudio) {
             HandleAudio(len);
         } else if (type == kTypeRec) {
-            // 录音控制：{"cmd":"start"} / {"cmd":"stop"}
+            // Recording control: {"cmd":"start"} / {"cmd":"stop"}
             uint8_t payload[kCtrlMax];
             if (g_rx.Read(payload, len, 1000) == len) {
                 payload[len < kCtrlMax ? len : kCtrlMax - 1] = '\0';
                 const bool start = strstr(reinterpret_cast<char*>(payload), "start") != nullptr;
                 g_capturing.store(start);
-                ESP_LOGI(kTag, "录音 %s", start ? "开始" : "停止");
+                ESP_LOGI(kTag, "recording %s", start ? "start" : "stop");
                 SendLine("{\"t\":\"ack\",\"rec\":%s}", start ? "true" : "false");
             } else {
                 g_stats.rx_timeout = g_stats.rx_timeout + 1;
@@ -429,30 +455,35 @@ esp_err_t Init() {
         g_tx_lock = new osal::Mutex();
     }
 
-    // **优先级必须高于 TinyUSB 的任务（默认 5）。**
+    // **The priority must be higher than the TinyUSB task (default 5).**
     //
-    // 这里踩过一个很隐蔽的坑：TinyUSB 的 RX 回调跑在它自己的任务里（优先级 5），
-    // 而接收任务原来只有 4 —— 于是**回调一直抢占消费者**：数据不停往环形缓冲里倒，
-    // 消费者却拿不到时间片，缓冲很快填满。实测溢出 1706 次（约 218KB，一半的数据
-    // 就这么丢了）。
+    // A very subtle pitfall was hit here: TinyUSB's RX callback runs in its own task
+    // (priority 5), while the receive task was originally only 4 -- so **the callback
+    // preempted the consumer the whole time**: data kept pouring into the ring buffer
+    // while the consumer never got a time slice, and the buffer filled up quickly.
+    // Measured: 1706 overflows (about 218KB, half the data lost just like that).
     //
-    // 提到 6 之后，数据一到：TinyUSB 任务跑回调把数据放进环形缓冲，紧接着被
-    // 优先级更高的接收任务抢占、立刻取走 —— 缓冲再也不会积压。
+    // After raising it to 6, the moment data arrives: the TinyUSB task runs the callback
+    // and puts the data in the ring buffer, and is immediately preempted by the
+    // higher-priority receive task which takes it away at once -- the buffer never backs
+    // up again.
     //
-    // 不会饿死 USB：接收任务阻塞在环形缓冲的 Receive 上，没数据就主动让出。
+    // USB is not starved: the receive task blocks on the ring buffer's Receive and
+    // voluntarily yields when there is no data.
     static osal::Task capture_task;
     capture_task.Create(CaptureTask, nullptr,
                         {.name = "link_cap", .stack_size = 4096, .priority = 5,
                          .core = osal::CoreAffinity::kCore1});
 
-    // 栈给 6144：这条任务要走 HandleAudio / HandleBand / HandleCtrl 三条路径，
-    // 都比"只收一行 JSON"重。之前 4096 配一个 4096 的栈上缓冲直接爆过。
+    // Give it 6144 of stack: this task walks all three paths, HandleAudio / HandleBand /
+    // HandleCtrl, which are all heavier than "just receive one line of JSON". Previously
+    // 4096 paired with a 4096 stack buffer blew up directly.
     static osal::Task rx_task;
     rx_task.Create(RxTask, nullptr,
                    {.name = "link_rx", .stack_size = 6144, .priority = 6,
                     .core = osal::CoreAffinity::kCore1});
 
-    ESP_LOGI(kTag, "链路已启动");
+    ESP_LOGI(kTag, "link started");
     return ESP_OK;
 }
 
@@ -479,12 +510,16 @@ void SendKey(const char* ev) {
 }
 
 bool RemoteOwnsScreen() {
-    // 收到第一个帧头就让位，不要等一条 band 收完。
+    // Yield as soon as the first frame header arrives; do not wait for a whole band to be
+    // received.
     //
-    // 这里写晚过一次，后果是整条链崩掉：本地图案和 PC 的帧抢 SPI 总线 ->
-    // 第一条 band 排队失败 -> bands 一直是 0 -> 这个函数一直返回 false ->
-    // 渲染任务永远不让位 -> 永久争抢 -> 消费任务读不了环形缓冲 -> 大量 RX 溢出。
-    // 日志顺序很说明问题：先一串 acquire spi bus failed，然后才是"PC 已接管屏幕"。
+    // This was once written too late, and the consequence was that the whole chain
+    // collapsed: the local pattern and the PC's frames fought over the SPI bus -> the
+    // first band failed to queue -> bands stayed 0 -> this function kept returning false
+    // -> the render task never yielded -> permanent contention -> the consumer task could
+    // not read the ring buffer -> heavy RX overflow.
+    // The log order is very telling: first a run of acquire spi bus failed, and only then
+    // "PC took over the screen".
     return g_stats.frames > 0 || g_stats.bands > 0 || g_stats.full > 0;
 }
 

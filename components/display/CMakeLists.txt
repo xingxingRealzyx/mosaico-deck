@@ -10,10 +10,13 @@ idf_component_register(
         log
 )
 
-# espressif/esp_lcd_co5300 由本目录的 idf_component.yml 声明，
-# 组件管理器会自动接进本组件的依赖，不需要在这里重复列出。
+# espressif/esp_lcd_co5300 is declared in this directory's idf_component.yml,
+# so the component manager wires it into this component's dependencies
+# automatically; there is no need to list it again here.
 
-# IDF 的 CO5300 配置宏是给 C 写的，展开后只初始化结构体的一部分字段。
-# C 里这是常规写法，但 IDF 默认 -Wextra -Werror，在 C++ 下就变成编译错误。
-# 这些字段本来就有正确的默认值（0），所以只降级这一条警告，不做别的放宽。
+# IDF's CO5300 configuration macros are written for C, and expanding them only
+# initializes a subset of the struct fields. That is normal in C, but IDF enables
+# -Wextra -Werror by default, which turns it into a compile error under C++.
+# Those fields already have the correct default value (0), so we only downgrade
+# this single warning and do not relax anything else.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=missing-field-initializers)

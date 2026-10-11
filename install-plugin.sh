@@ -25,33 +25,36 @@ echo "=== 安装 mosaico-deck 插件到 profile: $PROFILE ==="
 # 记下 node_modules 里的实体位置（file: 装法下是个真实目录）
 DEST="$DSH_HOME/profiles/$PROFILE/node_modules/dsh-mosaico-deck"
 
-if [ -d "$DEST" ]; then
-    echo "  更新已有的安装：$DEST"
-    rm -rf "$DEST"
-    mkdir -p "$DEST"
-    cp -R "$HERE/plugin/lib" "$DEST/lib"
-    cp "$HERE/plugin/render.py" "$DEST/render.py"
-    cp "$HERE/plugin/package.json" "$DEST/package.json"
-    cp "$HERE/plugin/cordis.patch.yml" "$DEST/cordis.patch.yml"
-    cp "$HERE/plugin/selftest.mjs" "$DEST/selftest.mjs"
-else
-    echo "  首次安装（需要 profile 里声明 bundle）"
-    "$DSH" plugin --profile "$PROFILE" add "file:$HERE/plugin"
-    python3 - "$DSH_HOME/profiles/$PROFILE/package.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-d = json.load(open(p))
-b = d.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
-if 'dsh-mosaico-deck' not in b:
-    b.append('dsh-mosaico-deck')
-    json.dump(d, open(p, 'w'), indent=2)
-    print('  已把 dsh-mosaico-deck 加进 profile 的 bundles')
-else:
-    print('  bundles 里已经有了')
-PY
-fi
+# Always copy the files (the installed copy is what the host actually loads,
+# and edits to the repo do not propagate on their own).
+mkdir -p "$DEST"
+cp -R "$HERE/plugin/lib" "$DEST/lib"
+cp "$HERE/plugin/render.py" "$DEST/render.py"
+cp "$HERE/plugin/package.json" "$DEST/package.json"
+cp "$HERE/plugin/cordis.patch.yml" "$DEST/cordis.patch.yml"
+cp "$HERE/plugin/selftest.mjs" "$DEST/selftest.mjs"
+echo "  copied plugin files to $DEST"
 
-echo
+# Register the bundle in the profile. This must happen on every run, not only
+# on first install: if the bundle row was ever removed (for example to disable
+# a broken plugin), a re-install that only copies files would leave the plugin
+# installed but never loaded.
+python3 - "$DSH_HOME/profiles/$PROFILE/package.json" "$HERE/plugin" <<'PY'
+import json, sys
+pkg, src = sys.argv[1], sys.argv[2]
+d = json.load(open(pkg))
+deps = d.setdefault('dependencies', {})
+if 'dsh-mosaico-deck' not in deps:
+    deps['dsh-mosaico-deck'] = f'file:{src}'
+bundles = d.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
+if 'dsh-mosaico-deck' not in bundles:
+    bundles.append('dsh-mosaico-deck')
+    print('  registered dsh-mosaico-deck in profile bundles')
+else:
+    print('  dsh-mosaico-deck already in profile bundles')
+json.dump(d, open(pkg, 'w'), indent=2)
+PY
+
 # 自检必须在**安装后的副本**上跑 —— ESM 的裸模块名（@deepseek-ai/*）是按
 # 导入方所在路径解析的，从仓库里那份跑会找不到。
 NODE="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"

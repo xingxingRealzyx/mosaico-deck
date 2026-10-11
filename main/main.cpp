@@ -1,21 +1,21 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// mosaico-deck —— 桌面的 agent 状态/交互终端
+// mosaico-deck -- a desktop agent status/interaction terminal
 //
-// 架构（为什么界面不在这块板子上渲染）
-// ----------------------------------
-// 板子只做三件事：**显示**、**采集输入**、**跟 PC 通信**。
-// 界面（文字、图标、布局、颜色）全部在 PC 侧渲染好，按 band 发过来。
+// Architecture (why the UI is not rendered on this board)
+// ------------------------------------------------------
+// The board does only three things: **display**, **collect input**, and **talk to the PC**.
+// The UI (text, icons, layout, colors) is entirely rendered on the PC side and sent over as bands.
 //
-// 理由不是"板子性能不够"，而是**开发效率**：
-//   · 中文要自己做点阵字库（1~2MB，而且难看）；PC 上有系统字体，完美且免费
-//   · 抗锯齿、图标、emoji —— PC 上全免费
-//   · 改一次界面：PC 侧存盘即生效，板子侧要重新烧录
-// 最后一条是数量级的差别。板子侧代码越少，"调界面"这件事就越快。
+// The reason is not "the board is too slow", it is **development speed**:
+//   - CJK text would need a hand-made bitmap font (1~2MB, and it looks bad); the PC has system fonts, perfect and free
+//   - Antialiasing, icons, emoji -- all free on the PC
+//   - Changing the UI once: on the PC side saving the file takes effect immediately, on the board side it means reflashing
+// That last point is an order-of-magnitude difference. The less code on the board side, the faster "tweaking the UI" gets.
 //
-// 而且板子是通过 USB 连在电脑上的，带宽和供电都不成问题 —— 450KB 一帧整屏传也就
-// 0.5 秒；只传变化的 band 的话是几 KB、几十毫秒。
+// On top of that, the board is connected to the computer over USB, so bandwidth and power are both non-issues --
+// a whole 450KB full-screen frame takes only 0.5 seconds to transfer; sending just the changed bands is a few KB, tens of milliseconds.
 
 #include <cmath>
 #include <cstdio>
@@ -55,10 +55,11 @@ uint32_t g_frames = 0;
 uint32_t g_band_flushes = 0;
 
 // ---------------------------------------------------------------------------
-// 电源：屏幕的 3.3V 控制脚
+// Power: the screen's 3.3V control pin
 // ---------------------------------------------------------------------------
-// GPIO60 控制屏幕供电及对外 3.3V 输出，**低电平有效**。上电时它是关的，
-// 不主动拉低面板就完全没反应 —— 而且 QSPI 是只写总线，主机侧一点都看不出来。
+// GPIO60 controls the screen supply and the external 3.3V output, **active low**. It is off at power-on,
+// so unless we actively drive it low the panel shows nothing at all -- and since QSPI is a write-only bus,
+// the host side cannot tell anything is wrong.
 esp_err_t PowerOnRails() {
     const gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << fluidbox::board::kPinVcc3V3Ctrl,
@@ -67,32 +68,32 @@ esp_err_t PowerOnRails() {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&cfg), kTag, "配置 GPIO%d 失败",
+    ESP_RETURN_ON_ERROR(gpio_config(&cfg), kTag, "failed to configure GPIO%d",
                         fluidbox::board::kPinVcc3V3Ctrl);
-    // 先给电平再使能输出，避免上电瞬间出现毛刺。
+    // Set the level before enabling the output, so no glitch appears at power-on.
     ESP_RETURN_ON_ERROR(
         gpio_set_level(static_cast<gpio_num_t>(fluidbox::board::kPinVcc3V3Ctrl), 0), kTag,
-                        "拉低 VCC_3V3 失败");
-    // 电源爬升需要一点时间。官方用 LEDC 做斜坡，这里直接等 —— 差别只在
-    // 上电瞬间的浪涌，对功能没有影响。
+                        "failed to drive VCC_3V3 low");
+    // The supply needs a little time to ramp up. The official code uses LEDC as a ramp; here we just wait --
+    // the only difference is the inrush at power-on, which does not affect functionality.
     osal::Delay(120);
-    ESP_LOGI(kTag, "屏幕 3.3V 已使能 (GPIO%d=0)",
+    ESP_LOGI(kTag, "screen 3.3V enabled (GPIO%d=0)",
              fluidbox::board::kPinVcc3V3Ctrl);
     return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
-// I2C 引脚排查
+// I2C pin investigation
 // ---------------------------------------------------------------------------
-// **文档写的和实测不一样。** 官方 V1.0 文档说对内 I2C0 在 GPIO0/1，但实测这块
-// 板子上一个器件都扫不到；GPIO56/3 上却有 6 个（触摸、IMU、磁力计、电量计、
-// codec）。所以启动时两组都扫一遍，选用有器件的那组。
+// **The documentation and the actual measurements disagree.** The official V1.0 docs say the internal I2C0 is on
+// GPIO0/1, but on this board nothing at all is found there; GPIO56/3 however has 6 devices (touch, IMU,
+// magnetometer, fuel gauge, codec). So at boot we scan both sets and use the one that has devices.
 //
-// 顺带这是判定板子版本的**第二路独立信号**：V1.0 的 I2C0 在 GPIO0/1，
-// V1.2 在 GPIO56/3。
+// Incidentally this is the **second independent signal** for determining the board revision: V1.0 has I2C0 on
+// GPIO0/1, V1.2 on GPIO56/3.
 int ScanBusOnPins(int sda, int scl, uint32_t hz) {
     i2c_master_bus_config_t cfg = {};
-    cfg.i2c_port = I2C_NUM_1;  // 用 1 号口扫描，扫完就释放，不影响正事
+    cfg.i2c_port = I2C_NUM_1;  // scan on port 1 and release it afterwards, so the real work is unaffected
     cfg.sda_io_num = static_cast<gpio_num_t>(sda);
     cfg.scl_io_num = static_cast<gpio_num_t>(scl);
     cfg.clk_source = I2C_CLK_SRC_DEFAULT;
@@ -107,7 +108,7 @@ int ScanBusOnPins(int sda, int scl, uint32_t hz) {
     int found = 0;
     for (uint8_t addr = 0x08; addr < 0x78; addr++) {
         if (i2c_master_probe(bus, addr, 20) == ESP_OK) {
-            ESP_LOGI(kTag, "  I2C(%d,%d) 发现器件 0x%02X", sda, scl, addr);
+            ESP_LOGI(kTag, "  I2C(%d,%d) found device 0x%02X", sda, scl, addr);
             found++;
         }
     }
@@ -116,41 +117,43 @@ int ScanBusOnPins(int sda, int scl, uint32_t hz) {
 }
 
 // ---------------------------------------------------------------------------
-// 显示链路自检
+// Display pipeline self-test
 // ---------------------------------------------------------------------------
-// 这一版还没有 PC 送帧，所以自己画一个图案证明整条链路通：**16 条 band 是不是
-// 都在动、颜色字节序对不对、有没有哪条 band 被漏掉**。
+// This version has no PC frames yet, so it draws a pattern to prove the whole pipeline works: **are all 16 bands
+// updating, is the color byte order right, is any band being skipped**.
 //
-// 图案：整屏竖向渐变（每条 band 的底色不同 → 漏掉一条会看出一条硬边），
-// 加一根横向移动的亮条（证明在持续刷新），四角各一个白方块（证明边界覆盖）。
+// Pattern: a full-screen vertical gradient (every band has a different base color -> a skipped band shows up as a
+// hard edge), plus a bright bar sweeping horizontally (proving it keeps refreshing), plus a white square in each
+// corner (proving the boundaries are covered).
 // ---------------------------------------------------------------------------
-// 显示链路自检
+// Display pipeline self-test
 // ---------------------------------------------------------------------------
-// 关键点：**只重画变化的那几条 band，不整屏重推。**
+// Key point: **only redraw the bands that changed, do not push the whole screen.**
 //
-// 为什么这是重点：整屏 450KB 在 60MHz QSPI 上要 15.4ms，而面板刷新周期是 17ms
-// —— 一帧的传输时间几乎等于一次刷新，只要有一点抖动就会跨过去，上半屏是新内容、
-// 下半屏还是旧的，看起来就是撕裂（实测一根横扫的亮条"有时候会弯"）。
+// Why this matters: a full 450KB screen takes 15.4ms over 60MHz QSPI, while the panel refresh period is 17ms
+// -- one frame's transfer time is almost equal to one refresh, so any jitter crosses the boundary and the top half
+// shows new content while the bottom half is still old, which looks like tearing (in practice a sweeping bright bar
+// "sometimes bends").
 //
-// 而真实 UI 大部分时间是静态的，只有几条 band 会变：文字更新也就 1~3 条，
-// 1.4~4.2ms 就传完了，稳稳落在一次刷新之内，**根本不会撕裂**。
+// A real UI is static most of the time and only a few bands change: a text update is 1~3 bands,
+// which takes 1.4~4.2ms, comfortably inside one refresh, so **it does not tear at all**.
 //
-// 所以正确的做法不是"让动画慢下来"（那只是把问题藏起来），而是只发变化的部分。
+// So the right fix is not "slow the animation down" (that only hides the problem), it is to send only the parts that changed.
 //
 // ---------------------------------------------------------------------------
-// 开机动画：DeepSeek Harness 的鲸鱼 logo -> 碎成粒子散开 -> 交给 PC
+// Boot animation: the DeepSeek Harness whale logo -> shatters into particles that scatter -> hand over to the PC
 // ---------------------------------------------------------------------------
-// **动画必须在板子上跑。** PC 推帧的话一帧是 16 条 band / 450KB，光传输就要
-// 15.4ms，加上渲染往返根本做不出流畅效果；而板子本地画只受 QSPI 带宽限制，
-// 实测能到 ~40fps，足够了。
+// **The animation has to run on the board.** If the PC pushed frames, one frame is 16 bands / 450KB and the transfer
+// alone takes 15.4ms; adding the render round-trip makes smooth motion impossible. Drawing locally on the board is
+// limited only by QSPI bandwidth and reaches ~40fps in practice, which is plenty.
 //
-// 三个阶段：
-//   ① 浮现（0.0~0.7s）  logo 由暗到亮淡入
-//   ② 散开（0.7~2.2s）  logo 的像素变成粒子，向外飞散并淡出
-//   ③ 交棒（2.2s 之后）  黑屏等待 —— PC 一旦送来第一帧就永久让位
+// Three phases:
+//   1. Fade in   (0.0~0.7s)  the logo fades from dark to bright
+//   2. Scatter   (0.7~2.2s)  the logo's pixels become particles that fly outwards and fade
+//   3. Handover  (after 2.2s) a black screen -- once the PC sends its first frame we yield forever
 //
-// 粒子位置用解析式算（p = p0 + v*t）而不是逐帧累加：一来不会有浮点漂移，
-// 二来任意时刻都能直接算出来，不受掉帧影响。
+// Particle positions are computed analytically (p = p0 + v*t) instead of accumulated frame by frame: first, there is
+// no floating-point drift; second, it can be evaluated directly at any instant, unaffected by dropped frames.
 namespace boot {
 
 using fluidbox::config::kBandCount;
@@ -159,37 +162,39 @@ using fluidbox::config::kBandRows;
 using fluidbox::config::kLcdHRes;
 using fluidbox::config::kLcdVRes;
 
-constexpr int64_t kFadeInUs = 600 * 1000;    // ① 浮现
-constexpr int64_t kScatterUs = 1100 * 1000;  // ② 散开
-// ③ 余韵：不再"结束"，而是落进一个安静的状态**一直陪着**，直到 PC 送第一帧。
+constexpr int64_t kFadeInUs = 600 * 1000;    // phase 1: fade in
+constexpr int64_t kScatterUs = 1100 * 1000;  // phase 2: scatter
+// Phase 3: the afterglow: the animation no longer "ends"; instead it settles into a quiet state and **stays there**,
+// until the PC sends its first frame.
 //
-// 这里踩过一次：原来动画在 2.2s 硬结束然后黑屏等 PC。但粒子带各自的起飞延迟，
-// 最晚的 ~1.7s 就淡完了，于是最后 0.5s 是纯黑；再加上 PC 侧建立连接的 1.2s，
-// 用户看到的是"炸开之后黑了好一会儿"。
+// We got this wrong once: originally the animation ended hard at 2.2s and then showed black while waiting for the PC.
+// But the particles each have their own launch delay and the last one faded out at ~1.7s, so the final 0.5s was pure
+// black; adding the ~1.2s the PC side needs to establish the connection, what the user saw was "after it explodes,
+// the screen stays black for quite a while".
 //
-// 现在动画不存在"结束"这个状态 —— 屏幕永远有东西，PC 一来就自然接走。
+// Now the animation has no "finished" state -- there is always something on screen, and when the PC arrives it takes over naturally.
 constexpr int64_t kScatterEndUs = kFadeInUs + kScatterUs;
 
-// logo 居中
+// center the logo
 constexpr int kLogoX = (kLcdHRes - deck::kLogoSize) / 2;
 constexpr int kLogoY = (kLcdVRes - deck::kLogoSize) / 2;
 
-// 采样间隔：蒙版里每隔 kSample 个像素取一个粒子。
-// 3 -> 约 1100 个粒子，散开时足够密，又不至于每帧算不过来。
+// Sampling interval: take one particle every kSample pixels in the mask.
+// 3 -> about 1100 particles, dense enough when scattering, and not too many to compute per frame.
 constexpr int kSample = 3;
 constexpr int kMaxParticles = (deck::kLogoSize / kSample) * (deck::kLogoSize / kSample);
 
 struct Particle {
-    float x0, y0;   // 起点（相对屏幕中心）
-    float vx, vy;   // 速度（像素/秒）
-    float delay;    // 各自的起飞延迟，让散开有层次而不是"整块平移"
+    float x0, y0;   // start point (relative to the screen center)
+    float vx, vy;   // velocity (pixels/second)
+    float delay;    // per-particle launch delay, so the scatter has depth instead of translating as one block
 };
 
 Particle g_particles[kMaxParticles];
 int g_count = 0;
 
-// 一个确定性的伪随机 —— 不用 rand() 是因为它要 srand 且结果依赖 libc 版本，
-// 换个工具链开机动画就变了。这里用整数 hash，结果永远一样。
+// A deterministic pseudo-random number -- we avoid rand() because it needs srand and its result depends on the libc
+// version, so switching toolchains would change the boot animation. This uses an integer hash, so the result is always the same.
 inline uint32_t Hash(uint32_t v) {
     v ^= v >> 16;
     v *= 0x7feb352dU;
@@ -208,14 +213,14 @@ void InitParticles() {
         for (int x = 0; x < deck::kLogoSize; x += kSample) {
             const uint8_t byte = deck::kLogoMask[y * deck::kLogoStride + (x >> 3)];
             if ((byte & (0x80 >> (x & 7))) == 0) {
-                continue;  // 不属于 logo
+                continue;  // not part of the logo
             }
             if (g_count >= kMaxParticles) {
                 break;
             }
             const float dx = static_cast<float>(x - half);
             const float dy = static_cast<float>(y - half);
-            // 离中心越远飞得越快 —— 视觉上就是"从中间炸开"
+            // The farther from the center, the faster it flies -- visually this reads as "exploding from the middle"
             const float dist = sqrtf(dx * dx + dy * dy) + 1.0f;
             const uint32_t h = Hash(static_cast<uint32_t>(y * 1000 + x));
             const float jitter = 0.75f + static_cast<float>(h % 1000) / 1000.0f * 0.7f;
@@ -226,30 +231,30 @@ void InitParticles() {
             p.y0 = dy;
             p.vx = dx / dist * speed;
             p.vy = dy / dist * speed;
-            // 延迟 0~180ms，按 hash 散开
+            // delay 0~180ms, spread out by hash
             p.delay = static_cast<float>((h >> 10) % 180) / 1000.0f;
         }
     }
-    ESP_LOGI(kTag, "开机动画：%d 个粒子", g_count);
+    ESP_LOGI(kTag, "boot animation: %d particles", g_count);
 }
 
-// 把某条 band 的一行像素填成黑（RGB565 且高字节在前，和 PC 侧一致）
+// Fill one row of pixels of a band with black (RGB565 with the high byte first, same as the PC side)
 inline uint16_t Rgb565(uint8_t r, uint8_t g, uint8_t b) {
     const uint16_t v = static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-    return static_cast<uint16_t>((v << 8) | (v >> 8));  // 字节交换
+    return static_cast<uint16_t>((v << 8) | (v >> 8));  // byte swap
 }
 
 const uint16_t kBlack = Rgb565(0, 0, 0);
 
-// 画一帧。full_redraw 时 16 条全画（第一帧初始化整屏）。
+// Draw one frame. With full_redraw all 16 bands are drawn (the first frame initializes the whole screen).
 //
-// **这个函数没有"结束"**：elapsed_us 一直涨，画出来的东西自然从"散开"过渡到
-// "余韵"，永远有内容。PC 接管由渲染循环判断，不在这里。
+// **This function has no "end"**: elapsed_us keeps growing and what is drawn naturally transitions from "scatter" to
+// "afterglow", so there is always content. Whether the PC has taken over is decided by the render loop, not here.
 void DrawFrame(int64_t elapsed_us, bool full_redraw) {
     InitParticles();
     const bool scattering = elapsed_us >= kFadeInUs;
     const float st = static_cast<float>(elapsed_us - kFadeInUs) / 1e6f;
-    // 散开结束后的秒数（余韵阶段用）
+    // seconds since the end of the scatter (used by the afterglow phase)
     const float after = (elapsed_us > kScatterEndUs)
                             ? static_cast<float>(elapsed_us - kScatterEndUs) / 1e6f
                             : 0.0f;
@@ -258,14 +263,14 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
         const int y0 = band * kBandRows;
         uint16_t* buf = g_panel.AcquireBand();
         if (buf == nullptr) {
-            return;  // 超时，这一帧就放弃（下一帧再来）
+            return;  // timed out, drop this frame (try again next frame)
         }
         for (int i = 0; i < kBandPixels; i++) {
             buf[i] = kBlack;
         }
 
         if (!scattering) {
-            // ---- 阶段①：logo 淡入 ----
+            // ---- phase 1: logo fades in ----
             const float t = static_cast<float>(elapsed_us) / static_cast<float>(kFadeInUs);
             const uint8_t level = static_cast<uint8_t>(t * 255.0f);
             const uint16_t color = Rgb565(level, level, level);
@@ -284,13 +289,14 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
                 }
             }
         } else {
-            // ---- 阶段②③：粒子散开 -> 余韵 ----
-            // 每个粒子画 2×2，保证远看还是"有点东西"而不是稀疏的点。
+            // ---- phases 2 and 3: particles scatter -> afterglow ----
+            // Each particle is drawn as 2x2, so from a distance there is still "something there" rather than sparse dots.
             //
-            // 亮度衰减用的是 (1 - local/1.5)^2，所以最晚的粒子（delay 最大 0.18s）
-            // 在 st≈1.68s 就彻底暗了 —— 而散开阶段是 1.1s，也就是说**粒子还没飞完
-            // 就已经看不见了**。这正是"炸开之后黑一段"的一半原因。
-            // 现在 fade 的分母拉到和整个散开时长一致，并且余韵阶段保留一点余光。
+            // The brightness decay used (1 - local/1.5)^2, so the latest particle (delay at most 0.18s)
+            // went fully dark at st~1.68s -- while the scatter phase is 1.1s, meaning **the particles became invisible
+            // before they finished flying**. That is half the reason for the "black stretch after the explosion".
+            // The fade denominator is now stretched to match the whole scatter duration, and the afterglow phase keeps
+            // a little residual light.
             for (int i = 0; i < g_count; i++) {
                 const Particle& p = g_particles[i];
                 const float local = st - p.delay;
@@ -299,8 +305,8 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
                 }
                 float fade = 1.0f - local / 1.35f;
                 if (fade <= 0.0f) {
-                    // 余韵：只剩极少数粒子还在缓慢外飘，给屏幕留一点"呼吸"
-                    // 用 (i % 23) 挑，比例约 4%，看起来是零星的星点而不是噪点
+                    // Afterglow: only a very few particles are still drifting slowly outwards, leaving the screen a little "breathing"
+                    // Selected with (i % 23), about 4%, so it looks like occasional stars rather than noise
                     if ((i % 23) != 0) {
                         continue;
                     }
@@ -308,7 +314,7 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
                     if (fade <= 0.0f) {
                         continue;
                     }
-                    const float slow = local * 0.35f;  // 余韵阶段几乎停住
+                    const float slow = local * 0.35f;  // almost frozen during the afterglow phase
                     const float px0 = kLcdHRes * 0.5f + p.x0 + p.vx * slow;
                     const float py0 = kLcdVRes * 0.5f + p.y0 + p.vy * slow;
                     const int ix0 = static_cast<int>(px0);
@@ -322,7 +328,7 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
                     }
                     continue;
                 }
-                // 散开阶段：亮度按平方衰减，尾巴收得干脆
+                // Scatter phase: brightness decays quadratically, so the tail ends cleanly
                 fade = fade * fade;
                 const float px = kLcdHRes * 0.5f + p.x0 + p.vx * local;
                 const float py = kLcdVRes * 0.5f + p.y0 + p.vy * local;
@@ -356,17 +362,17 @@ void DrawFrame(int64_t elapsed_us, bool full_redraw) {
 }  // namespace boot
 
 // ---------------------------------------------------------------------------
-// 任务
+// Tasks
 // ---------------------------------------------------------------------------
 void RenderTask(void* arg) {
     (void)arg;
-    ESP_LOGI(kTag, "渲染任务启动");
+    ESP_LOGI(kTag, "render task started");
 
-    // 本地自检图案只在**PC 还没接管屏幕**时画。
+    // The local self-test pattern is only drawn while **the PC has not taken over the screen yet**.
     //
-    // 为什么必须让出去：两个任务同时画会抢 SPI 总线（实测 `acquire spi bus failed`
-    // + `ESP_ERR_INVALID_STATE`），而且消费任务被总线卡住之后没空读环形缓冲 ——
-    // 表现为大量 RX 溢出。屏幕的所有权只能有一个主人。
+    // Why yielding is mandatory: two tasks drawing at the same time fight over the SPI bus (measured as
+    // `acquire spi bus failed` + `ESP_ERR_INVALID_STATE`), and once the consumer task is blocked on the bus it has no
+    // time to read the ring buffer -- which shows up as heavy RX overflow. The screen can only have one owner.
     const int64_t boot_start_us = osal::TimeUs();
     bool first = true;
     bool gave_up = false;
@@ -375,33 +381,34 @@ void RenderTask(void* arg) {
         if (hostlink::RemoteOwnsScreen()) {
             if (!gave_up) {
                 gave_up = true;
-                ESP_LOGI(kTag, "PC 已接管屏幕，开机动画让位");
+                ESP_LOGI(kTag, "PC has taken over the screen, boot animation yields");
             }
             osal::Delay(50);
             continue;
         }
 
-        // **动画没有"结束"，一直画到 PC 接管为止。**
+        // **The animation has no "end"; it draws until the PC takes over.**
         //
-        // 原来是在 2.2s 硬停下来黑屏等 PC，结果"炸开之后黑了好一会儿"——
-        // 因为粒子带延迟，最晚的 1.7s 就淡完了，剩下的时间是纯黑；再叠上 PC
-        // 建立连接的时间就更长。现在动画落进一个安静的余韵状态陪着屏幕，
-        // PC 一来自然被接走。
+        // It used to stop hard at 2.2s and show black waiting for the PC, which produced "a long black stretch after
+        // the explosion" -- because the particles carry delays, the last one faded at 1.7s, so the remaining time was
+        // pure black; on top of the time the PC needs to establish the connection it got even longer. Now the
+        // animation settles into a quiet afterglow state that keeps the screen company, and when the PC arrives it is
+        // naturally taken over.
         //
-        // 唯一要守的规矩：**PC 一接管就必须立刻停手** —— 两边同时画会抢 SPI
-        // 总线（实测 acquire spi bus failed），而且消费任务被卡住会导致 RX 溢出。
-        // 这个由循环开头的 RemoteOwnsScreen() 保证。
+        // The one rule to keep: **as soon as the PC takes over we must stop immediately** -- drawing on both sides at
+        // once fights over the SPI bus (measured as acquire spi bus failed), and a blocked consumer task causes RX
+        // overflow. The RemoteOwnsScreen() check at the top of the loop guarantees this.
         const int64_t elapsed = osal::TimeUs() - boot_start_us;
         if (!anim_done && elapsed > boot::kScatterEndUs + 1500 * 1000) {
             anim_done = true;
-            ESP_LOGI(kTag, "开机动画进入余韵（%.1fs）", elapsed / 1e6);
+            ESP_LOGI(kTag, "boot animation entering afterglow (%.1fs)", elapsed / 1e6);
         }
 
-        // 等面板的一个刷新周期再推帧。面板刷新率（约 58.5Hz）才是这个系统的真实
-        // 上限，推得比它快不会更流畅，只会在面板扫描时往 GRAM 里写 —— 那样整条
-        // band 可能整帧都没被接受。
+        // Wait for one panel refresh period before pushing a frame. The panel refresh rate (~58.5Hz) is the real
+        // ceiling of this system; pushing faster does not make it smoother, it only writes into GRAM while the panel
+        // is scanning -- in which case an entire band may never be accepted for the whole frame.
         if (g_panel.WaitForTeTick(30)) {
-            // 和 link 抢的是同一把锁 —— 见 display::Panel::DrawMutex()。
+            // The same lock the link contends for -- see display::Panel::DrawMutex().
             osal::LockGuard<osal::Mutex> draw_guard(g_panel.DrawMutex());
             boot::DrawFrame(elapsed, first);
             first = false;
@@ -410,8 +417,9 @@ void RenderTask(void* arg) {
     }
 }
 
-// 触摸上报。**只在按下/抬起边沿发** —— 触摸是 3ms 轮询一次，逐个采样都发的话
-// 每秒 300 条消息，USB 会被刷爆，而 PC 侧真正需要的只是"手指落在哪、什么时候抬"。
+// Touch reporting. **Only send on press/release edges** -- touch is polled every 3ms, so reporting every sample would
+// be 300 messages per second and would flood USB, while what the PC really needs is just "where did the finger land,
+// and when did it lift".
 void TouchTask(void* arg) {
     (void)arg;
     bool was_active = false;
@@ -423,42 +431,42 @@ void TouchTask(void* arg) {
         if (ts.active != was_active) {
             was_active = ts.active;
             hostlink::SendTouch(ts.active, ts.x, ts.y);
-            ESP_LOGI(kTag, "触摸 %s (%d,%d)", ts.active ? "按下" : "抬起", ts.x, ts.y);
+            ESP_LOGI(kTag, "touch %s (%d,%d)", ts.active ? "down" : "up", ts.x, ts.y);
         }
 
-        // 按键也在这里轮询 —— 单独起一个任务只为了每 25ms 读一次 GPIO 不值得。
+        // The button is polled here too -- spinning up a separate task just to read a GPIO every 25ms is not worth it.
         //
-        // 按键的两个用途：
-        //   · **按住 = 说话**（最自然的交互：想说就说，不用在屏幕上找按钮）
-        //   · 单击 = 取消当前的问询（PC 侧处理）
+        // The two uses of the button:
+        //   - **hold = push to talk** (the most natural interaction: speak whenever you want, no hunting for an on-screen button)
+        //   - short press = cancel the current query (handled on the PC side)
         const int64_t now = osal::TimeUs();
         if (now - last_button_us >= 25 * 1000) {
             last_button_us = now;
 
-            // 先看电平：按住期间持续录音。
+            // Check the level first: while held, keep recording.
             const bool held = g_button.IsPressed();
             if (held != rec_held) {
                 rec_held = held;
                 if (held) {
                     hostlink::StartCapture();
-                    ESP_LOGI(kTag, "按键按下 -> 开始录音");
+                    ESP_LOGI(kTag, "button pressed -> start recording");
                 } else {
                     hostlink::StopCapture();
-                    ESP_LOGI(kTag, "按键松开 -> 停止录音");
+                    ESP_LOGI(kTag, "button released -> stop recording");
                     hostlink::SendKey("voice_end");
                 }
-                // 录音期间的按下/松开不再当作短按长按上报，避免 PC 侧收到
-                // 一个"短按"然后又收到一段语音，语义打架。
+                // Presses/releases during recording are not reported as short/long presses, otherwise the PC side
+                // would receive a "short press" and then an audio clip, which is semantically contradictory.
                 (void)g_button.Poll();
             } else {
                 switch (g_button.Poll()) {
                     case input::ResetButton::Event::kShortPress:
                         hostlink::SendKey("short");
-                        ESP_LOGI(kTag, "按键：短按");
+                        ESP_LOGI(kTag, "button: short press");
                         break;
                     case input::ResetButton::Event::kLongPress:
                         hostlink::SendKey("long");
-                        ESP_LOGI(kTag, "按键：长按");
+                        ESP_LOGI(kTag, "button: long press");
                         break;
                     default:
                         break;
@@ -489,24 +497,24 @@ void StatsTask(void* arg) {
         last_flushes = g_band_flushes;
 
         const fluidbox::touch::State ts = g_touch.Get();
-        // df/dt 和 db/dt —— **两个数都要除以 dt**。
-        // 之前 db 直接打出来，于是 1872 这个"每 2 秒的次数"看着像频率，
-        // 和 58.5 fps 对不上（1872/58.5 不是整数）。除以 dt 之后是 936 band/s
-        // = 58.5 fps × 16 条，才对得上。
+        // df/dt and db/dt -- **both numbers must be divided by dt**.
+        // Previously db was printed raw, so 1872, which is a "count per 2 seconds", looked like a frequency and did
+        // not match 58.5 fps (1872/58.5 is not an integer). After dividing by dt it is 936 band/s
+        // = 58.5 fps x 16 bands, which finally adds up.
         const hostlink::Stats ls = hostlink::GetStats();
-        ESP_LOGI(kTag, "音频 放音%u 录音%u 块 | %s",
+        ESP_LOGI(kTag, "audio playback%u record%u blocks | %s",
                  static_cast<unsigned>(ls.audio_in), static_cast<unsigned>(ls.audio_out),
-                 hostlink::Capturing() ? "正在录音" : "空闲");
-        ESP_LOGI(kTag, "链路 帧%u band%u 整屏%u 控制%u | 坏帧头%u 坏长度%u 超时%u | RX溢出%u",
+                 hostlink::Capturing() ? "recording" : "idle");
+        ESP_LOGI(kTag, "link frames%u band%u full%u ctrl%u | bad magic%u bad len%u timeout%u | RX overflow%u",
                  static_cast<unsigned>(ls.frames), static_cast<unsigned>(ls.bands),
                  static_cast<unsigned>(ls.full), static_cast<unsigned>(ls.ctrl),
                  static_cast<unsigned>(ls.bad_magic), static_cast<unsigned>(ls.bad_len),
                  static_cast<unsigned>(ls.rx_timeout),
                  static_cast<unsigned>(usb_console::RxOverflowCount()));
-        ESP_LOGI(kTag, "%.1f fps | %.0f band/s | TE %u | 触摸 %s(%d,%d) | SRAM %u B",
+        ESP_LOGI(kTag, "%.1f fps | %.0f band/s | TE %u | touch %s(%d,%d) | SRAM %u B",
                  static_cast<double>(df) / dt, static_cast<double>(db) / dt,
                  static_cast<unsigned>(g_panel.TeEdges()),
-                 ts.active ? "按下" : "抬起", ts.x, ts.y,
+                 ts.active ? "down" : "up", ts.x, ts.y,
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
     }
 }
@@ -514,32 +522,33 @@ void StatsTask(void* arg) {
 }  // namespace
 
 extern "C" void app_main(void) {
-    ESP_LOGI(kTag, "===== mosaico-deck 启动 =====");
+    ESP_LOGI(kTag, "===== mosaico-deck starting =====");
 
-    // ---- 板级版本：必须最先做 ----
-    // 读 eFuse 决定 LCD_RST/LCD_SCL 和 I2C 引脚。V1.0 和 V1.2 这两组是互换的，
-    // 猜错的后果是"面板初始化成功但全程黑屏"（QSPI 只写，主机不知情）。
+    // ---- board revision: must be done first ----
+    // Read the eFuse to decide LCD_RST/LCD_SCL and the I2C pins. V1.0 and V1.2 swap these two sets, and guessing
+    // wrong means "the panel initializes successfully but the screen stays black the whole time" (QSPI is write-only,
+    // so the host has no idea).
     fluidbox::board::Init();
 
-    // ---- USB 控制台 ----
-    // 放前面：后面所有日志都要靠它出去。注意 USB 枚举要几百毫秒，
-    // 这之前的日志会丢（官方 SDK 也一样）。
+    // ---- USB console ----
+    // Do this early: all the logging that follows depends on it. Note that USB enumeration takes a few hundred
+    // milliseconds, so logs before that are lost (the official SDK behaves the same way).
     if (usb_console::Init() != ESP_OK) {
-        ESP_LOGW(kTag, "USB 控制台初始化失败");
+        ESP_LOGW(kTag, "USB console init failed");
     }
     usb_console::AttachToLogger();
 
-    // ---- 屏幕供电 ----
+    // ---- screen power ----
     if (PowerOnRails() != ESP_OK) {
-        ESP_LOGE(kTag, "3.3V 上电失败");
+        ESP_LOGE(kTag, "3.3V power-on failed");
     }
 
-    // ---- I2C 引脚排查 ----
+    // ---- I2C pin investigation ----
     const int n_v10 = ScanBusOnPins(0, 1, 100000);
     const int n_v12 = ScanBusOnPins(56, 3, 100000);
-    // 先报给 board：eFuse 不可信时这是判定板子版本的第二路独立信号。
+    // Report to board first: when the eFuse cannot be trusted, this is the second independent signal for the board revision.
     fluidbox::board::SetRevisionFromI2cProbe(n_v12 > n_v10);
-    ESP_LOGI(kTag, "I2C 探测: V1.0 组 %d 个 / V1.2 组 %d 个", n_v10, n_v12);
+    ESP_LOGI(kTag, "I2C probe: V1.0 set %d devices / V1.2 set %d devices", n_v10, n_v12);
 
     const int sda = fluidbox::board::Active().i2c_sda;
     const int scl = fluidbox::board::Active().i2c_scl;
@@ -552,50 +561,52 @@ extern "C" void app_main(void) {
     i2c_cfg.glitch_ignore_cnt = 7;
     i2c_cfg.flags.enable_internal_pullup = 1;
     if (i2c_new_master_bus(&i2c_cfg, &g_i2c_bus) != ESP_OK) {
-        ESP_LOGE(kTag, "I2C 总线创建失败 (SDA=%d SCL=%d)", sda, scl);
+        ESP_LOGE(kTag, "I2C bus creation failed (SDA=%d SCL=%d)", sda, scl);
         g_i2c_bus = nullptr;
     }
 
-    // ---- 面板 ----
+    // ---- panel ----
     if (g_panel.Init() != ESP_OK) {
-        ESP_LOGE(kTag, "面板初始化失败");
+        ESP_LOGE(kTag, "panel init failed");
     } else {
         g_panel.SetBrightness(fluidbox::config::kDisplayBrightness);
-        ESP_LOGI(kTag, "面板就绪，亮度 %d", fluidbox::config::kDisplayBrightness);
+        ESP_LOGI(kTag, "panel ready, brightness %d", fluidbox::config::kDisplayBrightness);
     }
 
-    // ---- 触摸 ----
+    // ---- touch ----
     if (g_i2c_bus != nullptr) {
         if (g_touch.Init(g_i2c_bus) != ESP_OK) {
-            ESP_LOGW(kTag, "触摸初始化失败，不影响显示");
+            ESP_LOGW(kTag, "touch init failed, display is unaffected");
         }
     }
 
-    // ---- 按键 ----
+    // ---- button ----
     if (g_button.Init() != ESP_OK) {
-        ESP_LOGW(kTag, "按键初始化失败");
+        ESP_LOGW(kTag, "button init failed");
     }
 
-    // 进 ROM 下载模式之前先关屏：重启后 GPIO 状态会丢、ROM 也不驱动屏幕的 3.3V
-    // 控制脚，屏幕要是还亮着，烧 flash 的电流尖峰就可能把供电拉崩。
+    // Turn the screen off before entering ROM download mode: after a reboot the GPIO state is lost and the ROM does
+    // not drive the screen's 3.3V control pin either, so if the screen is still on, the current spike from flashing
+    // can collapse the supply.
     usb_console::SetPreRestartHook([]() { g_panel.PrepareForBootloader(); });
 
-    // ---- 音频 ----
-    // ES8311 挂在 I2C 上，所以必须在 I2C 总线建好之后。
-    // 失败了不影响显示和触摸，只是不能说话/听。
+    // ---- audio ----
+    // The ES8311 sits on I2C, so this must come after the I2C bus is up.
+    // Failure does not affect display or touch, it just means no speaking/listening.
     if (g_i2c_bus != nullptr) {
         if (audio::Init(g_i2c_bus) != ESP_OK) {
-            ESP_LOGW(kTag, "音频初始化失败，设备不能说话也不能听");
+            ESP_LOGW(kTag, "audio init failed, the device can neither speak nor listen");
         }
     }
 
-    // ---- 链路 ----
-    // SetPanel 必须在 Init 之前 —— link 不认识面板从哪来，由 main 决定。
-    // 面板没就绪时传 nullptr 也合法：link 照常收帧、只是不显示（否则流会错位）。
+    // ---- link ----
+    // SetPanel must come before Init -- link does not know where the panel comes from, main decides that.
+    // Passing nullptr when the panel is not ready is also legal: link keeps receiving frames and simply does not
+    // display them (otherwise the stream would get out of sync).
     hostlink::SetPanel(g_panel.ready() ? &g_panel : nullptr);
     hostlink::Init();
 
-    // ---- 起任务 ----
+    // ---- start tasks ----
     static osal::Task render_task;
     static osal::Task stats_task;
     static osal::Task touch_task;
@@ -609,5 +620,5 @@ extern "C" void app_main(void) {
                       {.name = "stats", .stack_size = 3072, .priority = 3,
                        .core = osal::CoreAffinity::kCore1});
 
-    ESP_LOGI(kTag, "启动完成。现在等 PC 送帧；本地自检图案：渐变 + 横扫亮条 + 四角块");
+    ESP_LOGI(kTag, "startup complete. Now waiting for PC frames; local self-test pattern: gradient + sweeping bright bar + corner blocks");
 }

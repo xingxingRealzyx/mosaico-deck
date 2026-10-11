@@ -1,7 +1,7 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// Queue<T> template implementation — included by osal.h, do not include directly.
+// Queue<T> template implementation -- included by osal.h, do not include directly.
 
 #pragma once
 

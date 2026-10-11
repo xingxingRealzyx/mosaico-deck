@@ -1,7 +1,8 @@
-# mosaico-deck 的 bundle 层。
+# Bundle layer for mosaico-deck.
 #
-# 它**只插入自己这一行** —— profile 的其余部分来自 dsh-base / dsh-web-app。
-# 每个 bundle 依次叠加上来，用户的 cordis.patch.yml 再叠在最上面。
+# It inserts only its own row -- the rest of the profile comes from dsh-base and
+# dsh-web-app. Bundles are stacked in order and the user's cordis.patch.yml is
+# applied on top.
 - insert:
     - id: mosaico-deck
       name: dsh-mosaico-deck

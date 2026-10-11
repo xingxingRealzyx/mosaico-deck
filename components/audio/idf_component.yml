@@ -1,4 +1,4 @@
 dependencies:
   idf: ">=5.0"
-  # ES8311 的驱动 + esp_codec_dev 抽象层。官方 BSP 用的也是这个（~1.6）。
+  # ES8311 driver + the esp_codec_dev abstraction layer. The official BSP uses the same one (~1.6).
   espressif/esp_codec_dev: "~1.6"

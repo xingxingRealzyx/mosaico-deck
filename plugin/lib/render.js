@@ -1,15 +1,16 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// render.js —— 调 render.py 画一页
+// render.js -- calls render.py to draw one page
 //
-// **用 DSH 自带的那份 Python。**
-// `runtime/primary-runtime/dependencies/python` 里有 Python 3.12 + Pillow，
-// 而 DSH 自己就是靠它跑 Office 技能的 —— 所以这不是"额外装个 Python"，
-// 是复用宿主已经带的运行时。
+// **Use the Python that ships with DSH.**
+// `runtime/primary-runtime/dependencies/python` has Python 3.12 + Pillow,
+// and DSH itself relies on it to run the Office skills -- so this is not
+// "installing an extra Python", it is reusing a runtime the host already ships.
 //
-// 为什么不自带渲染：Node 侧没法用原生模块（见 device.js 顶部的说明），
-// 纯 JS 画中文要自己做字形栅格化。而 Pillow 这条链已经在跑、也验证过了。
+// Why not bundle our own renderer: the Node side cannot use native modules (see the
+// note at the top of device.js), and drawing Chinese text in pure JS would mean doing
+// glyph rasterization ourselves. The Pillow chain is already running and verified.
 
 import { execFile } from 'node:child_process';
 import path from 'node:path';
@@ -20,10 +21,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, '..', 'render.py');
 
 const CANDIDATES = [
-    // DSH 打包进去的那份（首选：一定有 Pillow）
+    // the one bundled with DSH (first choice: Pillow is guaranteed to be there)
     process.env.DSH_PYTHON,
     '/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3',
-    // 开发时的虚拟环境
+    // the virtualenv used during development
     path.join(HERE, '..', '..', '.venv', 'bin', 'python'),
     'python3',
 ].filter(Boolean);
@@ -44,12 +45,13 @@ function pythonPath() {
 }
 
 /**
- * 渲染一页。
+ * Render one page.
  *
- * 输出 **裸 RGB**（480×480×3）而不是 PNG：调用方拿去做 band 差分，本来就要
- * 逐字节比对整幅图，PNG 还得先解压。
+ * The output is **raw RGB** (480x480x3) rather than PNG: the caller uses it for band
+ * diffing and has to compare the whole image byte by byte anyway, while PNG would have
+ * to be decompressed first.
  *
- * @param {object} job 页面描述，形如 { page: 'status', state, detail, ... }
+ * @param {object} job page description, shaped like { page: 'status', state, detail, ... }
  * @returns {Promise<{rgb: Buffer, hits: Array}>}
  */
 export function render(job) {
@@ -58,16 +60,16 @@ export function render(job) {
         const child = execFile(
             pythonPath(),
             [SCRIPT],
-            // maxBuffer 别写 0 —— 在 Node 里那是"最多 0 字节"，会直接报
-            // 'stderr maxBuffer length exceeded'，而不是"不限制"。
+            // Do not set maxBuffer to 0 -- in Node that means "at most 0 bytes" and it
+            // reports 'stderr maxBuffer length exceeded' instead of "unlimited".
             { maxBuffer: 32 * 1024 * 1024, encoding: 'buffer', timeout: 15000 },
             (err, stdout, stderr) => {
                 if (err) {
-                    reject(new Error(`渲染失败: ${err.message}`));
+                    reject(new Error(`render failed: ${err.message}`));
                     return;
                 }
                 if (stdout.length !== PAGE_BYTES) {
-                    reject(new Error(`渲染输出 ${stdout.length} 字节，期望 ${PAGE_BYTES}`));
+                    reject(new Error(`render produced ${stdout.length} bytes, expected ${PAGE_BYTES}`));
                     return;
                 }
                 let hits = [];
@@ -87,7 +89,7 @@ export function render(job) {
     });
 }
 
-/** 综合环境检查，给插件一个"能不能用"的快速答案。 */
+/** Combined environment check, giving the plugin a quick "can this work" answer. */
 export function checkEnvironment() {
     const py = pythonPath();
     return { python: py, script: SCRIPT, exists: fs.existsSync(SCRIPT) };

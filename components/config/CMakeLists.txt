@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "src/board.cpp"
     INCLUDE_DIRS "include"
-    # board.cpp 要读 eFuse 判断板子版本（官方 BSP 也是这么做的）。
+    # board.cpp needs to read the eFuse to determine the board revision (the official BSP does the same).
     PRIV_REQUIRES efuse log
 )

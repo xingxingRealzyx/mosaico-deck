@@ -1,20 +1,22 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// input —— "重置流体"按键
+// input -- the "reset fluid" button
 //
-// 为什么不是原项目的按钮驱动
-// --------------------------
-// V4C38/esp32-fluidbox 的 button.c 是从 TCA9554 IO 扩展器上读 PWR 键的；
-// ESP-Mosaico 上没有那颗芯片，板载可用的只有接到 GPIO7 的 AI 按键（低电平
-// 有效）。所以这里保留原驱动"短按/长按"的判定行为，只把底层从 I2C 扩展器换成
-// 普通 GPIO + 内部上拉。
+// Why not the original project's button driver
+// --------------------------------------------
+// V4C38/esp32-fluidbox's button.c reads the PWR key from a TCA9554 IO expander;
+// the ESP-Mosaico has no such chip, and the only on-board option is the AI button
+// wired to GPIO7 (active low). So the original driver's short-press/long-press
+// decision behaviour is kept here, and only the low-level layer is swapped from
+// the I2C expander to a plain GPIO + internal pull-up.
 //
-// 为什么轮询而不是中断
-// --------------------
-// 按键接在 GPIO7 上，本身就是机械触点，抖动靠软件窗口滤掉就够了；主循环本来
-// 就有约 25 ms 的节拍，多一个中断只会多一条并发路径。所以 GPIO_INTR_DISABLE，
-// 由调用者周期性调用 Poll()。
+// Why polling instead of an interrupt
+// -----------------------------------
+// The button is on GPIO7 and is a mechanical contact by nature; filtering the
+// bounce with a software window is enough, and the main loop already ticks at
+// about 25 ms. An extra interrupt would only add another concurrent path. Hence
+// GPIO_INTR_DISABLE, with the caller invoking Poll() periodically.
 
 #pragma once
 
@@ -30,40 +32,48 @@ class ResetButton {
     ResetButton(const ResetButton&) = delete;
     ResetButton& operator=(const ResetButton&) = delete;
 
-    // 配置 GPIO，打开内部上拉。
+    // Configure the GPIO and enable the internal pull-up.
     esp_err_t Init();
 
-    // 一次采样能报出的事件。
+    // The events a single sample can report.
     enum class Event : uint8_t {
         kNone,
-        kShortPress,  // 按下后 1.5 秒内松开
-        kLongPress,   // 按住超过 1.5 秒 —— **在按住期间就报**，不用等松手
+        kShortPress,  // released within 1.5 seconds of being pressed
+        kLongPress,   // held longer than 1.5 seconds -- **reported while still held**, no need to wait for the release
     };
 
-    // 周期性调用（约每 25 ms 一次）。
+    // Call periodically (about once every 25 ms).
     //
-    // **必须只调这一个，不要拆成两个函数。**
-    // 这里踩过一次：原来有 TakeShortPress() 和 TakeLongPress() 两个函数，各自
-    // 维护同一份去抖状态（stable_ / raw_pressed_）。每轮依次调用时，第二个看到的
-    // 状态已经被第一个改过了 —— 去抖状态机直接乱掉，长按和短按**双双失灵**。
-    // 症状就是用户说的"没反应"。
+    // **This one must be the only entry point; do not split it into two
+    // functions.**
+    // We hit this once: there used to be TakeShortPress() and TakeLongPress(),
+    // each maintaining the same debounce state (stable_ / raw_pressed_). When
+    // called in sequence every round, the second one saw state the first one had
+    // already modified -- the debounce state machine fell apart and both long
+    // press and short press **stopped working**. The symptom is exactly what the
+    // user described as "no response".
     //
-    // 长按在按住期间就报（不等松手）：这一档是用来"边按边试"的（长按切换触摸
-    // 力度，手一松就能立刻去摸屏幕感受新力度），等松手才反馈的话人已经离开屏幕了。
+    // Long press is reported while the button is still held (without waiting for
+    // the release): this tier is meant for "press and try it out" (long press
+    // toggles the touch force, and the hand can immediately go feel the new force
+    // on the screen); if feedback waited for the release, the person would already
+    // have left the screen.
     Event Poll();
 
-    // 当前是否按着（去抖后的电平）。
+    // Whether it is currently held (the debounced level).
     //
-    // "按住说话"需要知道**持续按住**这件事，而不是按下/松开两个边沿 —— 用
-    // Poll() 的事件流来实现的话，得在 PC 侧记状态、还要处理丢事件的情况。
+    // "Hold to talk" needs to know about the **continuous hold**, not the two
+    // edges of press/release -- implementing that with the Poll() event stream
+    // would require tracking state on the PC side and also handling dropped
+    // events.
     bool IsPressed() const { return raw_pressed_; }
 
  private:
-    bool raw_pressed_ = false;   // 去抖后的电平
+    bool raw_pressed_ = false;   // debounced level
     bool stable_ = false;
     int64_t press_start_us_ = 0;
     bool reported_ = false;
-    bool long_reported_ = false;  // 这一次按住是否已经报过长按
+    bool long_reported_ = false;  // whether a long press has already been reported for this hold
 };
 
 }  // namespace input

@@ -4,29 +4,36 @@ menu "Mosaico Deck"
         prompt "ESP-Mosaico CoreBoard revision (FALLBACK only)"
         default FBOX_BOARD_V10
         help
-            ⚠️ 正常情况下**不需要动这里**：板子版本由芯片 eFuse 里的硬件版本字
-            自动识别（board::Init()，官方 BSP 的 bsp_board_variant_get() 也是
-            这么做的）。这个选项只在 eFuse 读不出来、或值不支持时兜底。
+            WARNING: Under normal circumstances **you do not need to touch this**: the board
+            revision is auto-detected from the hardware revision word in the chip eFuse
+            (board::Init(); the official BSP's bsp_board_variant_get() does the same).
+            This option is only a fallback for when the eFuse cannot be read or holds an
+            unsupported value.
 
-            为什么不能靠这个选项：LCD_RST / LCD_SCL 在两个版本里是**互换**的，
-            选错的后果是 QSPI 时钟打在复位脚上、面板永远收不到有效命令 ——
-            而 QSPI 是**只写总线**，ESP 侧完全不知情，驱动一路 ESP_OK，
-            最后得到一个"初始化成功但全程黑屏"的屏幕。本工程实际踩过。
+            Why you cannot rely on this option: LCD_RST / LCD_SCL are **swapped** between
+            the two revisions, and choosing wrong means the QSPI clock lands on the reset
+            pin and the panel never receives a valid command -- and since QSPI is a
+            **write-only bus**, the ESP side is completely unaware: the driver returns
+            ESP_OK the whole way, and you end up with a screen that "initialized
+            successfully but is black the entire time". This project actually hit this.
 
-            仅供参考，两个版本的差别：
+            For reference only, the differences between the two revisions:
               V1.0: LCD_RST=GPIO42, LCD_SCL=GPIO44
               V1.2: LCD_RST=GPIO44, LCD_SCL=GPIO42
-            选错面板点不亮。请对照主板丝印确认。
+            Choose wrong and the panel will not light up. Please confirm against the
+            silkscreen on the mainboard.
 
-            I2C 引脚**不需要在这里选**：固件启动时会自动扫 GPIO0/1 和 GPIO56/3
-            两组并选用有器件的那组（实测这块板子用的是 GPIO56/3，和官方 V1.0
-            文档写的 GPIO0/1 不一样，所以交给探测更可靠）。
+            The I2C pins **do not need to be selected here**: at startup the firmware
+            automatically scans both groups GPIO0/1 and GPIO56/3 and picks whichever group
+            has devices (this particular board was measured to use GPIO56/3, different
+            from the GPIO0/1 written in the official V1.0 documentation, so leaving it to
+            the probe is more reliable).
 
         config FBOX_BOARD_V10
-            bool "V1.0  (橙色状态灯, LCD_RST=42/SCL=44)"
+            bool "V1.0  (orange status LED, LCD_RST=42/SCL=44)"
 
         config FBOX_BOARD_V12
-            bool "V1.2  (无状态灯, LCD_RST=44/SCL=42)"
+            bool "V1.2  (no status LED, LCD_RST=44/SCL=42)"
     endchoice
 
     config FBOX_DISPLAY_PCLK_MHZ
@@ -34,34 +41,40 @@ menu "Mosaico Deck"
         range 20 120
         default 60
         help
-            **默认 60，不是官方那种 40，也不是能跑到的最高 80。**
+            **Default 60, not the official 40, and not the 80 it could run at.**
 
-            理由：面板的刷新率（TE 实测约 58.5 Hz）才是这个系统的真实上限。
-            喂满 60 Hz 需要约 54 MHz，所以 60 MHz 刚好够，再高纯粹是浪费 ——
-            推得比面板快不会更流畅，只会撕裂。
+            Reason: the panel's refresh rate (TE measured about 58.5 Hz) is the real
+            ceiling of this system. Feeding a full 60 Hz needs about 54 MHz, so 60 MHz is
+            just enough and anything higher is pure waste -- pushing faster than the panel
+            does not make it smoother, it only tears.
 
-            而且**高时钟是有代价的**：链路走 GPIO 矩阵、驱动能力又被官方要求
-            设成最弱挡（`FBOX_LCD_DRIVE_CAP`，为降 EMI），80 MHz 下边沿来不及
-            建立，会偶发位错误 —— 表现是"某条 band 闪一下别的颜色"，而 QSPI 是
-            只写总线，主机侧一点错都看不到。这个坑本工程实际踩过。
+            Moreover, **a high clock has a cost**: the link goes through the GPIO matrix
+            and the drive strength is required by the official code to be set to the
+            weakest step (`FBOX_LCD_DRIVE_CAP`, to reduce EMI); at 80 MHz the edges do not
+            have time to settle and occasional bit errors occur -- the symptom is "one
+            band flashes a different color", and since QSPI is a write-only bus, the host
+            side sees no error at all. This project actually hit this pitfall.
 
-            出现花屏/错色就往下调；想稳妥就跟官方一样用 40（代价是掉到约 44 fps）。
+            If you see corrupted or wrong-colored output, turn it down; if you want to play
+            it safe, use 40 like the official code (at the cost of dropping to about
+            44 fps).
 
     config FBOX_LCD_DRIVE_CAP
         int "QSPI bus pin drive strength (0-3)"
         range 0 3
         default 2
         help
-            CO5300 的 SCL 与 DATA0-DATA3 五根线的 GPIO 驱动能力。
-            0 = 最弱，3 = 最强。
+            GPIO drive strength of the CO5300's five lines, SCL and DATA0-DATA3.
+            0 = weakest, 3 = strongest.
 
-            官方 BSP 默认是 **0**（最弱），理由是降低边沿速率、减少 EMI，对
-            Wi-Fi/BLE 共存有好处；官方注释也写明"signal integrity fails at
-            high clock 就往上调"。
+            The official BSP defaults to **0** (weakest) in order to lower the edge rate
+            and reduce EMI, which is good for Wi-Fi/BLE coexistence; the official comment
+            also states "turn it up if signal integrity fails at high clock".
 
-            这里默认用 **2**（中等）：在 60 MHz 下留出足够的建立时间余量，
-            代价是 EMI 比最弱挡大一些。如果你的板子在 80 MHz 下非要跑，
-            可以试 3；反过来想省电/降 EMI 就调到 0，同时把 PCLK 降到 40。
-            对应官方 Kconfig 的 BSP_LCD_QSPI_DRIVE_CAP。
+            Here the default is **2** (medium): it leaves enough setup-time margin at
+            60 MHz, at the cost of somewhat more EMI than the weakest step. If your board
+            insists on running at 80 MHz you can try 3; conversely, to save power or reduce
+            EMI, set it to 0 and lower PCLK to 40.
+            Corresponds to the official Kconfig's BSP_LCD_QSPI_DRIVE_CAP.
 
 endmenu

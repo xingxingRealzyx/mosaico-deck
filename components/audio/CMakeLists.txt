@@ -5,6 +5,7 @@ idf_component_register(
     PRIV_REQUIRES config osal esp_driver_i2s esp_driver_i2c esp_driver_gpio log
 )
 
-# esp_codec_dev / i2s 的配置结构体是 C 写的、字段会增（这次就在 clk_src 上踩了），
-# C++ 这边聚合初始化必然缺字段。和 display / touch / input 组件同样处理。
+# The esp_codec_dev / i2s config structs are written in C and gain fields over time
+# (this time it was clk_src), so C++ aggregate initialization necessarily misses fields.
+# Handled the same way as the display / touch / input components.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=missing-field-initializers)

@@ -1,14 +1,14 @@
 // Copyright 2026 ESP-Claw Authors
 // SPDX-License-Identifier: MIT
 //
-// dh_logo.h —— 开机动画用的 DeepSeek Harness 鲸鱼 logo（自动生成，勿手改）
+// dh_logo.h -- DeepSeek Harness whale logo used by the boot animation (auto-generated, do not edit by hand)
 //
-// 从 /Applications/DeepSeek Harness.app/Contents/Resources/icon.png 提取：
-// 裁掉圆角浅底，取暗色像素做 1-bit 蒙版。1 表示属于 logo。
+// Extracted from /Applications/DeepSeek Harness.app/Contents/Resources/icon.png:
+// the rounded light background was cropped out and the dark pixels became a 1-bit mask. 1 means the pixel belongs to the logo.
 //
-// **为什么是 1-bit 蒙版而不是彩色位图**：开机动画要把 logo 画成一种颜色
-//（白色），而且后面粒子散开时每个粒子直接取蒙版上的点即可 —— 既省 7/8 的
-// flash，也省掉一次解包。
+// **Why a 1-bit mask instead of a color bitmap**: the boot animation draws the logo in a single color
+// (white), and when the particles scatter later each particle can just sample a bit from the mask -- this saves 7/8 of
+// the flash and also skips a decode pass.
 
 #pragma once
 
@@ -17,9 +17,9 @@
 namespace deck {
 
 inline constexpr int kLogoSize = 240;
-inline constexpr int kLogoStride = 30;  // 每行字节数
+inline constexpr int kLogoStride = 30;  // bytes per row
 
-// 每行 30 字节，高位在前（bit7 = 最左边的像素）。
+// 30 bytes per row, MSB first (bit7 = leftmost pixel).
 inline constexpr uint8_t kLogoMask[kLogoSize * kLogoStride] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

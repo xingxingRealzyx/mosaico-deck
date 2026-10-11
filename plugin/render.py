@@ -2,21 +2,23 @@
 # Copyright 2026 ESP-Claw Authors
 # SPDX-License-Identifier: MIT
 #
-# render.py —— 把一页界面渲染成 480×480 的裸 RGB
+# render.py -- render one page of UI into raw 480x480 RGB
 #
-# 约定
-# ----
-#   stdin  : 一页的 JSON（一行）
-#   stdout : 480*480*3 字节裸 RGB（小端无关，就是 R,G,B 顺序）
+# Contract
+# --------
+#   stdin  : one page of JSON (single line)
+#   stdout : 480*480*3 bytes of raw RGB (endianness-agnostic, just R,G,B order)
 #
-# **为什么用裸 RGB 而不是 PNG**：调用方（render.js）拿去做 band 差分，本来就要
-# 逐字节比对整幅图。PNG 得先解压才能比对，白白多一次编解码。
+# **Why raw RGB instead of PNG**: the caller (render.js) uses it for band
+# diffing and already compares the whole image byte by byte. PNG would have to
+# be decompressed before comparison, wasting an extra encode/decode round.
 #
-# 为什么渲染留在 Python
-# --------------------
-# 板子只有 512KB SRAM 跑不了 TTS/排版，界面必须在 PC 上画。而 DSH 自带的那份
-# Python 里就有 Pillow（runtime/primary-runtime/dependencies/python），中文
-# 字体直接用系统的 —— 这条链是现成的，没必要在 Node 里再搭一套。
+# Why rendering stays in Python
+# -----------------------------
+# The board only has 512KB SRAM and cannot run TTS/layout, so the UI must be
+# drawn on the PC. The Python shipped with DSH already includes Pillow
+# (runtime/primary-runtime/dependencies/python), and CJK fonts come straight
+# from the system -- this chain is ready-made, no need to build another in Node.
 
 import json
 import sys
@@ -26,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 W = H = 480
 
-BG = (0, 0, 0)          # 纯黑：AMOLED 上不发光，省电且对比度最高
+BG = (0, 0, 0)          # Pure black: emits nothing on AMOLED, saves power, max contrast
 SURFACE_HI = (26, 31, 41)
 BORDER = (33, 40, 54)
 TEXT = (240, 244, 250)
@@ -72,7 +74,7 @@ def draw_status(d, img, job):
     color = STATE_COLORS.get(state, IDLE)
     label = job.get("label") or STATE_LABELS.get(state, state)
 
-    # 状态点：外圈两层更暗的同色环，看起来"亮着"
+    # Status dot: two outer rings of the same hue but dimmer, so it looks "lit"
     cx, cy, r = 34, 40, 7
     halo = Image.new("RGBA", (r * 8, r * 8), (0, 0, 0, 0))
     hd = ImageDraw.Draw(halo)
@@ -110,15 +112,16 @@ def draw_status(d, img, job):
     d.line((28, sy, W - 28, sy), fill=BORDER, width=1)
     parts = []
     if job.get("files"):
-        parts.append(f"改了 {job['files']} 个文件")
+        parts.append(f"{job['files']} files changed")
     if job.get("testsTotal"):
-        parts.append(f"测试 {job.get('testsPassed', 0)}/{job['testsTotal']}")
+        parts.append(f"tests {job.get('testsPassed', 0)}/{job['testsTotal']}")
     if parts:
         d.text((28, sy + 12), "   ·   ".join(parts), font=font(18), fill=TEXT_DIM)
 
     log = job.get("log") or []
     if log:
-        # 行数跟按钮让位：按钮顶在 H-100，日志压过去就被盖住
+        # Line count yields to the buttons: buttons sit at H-100, so the log
+        # would be covered if it ran past them
         room = (H - 100) - (sy + 42)
         n = max(1, min(4, room // 26))
         ly = sy + 42
@@ -220,12 +223,13 @@ def main():
     img, hits = PAGES.get(job.get("page", "status"), render_status)(job)
 
     if job.get("hits"):
-        # 调用方要按钮位置：把命中区单独走 stderr 的旁路（stdout 只放像素，
-        # 二进制流里混不进结构化的东西）。
+        # The caller wants button positions: send the hit regions over a
+        # separate stderr side channel (stdout carries only pixels; structured
+        # data cannot be mixed into a binary stream).
         sys.stderr.write(json.dumps(hits) + "\n")
         sys.stderr.flush()
 
-    # stdout 必须是干净的裸像素 —— 所以上面所有输出都走 stderr。
+    # stdout must be clean raw pixels -- so all output above goes to stderr.
     sys.stdout.buffer.write(img.tobytes())
     sys.stdout.buffer.flush()
     return 0
