@@ -41,7 +41,21 @@ import { render, checkEnvironment } from './render.js';
 export const name = 'mosaico-deck';
 export const inject = ['tools'];
 
+// Reconnect backoff. **Do not poll the port aggressively.**
+//
+// On this board, opening /dev/cu.usbmodem* asserts DTR and RTS -- that is a
+// hardware fact, not a firmware quirk (flash-rom.sh documents the same trap).
+// While the chip sits in ROM download mode those lines ARE the reset signal, so
+// a plugin that periodically opens the port to "see if the board is there"
+// kicks the chip straight back out of download mode. Observed symptom: the
+// board re-enumerates every few seconds, never stays in ROM mode, and flashing
+// becomes impossible.
+//
+// So: try at startup, then back off hard and stop retrying. If the board shows
+// up later, the user can reconnect from the host; what must never happen is
+// this plugin fighting an ongoing flash.
 const RECONNECT_MS = 5000;
+const RECONNECT_MAX = 3; // then give up and leave the port alone
 const TICK_MS = 1000;
 
 // Wait this long after connecting before pushing the first frame. The board is
@@ -230,8 +244,17 @@ export function apply(ctx) {
     }
 
     connect();
+    let attempts = 1;
     const reconnectTimer = setInterval(() => {
-        if (!deck.connected) connect();
+        if (deck.connected || attempts >= RECONNECT_MAX) {
+            if (attempts >= RECONNECT_MAX && !deck.connected) {
+                clearInterval(reconnectTimer);
+                ctx.logger?.info?.('mosaico-deck: board not found, stopped probing the port');
+            }
+            return;
+        }
+        attempts += 1;
+        connect();
     }, RECONNECT_MS);
 
     const tickTimer = setInterval(() => {
