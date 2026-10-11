@@ -34,6 +34,7 @@
 #include <cstdint>
 
 #include "esp_err.h"
+#include "osal.h"
 
 namespace usb_console {
 
@@ -57,6 +58,25 @@ void Printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // 把 ESP-IDF 的日志重定向到 CDC。
 void AttachToLogger();
+
+// ---- 接收 ------------------------------------------------------------------
+//
+// **这一层不认识协议**，只把收到的字节交出来。协议解析（帧头、JSON 行）在各自的
+// 调用方里做 —— 这样 usb_console 保持通用，将来换协议不用动它。
+//
+// 前提：Init() 里已经注册了 CDC 的 RX 回调，收到的数据进一个环形缓冲。
+
+// 取一段收到的数据。**空 view 表示超时**（不是出错）。
+//
+// 返回的 view 指向环形缓冲的内部存储，**用完必须调 ReturnRx() 还回去** ——
+// FreeRTOS 的 ring buffer 在 no-split 模式下是"借出"语义，不还的话缓冲很快就满。
+osal::InputBuffer ReceiveRx(uint32_t timeout_ms = UINT32_MAX);
+
+// 归还 ReceiveRx() 借出的那段。
+void ReturnRx(osal::InputBuffer buf);
+
+// 环形缓冲满过几次（说明消费太慢或对方发太快）。诊断用。
+uint32_t RxOverflowCount();
 
 // 重启进 ROM 下载模式之前的回调。
 //

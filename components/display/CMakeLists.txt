@@ -1,8 +1,7 @@
 idf_component_register(
     SRCS "src/display.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES osal
-    PRIV_REQUIRES
+    PRIV_REQUIRES osal
         config
         esp_driver_gpio
         esp_lcd

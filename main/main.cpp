@@ -34,6 +34,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "input.h"
+#include "link.h"
 #include "osal.h"
 #include "touch.h"
 #include "usb_console.h"
@@ -119,31 +120,51 @@ int ScanBusOnPins(int sda, int scl, uint32_t hz) {
 //
 // 图案：整屏竖向渐变（每条 band 的底色不同 → 漏掉一条会看出一条硬边），
 // 加一根横向移动的亮条（证明在持续刷新），四角各一个白方块（证明边界覆盖）。
-void DrawBringUpPattern(int frame) {
+// ---------------------------------------------------------------------------
+// 显示链路自检
+// ---------------------------------------------------------------------------
+// 关键点：**只重画变化的那几条 band，不整屏重推。**
+//
+// 为什么这是重点：整屏 450KB 在 60MHz QSPI 上要 15.4ms，而面板刷新周期是 17ms
+// —— 一帧的传输时间几乎等于一次刷新，只要有一点抖动就会跨过去，上半屏是新内容、
+// 下半屏还是旧的，看起来就是撕裂（实测一根横扫的亮条"有时候会弯"）。
+//
+// 而真实 UI 大部分时间是静态的，只有几条 band 会变：文字更新也就 1~3 条，
+// 1.4~4.2ms 就传完了，稳稳落在一次刷新之内，**根本不会撕裂**。
+//
+// 所以正确的做法不是"让动画慢下来"（那只是把问题藏起来），而是只发变化的部分。
+// 这个图案就是按真实方式画的：
+//   · 第一帧画满 16 条（初始化整屏）
+//   · 之后每帧只重画亮条经过的那几条 band
+constexpr int kBarTop = 150;
+constexpr int kBarBottom = 230;  // 亮条占据的行范围
+constexpr int kBarWidth = 16;
+
+void DrawBringUpPattern(int frame, bool full_redraw) {
     // 面板是**圆角矩形**：实测在 (0,0)/(460,0)/(0,460)/(460,460) 画的 20×20 白块
-    // 完全看不到。所以角标要往里缩。这个边距 PC 侧渲染 UI 时同样适用 ——
-    // 不要把内容放在四角。
+    // 完全看不到。所以角标往里缩。这个边距 PC 侧渲染 UI 时同样适用。
     constexpr int kCornerInset = 60;
     constexpr int kCornerSize = 24;
-
-    // 亮条速度：**1 px/帧**。
-    //
-    // 原来写的是 4 px/帧（约 234 px/s），结果条是弯的 —— 不是画错了，是撕裂：
-    // 16 条 band 推完要 22ms，跨越了一次面板刷新（17ms），于是上半屏是新位置、
-    // 下半屏还是旧位置。这是这套显示的物理特性，TE 同步只能对齐帧的**起点**，
-    // 消不掉"一帧比一次刷新还长"这件事。
-    //
-    // 1 px/帧 时 22ms 内只移动 1.3px，看不出来。真实 UI 应该避免快速移动的元素，
-    // 或者一次刷新内发完整屏。
-    const int phase = frame % 480;
-    const int x = (phase < 240) ? (phase * 2) : ((479 - phase) * 2);
 
     auto swap16 = [](uint16_t v) -> uint16_t {
         return static_cast<uint16_t>((v >> 8) | (v << 8));
     };
     const uint16_t white = swap16(0xFFFF);
 
+    // 亮条位置：2px/帧 左右往返
+    const int phase = frame % 480;
+    const int x = (phase < 240) ? (phase * 2) : ((479 - phase) * 2);
+
+    // 只有这几条 band 会被重画（第一帧除外）
+    const int bar_b0 = kBarTop / fluidbox::config::kBandRows;
+    const int bar_b1 = (kBarBottom - 1) / fluidbox::config::kBandRows;
+
     for (int band = 0; band < fluidbox::config::kBandCount; band++) {
+        const bool in_bar = (band >= bar_b0 && band <= bar_b1);
+        if (!full_redraw && !in_bar) {
+            continue;  // **跳过没变的 band** —— 这就是省下来的带宽
+        }
+
         uint16_t* buf = g_panel.AcquireBand();
         if (buf == nullptr) {
             continue;
@@ -152,7 +173,8 @@ void DrawBringUpPattern(int frame) {
         const int y0 = band * fluidbox::config::kBandRows;
         const int y1 = y0 + fluidbox::config::kBandRows;
 
-        // 底色：按 band 序号在深蓝→深紫之间渐变。漏掉任何一条都会看成一条硬边。
+        // 底色：按 band 序号从**蓝渐变到红**（绿通道恒为 0，中间经过洋红）。
+        // 漏掉任何一条 band 都会在渐变里看成一条硬边。
         const int t = band * 255 / (fluidbox::config::kBandCount - 1);
         const uint16_t r5 = static_cast<uint16_t>(t * 31 / 255);
         const uint16_t b5 = static_cast<uint16_t>((255 - t) * 31 / 255);
@@ -161,11 +183,12 @@ void DrawBringUpPattern(int frame) {
             buf[i] = bg;
         }
 
-        // 移动的亮条（屏幕中间偏上，避开中心方便以后放真实内容）
-        if (y1 > 150 && y0 < 230) {
-            for (int y = (y0 > 150 ? y0 : 150); y < (y1 < 230 ? y1 : 230); y++) {
+        // 移动的亮条
+        if (in_bar) {
+            for (int y = (y0 > kBarTop ? y0 : kBarTop);
+                 y < (y1 < kBarBottom ? y1 : kBarBottom); y++) {
                 uint16_t* row = buf + (y - y0) * fluidbox::config::kLcdHRes;
-                for (int dx = 0; dx < 16; dx++) {
+                for (int dx = 0; dx < kBarWidth; dx++) {
                     const int px = x + dx;
                     if (px >= 0 && px < fluidbox::config::kLcdHRes) {
                         row[px] = white;
@@ -174,9 +197,11 @@ void DrawBringUpPattern(int frame) {
             }
         }
 
-        // 四角角标：**往里缩**，避开圆角。
-        const int xs[2] = {kCornerInset, fluidbox::config::kLcdHRes - kCornerInset - kCornerSize};
-        const int ys[2] = {kCornerInset, fluidbox::config::kLcdVRes - kCornerInset - kCornerSize};
+        // 四角角标：往里缩避开圆角
+        const int xs[2] = {kCornerInset,
+                           fluidbox::config::kLcdHRes - kCornerInset - kCornerSize};
+        const int ys[2] = {kCornerInset,
+                           fluidbox::config::kLcdVRes - kCornerInset - kCornerSize};
         for (int cy = 0; cy < 2; cy++) {
             for (int cx = 0; cx < 2; cx++) {
                 for (int y = ys[cy]; y < ys[cy] + kCornerSize; y++) {
@@ -206,16 +231,72 @@ void RenderTask(void* arg) {
     (void)arg;
     ESP_LOGI(kTag, "渲染任务启动");
 
+    // 本地自检图案只在**PC 还没接管屏幕**时画。
+    //
+    // 为什么必须让出去：两个任务同时画会抢 SPI 总线（实测 `acquire spi bus failed`
+    // + `ESP_ERR_INVALID_STATE`），而且消费任务被总线卡住之后没空读环形缓冲 ——
+    // 表现为大量 RX 溢出。屏幕的所有权只能有一个主人。
     int frame = 0;
+    bool first = true;
+    bool gave_up = false;
     for (;;) {
+        if (link::RemoteOwnsScreen()) {
+            if (!gave_up) {
+                gave_up = true;
+                ESP_LOGI(kTag, "PC 已接管屏幕，本地自检图案停止");
+            }
+            osal::Delay(50);
+            continue;
+        }
+
         // 等面板的一个刷新周期再推帧。面板刷新率（约 58.5Hz）才是这个系统的真实
         // 上限，推得比它快不会更流畅，只会在面板扫描时往 GRAM 里写 —— 那样整条
         // band 可能整帧都没被接受。
-        g_panel.WaitForTeTick(30);
+        if (g_panel.WaitForTeTick(30)) {
+            // 和 link 抢的是同一把锁 —— 见 display::Panel::DrawMutex()。
+            osal::LockGuard<osal::Mutex> draw_guard(g_panel.DrawMutex());
+            DrawBringUpPattern(frame, first);
+            first = false;
+            frame++;
+            g_frames = g_frames + 1;
+        }
+    }
+}
 
-        DrawBringUpPattern(frame);
-        frame++;
-        g_frames = g_frames + 1;
+// 触摸上报。**只在按下/抬起边沿发** —— 触摸是 3ms 轮询一次，逐个采样都发的话
+// 每秒 300 条消息，USB 会被刷爆，而 PC 侧真正需要的只是"手指落在哪、什么时候抬"。
+void TouchTask(void* arg) {
+    (void)arg;
+    bool was_active = false;
+    int64_t last_button_us = osal::TimeUs();
+    for (;;) {
+        g_touch.Poll();
+        const fluidbox::touch::State ts = g_touch.Get();
+        if (ts.active != was_active) {
+            was_active = ts.active;
+            link::SendTouch(ts.active, ts.x, ts.y);
+            ESP_LOGI(kTag, "触摸 %s (%d,%d)", ts.active ? "按下" : "抬起", ts.x, ts.y);
+        }
+
+        // 按键也在这里轮询 —— 单独起一个任务只为了每 25ms 读一次 GPIO 不值得。
+        const int64_t now = osal::TimeUs();
+        if (now - last_button_us >= 25 * 1000) {
+            last_button_us = now;
+            switch (g_button.Poll()) {
+                case input::ResetButton::Event::kShortPress:
+                    link::SendKey("short");
+                    ESP_LOGI(kTag, "按键：短按");
+                    break;
+                case input::ResetButton::Event::kLongPress:
+                    link::SendKey("long");
+                    ESP_LOGI(kTag, "按键：长按");
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        osal::Delay(fluidbox::config::kTouchPollPeriodMs);
     }
 }
 
@@ -242,6 +323,13 @@ void StatsTask(void* arg) {
         // 之前 db 直接打出来，于是 1872 这个"每 2 秒的次数"看着像频率，
         // 和 58.5 fps 对不上（1872/58.5 不是整数）。除以 dt 之后是 936 band/s
         // = 58.5 fps × 16 条，才对得上。
+        const link::Stats ls = link::GetStats();
+        ESP_LOGI(kTag, "链路 帧%u band%u 整屏%u 控制%u | 坏帧头%u 坏长度%u 超时%u | RX溢出%u",
+                 static_cast<unsigned>(ls.frames), static_cast<unsigned>(ls.bands),
+                 static_cast<unsigned>(ls.full), static_cast<unsigned>(ls.ctrl),
+                 static_cast<unsigned>(ls.bad_magic), static_cast<unsigned>(ls.bad_len),
+                 static_cast<unsigned>(ls.rx_timeout),
+                 static_cast<unsigned>(usb_console::RxOverflowCount()));
         ESP_LOGI(kTag, "%.1f fps | %.0f band/s | TE %u | 触摸 %s(%d,%d) | SRAM %u B",
                  static_cast<double>(df) / dt, static_cast<double>(db) / dt,
                  static_cast<unsigned>(g_panel.TeEdges()),
@@ -319,15 +407,25 @@ extern "C" void app_main(void) {
     // 控制脚，屏幕要是还亮着，烧 flash 的电流尖峰就可能把供电拉崩。
     usb_console::SetPreRestartHook([]() { g_panel.PrepareForBootloader(); });
 
+    // ---- 链路 ----
+    // SetPanel 必须在 Init 之前 —— link 不认识面板从哪来，由 main 决定。
+    // 面板没就绪时传 nullptr 也合法：link 照常收帧、只是不显示（否则流会错位）。
+    link::SetPanel(g_panel.ready() ? &g_panel : nullptr);
+    link::Init();
+
     // ---- 起任务 ----
     static osal::Task render_task;
     static osal::Task stats_task;
+    static osal::Task touch_task;
     render_task.Create(RenderTask, nullptr,
                        {.name = "render", .stack_size = 4096, .priority = 5,
                         .core = osal::CoreAffinity::kCore0});
+    touch_task.Create(TouchTask, nullptr,
+                      {.name = "touch", .stack_size = 3072, .priority = 4,
+                       .core = osal::CoreAffinity::kCore1});
     stats_task.Create(StatsTask, nullptr,
                       {.name = "stats", .stack_size = 3072, .priority = 3,
                        .core = osal::CoreAffinity::kCore1});
 
-    ESP_LOGI(kTag, "启动完成，期待看到：整屏竖向渐变 + 一根横扫的亮条 + 四角白块");
+    ESP_LOGI(kTag, "启动完成。现在等 PC 送帧；本地自检图案：渐变 + 横扫亮条 + 四角块");
 }

@@ -30,6 +30,7 @@
 #include <cstdint>
 
 #include "esp_err.h"
+#include "osal.h"
 
 namespace display {
 
@@ -46,6 +47,15 @@ class Panel {
 
     // 0..255。AMOLED 自己调亮度，没有背光引脚。
     esp_err_t SetBrightness(uint8_t level);
+
+    // **显示不是线程安全的**：两个任务同时"取缓冲 → 画 → 送"会抢 SPI 总线，
+    // 报 `acquire spi bus failed` / `ESP_ERR_INVALID_STATE`。
+    //
+    // 正常情况靠"屏幕所有权只有一个主人"来保证（PC 接管后本地图案就停），
+    // 但过渡的那一瞬仍然可能撞上。这个锁是那一下的保险。
+    //
+    // 用法：DrawLock() 返回的守卫活过整段 Acquire → 画 → Flush。
+    [[nodiscard]] osal::Mutex& DrawMutex() { return draw_mutex_; }
 
     // 阻塞直到有一块 band 缓冲空闲，然后返回它。
     // 大小是 kBandRows * kLcdHRes 像素。
@@ -103,6 +113,7 @@ class Panel {
     void* panel_ = nullptr;  // esp_lcd_panel_handle_t
     void* io_ = nullptr;     // esp_lcd_panel_io_handle_t
     void* buffers_free_ = nullptr;  // osal::CountingSemaphore*
+    osal::Mutex draw_mutex_;
     unsigned next_buffer_ = 0;
 };
 

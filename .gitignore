@@ -15,7 +15,10 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 
-# ---- Python 字节码 ----------------------------------------------------------
+# ---- Python 虚拟环境（PC 侧 bridge 的依赖，可由 requirements 重建）----------
+.venv/
+venv/
+
 __pycache__/
 *.pyc
 *.pyo

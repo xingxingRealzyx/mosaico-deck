@@ -83,6 +83,15 @@ volatile bool g_reboot_pending = false;
 // 重启进 ROM 下载模式之前的回调（main 里注册，用来先关掉屏幕省电）。
 PreRestartHook g_pre_restart_hook = nullptr;
 
+// 收到的字节先进这里，由调用方取出解析。
+//
+// **32KB** —— 必须放得下一条 band 的 payload（480×30×2 = 28800 字节）。
+// 一开始给的是 4KB，结果传一条 band 中途必然溢出，而当时"满了就 break"的写法
+// 会让回调停止消费 USB FIFO → FIFO 满 → CDC 端点 NAK → **PC 侧 write 永久阻塞**。
+// 表现就是"PC 一发 28KB，两边一起卡死"。
+osal::RingBuffer* g_rx = nullptr;
+volatile uint32_t g_rx_overflow = 0;
+
 // 是否已经见过 esptool 签名里的"武装"那一步。
 bool g_saw_esptool_arm = false;
 
@@ -150,6 +159,48 @@ void LineStateChangedCallback(int itf, cdcacm_event_t* event) {
     // 触发不了了。
 }
 
+
+// TinyUSB 的 RX 回调。**运行在 TinyUSB 任务上下文里，绝对不能阻塞。**
+//
+// 这里有三个坑，都是实测踩出来的（症状是：PC 一发 28KB 的 band，两边一起卡死）：
+//
+// 1. **环形缓冲满了绝对不能 `break` 掉 USB 读取。**
+//    一开始写的是"满了就 break"，结果回调停止消费 USB FIFO → FIFO 也满 →
+//    CDC 端点开始 NAK → **PC 侧的 write 永久阻塞**。表现就是"卡住了"。
+//    正确做法：满了就**丢弃并计数**，但继续把 FIFO 读空 —— USB 必须一直被消费。
+//
+// 2. **每次回调尽量把 FIFO 读空。**
+//    这里有个反直觉的地方：一开始我把上限设成"每次只倒 8 块"，想的是"别占着 CPU"。
+//    但那样**剩余的数据可能不会再触发回调**（TinyUSB 的 CDC_EVENT_RX 是"有新数据"
+//    时来的，FIFO 里已经有但没读走的部分不一定再报）—— 于是又变成卡死。
+//    实际上倒满 32KB 也只是 225 轮 memcpy，微秒级，根本不是 CPU 负担。
+//    上限设成 256 块（32KB）是为了万一对方发疯时有逃生口，正常情况一次就读空了。
+//
+// 3. **环形缓冲要放得下一条 band。** 一条 band 的 payload 是 480×30×2 = 28800 字节；
+//    缓冲比它小的话，回调必然在传一半时溢出。32KB 是够一个完整的 band 再加余量。
+constexpr size_t kRxChunkMax = 256;   // 单次从 FIFO 读多少
+constexpr int kRxDrainPerCallback = 256;  // 上限 256×128B = 32KB，正常一次读空
+
+void RxCallback(int itf, cdcacm_event_t* event) {
+    (void)itf;
+    (void)event;
+    if (g_rx == nullptr) {
+        return;
+    }
+
+    uint8_t buf[kRxChunkMax];
+    for (int i = 0; i < kRxDrainPerCallback; i++) {
+        size_t len = 0;
+        if (tinyusb_cdcacm_read(kCdcItf, buf, sizeof(buf), &len) != ESP_OK || len == 0) {
+            return;  // FIFO 空了，收工
+        }
+        if (!g_rx->Send(osal::InputBuffer(buf, len), 0)) {
+            // **丢弃，但继续读。** 见上面第 1 条 —— 这里 break 会让 PC 卡死。
+            g_rx_overflow = g_rx_overflow + 1;
+        }
+    }
+}
+
 int CdcVprintf(const char* fmt, va_list ap) {
     char buf[256];
     const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -192,7 +243,7 @@ esp_err_t Init() {
     // 2. CDC-ACM + 控制线回调（免按键烧录的核心）。
     const tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = kCdcItf,
-        .callback_rx = nullptr,
+        .callback_rx = RxCallback,
         .callback_rx_wanted_char = nullptr,
         .callback_line_state_changed = LineStateChangedCallback,
         .callback_line_coding_changed = nullptr,
@@ -200,6 +251,11 @@ esp_err_t Init() {
     const esp_err_t acm_err = tinyusb_cdcacm_init(&acm_cfg);
     if (acm_err != ESP_OK) {
         return acm_err;
+    }
+
+    // 2.5 接收环形缓冲 + RX 回调已经在上面注册。
+    if (g_rx == nullptr) {
+        g_rx = new osal::RingBuffer(32768);
     }
 
     // 3. 重启定时器。
@@ -262,6 +318,21 @@ void SetPreRestartHook(PreRestartHook hook) { g_pre_restart_hook = hook; }
 void AttachToLogger() {
     esp_log_set_vprintf(CdcVprintf);
 }
+
+osal::InputBuffer ReceiveRx(uint32_t timeout_ms) {
+    if (g_rx == nullptr) {
+        return {};
+    }
+    return g_rx->Receive(timeout_ms);
+}
+
+void ReturnRx(osal::InputBuffer buf) {
+    if (g_rx != nullptr && !buf.empty()) {
+        g_rx->ReturnItem(buf);
+    }
+}
+
+uint32_t RxOverflowCount() { return g_rx_overflow; }
 
 void RebootToBootloader() {
     g_reboot_to_bootloader = true;
