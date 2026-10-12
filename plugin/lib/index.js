@@ -282,6 +282,7 @@ export function apply(ctx) {
                 log: state.log,
                 stats: readStats(),
                 shift: driftShift(),
+                replies: state.asking ? [] : quickReplies(),
                 // Tap targets exist only while a question is pending. Drawing
                 // them otherwise is noise, and a stray tap is expensive.
                 buttons: state.asking ? null : undefined,
@@ -549,6 +550,42 @@ export function apply(ctx) {
         }
     }
 
+    /** Stop the running turn. **Not a message that says "stop"** -- that would queue an
+     *  instruction for the model to read after it has already finished, which is the
+     *  opposite of stopping it. `cancel` is the Session API's own interrupt. */
+    async function cancelTurn() {
+        const session = rootSession();
+        const controller = ctx.sessionController;
+        if (!session?.id || typeof controller?.cancel !== 'function') {
+            ctx.logger?.warn?.('mosaico-deck: no session controller, cannot cancel');
+            return false;
+        }
+        try {
+            controller.cancel({ sessionId: session.id });
+            pushLog({ kind: 'reply', text: 'cancelled' });
+            void paint({ force: true });
+            return true;
+        } catch (err) {
+            ctx.logger?.warn?.(`mosaico-deck: cancel failed: ${err?.message ?? err}`);
+            return false;
+        }
+    }
+
+    /** Which chips to show right now.
+     *
+     * **Contextual on purpose.** The user asked "when are these used?", and that question
+     * is the panel's job to answer: while a turn is running the only useful thing is to
+     * stop it, and while it is idle the useful things are "keep going" and "say more".
+     * A fixed row of three would just be three buttons that are wrong most of the time.
+     */
+    function quickReplies() {
+        if (state.asking) return [];
+        if (state.status !== 'idle' && state.status !== 'error') {
+            return [{ text: '停下', kind: 'cancel' }];
+        }
+        return [{ text: '继续', kind: 'prompt' }, { text: '详细说说', kind: 'prompt' }];
+    }
+
     /** Push to talk: the firmware streams the microphone up while the button is held. */
     let recording = null;
 
@@ -749,7 +786,8 @@ export function apply(ctx) {
                     && state.chips.find((h) => ev.x >= h.x - 6 && ev.x <= h.x + h.w + 6
                         && ev.y >= h.y - 6 && ev.y <= h.y + h.h + 6);
                 if (chip) {
-                    void sendPrompt(String(chip.value));
+                    if (chip.kind === 'cancel') void cancelTurn();
+                    else void sendPrompt(String(chip.value));
                     return;
                 }
                 touchStart = { x: ev.x, y: ev.y };

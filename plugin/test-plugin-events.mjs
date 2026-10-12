@@ -79,9 +79,9 @@ export function render(job) {
     const hits = job.page === 'panel'
         ? [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
            { x: 20, y: 300, w: 440, h: 54, value: 'brightness' }]
-        : [{ x: 28, y: 360, w: 132, h: 46, value: '继续', kind: 'reply' },
-           { x: 170, y: 360, w: 132, h: 46, value: '停下', kind: 'reply' },
-           { x: 312, y: 360, w: 132, h: 46, value: '详细说说', kind: 'reply' }];
+        : (job.replies || []).map((c, i, all) => ({
+            x: 28 + i * (140 + 10), y: 360, w: 140, h: 46,
+            value: c.text, kind: c.kind }));
     return Promise.resolve({ rgb: Buffer.alloc(PAGE_BYTES), hits });
 }
 `);
@@ -131,6 +131,10 @@ const ctx = {
     sessionController: {
         prompt: async (req) => {
             (globalThis.__prompts = globalThis.__prompts || []).push(req);
+            return { accepted: true };
+        },
+        cancel: (req) => {
+            (globalThis.__cancels = globalThis.__cancels || []).push(req);
             return { accepted: true };
         },
     },
@@ -459,7 +463,29 @@ check(job().levels?.volume >= 45 && job().levels?.volume <= 55,
 touch('down', 240, 430);          // 收尾：关掉
 await new Promise((r) => setTimeout(r, 60));
 
-console.log('快捷回复：点一下就送进对话（走用户输入同一条路）');
+console.log('快捷回复：内容随状态变化，点一下就生效');
+await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 20 });
+await new Promise((r) => setTimeout(r, 60));
+let chipsNow = (job().replies || []).map((c) => c.text);
+check(chipsNow.join('/') === '继续/详细说说',
+    `空闲时给的是"继续/详细说说"：${chipsNow.join('/')}`);
+await fire('session/event', ROOT_SESSION, { type: 'turn/start', turn: 21 });
+await fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => {});
+await new Promise((r) => setTimeout(r, 60));
+chipsNow = (job().replies || []).map((c) => `${c.text}:${c.kind}`);
+check(chipsNow.join('/') === '停下:cancel',
+    `干活时只给"停下"，而且是 cancel：${chipsNow.join('/')}`);
+globalThis.__cancels = [];
+globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 60, y: 380 });
+await new Promise((r) => setTimeout(r, 80));
+check((globalThis.__cancels || []).length === 1,
+    `点"停下"走的是会话中断而不是发消息：${JSON.stringify(globalThis.__cancels)}`);
+check((globalThis.__prompts || []).length === 0,
+    '"停下"不会作为一条消息发给模型（那等于让它做完再读到"停下"）');
+// 回到空闲，测"继续"
+await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 21 });
+await new Promise((r) => setTimeout(r, 60));
+globalThis.__prompts = [];
 globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 60, y: 380 });
 await new Promise((r) => setTimeout(r, 120));
 let prompts = globalThis.__prompts || [];

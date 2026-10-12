@@ -279,7 +279,9 @@ def pack_items(items, f, max_w):
     return ""
 
 
-QUICK_REPLIES = ("继续", "停下", "详细说说")
+# Fallback only: the plugin decides which chips make sense for the current state and
+# passes them in `job["replies"]`. See quickReplies() on the plugin side.
+QUICK_REPLIES = ({"text": "继续", "kind": "prompt"}, {"text": "详细说说", "kind": "prompt"})
 CHIP_H = 46
 S_CHIP = 22
 
@@ -292,18 +294,28 @@ def draw_quick_replies(img, d, job):
     The chips are deliberately few and short: this is a desk panel, and anything that
     needs thought belongs at the keyboard.
     """
+    chips = job.get("replies")
+    if chips is None:
+        chips = QUICK_REPLIES
+    chips = [c for c in chips if c and c.get("text")]
+    if not chips:
+        return []
     hits = []
     top = H - STATS_H - CHIP_H - 12
     gap = 10
-    width = (W - 56 - gap * (len(QUICK_REPLIES) - 1)) // len(QUICK_REPLIES)
-    for i, text in enumerate(QUICK_REPLIES):
+    width = (W - 56 - gap * (len(chips) - 1)) // len(chips)
+    for i, chip in enumerate(chips):
+        text = str(chip["text"])
+        # `cancel` is a real interrupt, so it is the one chip that gets the alarm colour:
+        # stopping something should not look like every other button.
+        danger = chip.get("kind") == "cancel"
         x = 28 + i * (width + gap)
         d.rounded_rectangle((x, top, x + width, top + CHIP_H), radius=CHIP_H // 2,
-                            fill=BG, outline=BORDER, width=2)
+                            fill=BG, outline=ERR if danger else BORDER, width=2)
         d.text((x + width // 2, top + CHIP_H // 2), text, font=font(S_CHIP),
-               fill=TEXT_SOFT, anchor="mm")
+               fill=ERR if danger else TEXT_SOFT, anchor="mm")
         hits.append({"x": x, "y": top, "w": width, "h": CHIP_H, "value": text,
-                     "kind": "reply"})
+                     "kind": chip.get("kind") or "prompt"})
     return hits
 
 
