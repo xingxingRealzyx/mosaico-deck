@@ -490,6 +490,20 @@ void CommitTask(void* arg) {
         if (g_panel == nullptr) {
             continue;
         }
+        // **Wait for the panel's TE edge *before* taking the draw mutex.**
+        //
+        // The receive task takes the same mutex for every message it handles, and it is
+        // the only thing draining USB. Waiting inside the lock -- up to 20 ms for TE plus
+        // ~12 ms on the bus -- starved it for ~30 ms per commit, and a full-screen update
+        // (16 bands, ~460 KB, which is what closing the panel is) arrives as a burst that
+        // does not fit in the receive ring over that window. The result was measured as
+        // `RX overflow55`: bands dropped, and because the PC diffs against what it has
+        // already sent, the screen kept showing the old picture while the plugin had
+        // already moved on. That is exactly "taps do nothing, and it only catches up when
+        // a new turn repaints".
+        //
+        // With the wait moved out here, the lock covers only the queue calls.
+        (void)g_panel->WaitForTeTick(20);
         osal::LockGuard<osal::Mutex> guard(g_panel->DrawMutex());
         g_panel->CommitFrame();
     }
