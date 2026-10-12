@@ -77,7 +77,9 @@ export function render(job) {
     const hits = job.page === 'panel'
         ? [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
            { x: 20, y: 300, w: 440, h: 54, value: 'brightness' }]
-        : [];
+        : [{ x: 28, y: 360, w: 132, h: 46, value: '继续', kind: 'reply' },
+           { x: 170, y: 360, w: 132, h: 46, value: '停下', kind: 'reply' },
+           { x: 312, y: 360, w: 132, h: 46, value: '详细说说', kind: 'reply' }];
     return Promise.resolve({ rgb: Buffer.alloc(PAGE_BYTES), hits });
 }
 `);
@@ -88,7 +90,7 @@ const registered = [];
 const effects = [];
 // The root conversation vs a subagent's session. Usage from the first must be counted
 // and from the second ignored, so the mock registry has to tell them apart.
-const ROOT_AGENT_OBJ = { id: 'root-agent', session: { who: 'root' } };
+const ROOT_AGENT_OBJ = { id: 'root-agent', session: { who: 'root', id: 'session-root' } };
 const ROOT_AGENT = ROOT_AGENT_OBJ;
 const SUBAGENT_AGENT = { id: 'sub-agent' };
 const ROOT_SESSION = ROOT_AGENT_OBJ.session;
@@ -123,6 +125,12 @@ const ctx = {
                                                    decodeMs: 1933235, decodeTokens: 398731 } },
         } : {}),
         viewCheckpoint: () => ({}),   // 只给有 wire 的单元：这里什么都不给（真实行为）
+    },
+    sessionController: {
+        prompt: async (req) => {
+            (globalThis.__prompts = globalThis.__prompts || []).push(req);
+            return { accepted: true };
+        },
     },
     on: (ev, fn) => {
         if (!listeners.has(ev)) listeners.set(ev, []);
@@ -448,6 +456,38 @@ check(job().levels?.volume >= 45 && job().levels?.volume <= 55,
     `而且音量确实改了：${job().levels?.volume}%`);
 touch('down', 240, 430);          // 收尾：关掉
 await new Promise((r) => setTimeout(r, 60));
+
+console.log('快捷回复：点一下就送进对话（走用户输入同一条路）');
+globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 60, y: 380 });
+await new Promise((r) => setTimeout(r, 120));
+let prompts = globalThis.__prompts || [];
+check(prompts.length === 1 && prompts[0].content?.[0]?.text === '继续',
+    `点"继续"会发出一条用户消息：${JSON.stringify(prompts[0]?.content)}`);
+check(prompts[0]?.sessionId === ROOT_SESSION.id,
+    '发到的是根会话');
+check(prompts[0]?.mode === 'queue' && typeof prompts[0]?.requestId === 'string',
+    '用的是 prompt 契约里的 mode/requestId');
+
+console.log('按键说话：录音 -> 转写 -> 送进对话');
+globalThis.__prompts = [];
+check(registered.length >= 8, '工具数量未受影响');
+// 按下：固件报 rec=true
+globalThis.__deck.emit('ack', { t: 'ack', rec: true });
+await new Promise((r) => setTimeout(r, 60));
+check(job().state === 'listening', `录音时状态是 listening：${job().state}`);
+// 音频块
+globalThis.__deck.emit('audio', Buffer.alloc(96000));   // 0.5 秒 48k 立体声
+// 松手：固件报 key voice_end；转写在这里必然失败（测试里没有 whisper），
+// 但"失败也要给出可见反馈"才是要断言的
+globalThis.__deck.emit('key', { t: 'key', ev: 'voice_end' });
+await new Promise((r) => setTimeout(r, 400));
+check(['识别失败', '没听清', '识别中…'].includes(job().detail) || job().state === 'listening',
+    `识别失败时有可见反馈，而不是静默：${JSON.stringify(job().detail)}`);
+// 太短的按压不该触发识别
+globalThis.__deck.emit('ack', { t: 'ack', rec: true });
+globalThis.__deck.emit('key', { t: 'key', ev: 'voice_end' });
+await new Promise((r) => setTimeout(r, 120));
+check(job().state === 'idle', '过短的按压（<50ms）直接回到空闲，不做无用的识别');
 
 console.log('deck_control / deck_panel');
 check(registered.some((t) => t.name === 'deck_control'), 'deck_control 已注册');

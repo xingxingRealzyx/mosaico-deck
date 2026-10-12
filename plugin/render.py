@@ -65,12 +65,12 @@ ERR = (255, 120, 145)
 IDLE = (176, 186, 206)
 
 STATE_COLORS = {
-    "idle": IDLE, "thinking": ACCENT, "running": ACCENT, "editing": ACCENT,
+    "listening": OK, "idle": IDLE, "thinking": ACCENT, "running": ACCENT, "editing": ACCENT,
     "testing": WARN, "waiting": WARN, "done": OK, "error": ERR, "failed": ERR,
     "tool": ACCENT,
 }
 STATE_LABELS = {
-    "idle": "空闲", "thinking": "思考中", "running": "执行中", "editing": "改代码",
+    "listening": "听你说", "idle": "空闲", "thinking": "思考中", "running": "执行中", "editing": "改代码",
     "testing": "跑测试", "waiting": "等你决定", "done": "完成", "error": "出错",
     "failed": "失败", "tool": "调用工具",
 }
@@ -279,6 +279,34 @@ def pack_items(items, f, max_w):
     return ""
 
 
+QUICK_REPLIES = ("继续", "停下", "详细说说")
+CHIP_H = 46
+S_CHIP = 22
+
+
+def draw_quick_replies(img, d, job):
+    """A row of one-tap replies, just above the stats strip.
+
+    These go through the same prompt path the user's own messages take, so they are real
+    input rather than a special channel -- "继续" is exactly what you would have typed.
+    The chips are deliberately few and short: this is a desk panel, and anything that
+    needs thought belongs at the keyboard.
+    """
+    hits = []
+    top = H - STATS_H - CHIP_H - 12
+    gap = 10
+    width = (W - 56 - gap * (len(QUICK_REPLIES) - 1)) // len(QUICK_REPLIES)
+    for i, text in enumerate(QUICK_REPLIES):
+        x = 28 + i * (width + gap)
+        d.rounded_rectangle((x, top, x + width, top + CHIP_H), radius=CHIP_H // 2,
+                            fill=BG, outline=BORDER, width=2)
+        d.text((x + width // 2, top + CHIP_H // 2), text, font=font(S_CHIP),
+               fill=TEXT_SOFT, anchor="mm")
+        hits.append({"x": x, "y": top, "w": width, "h": CHIP_H, "value": text,
+                     "kind": "reply"})
+    return hits
+
+
 def draw_stats(img, d, job):
     """Context ring plus one packed line of session numbers. Returns the height used.
 
@@ -459,7 +487,9 @@ def draw_status(d, img, job):
     f_log = font(S_LOG)
     step = S_LOG + 14
     buttons = job.get("buttons") or []
-    floor = (H - 100 - 14) if buttons else (H - 22 - stats_h)
+    # The chips row owns the strip just above the stats; without this the log would be
+    # drawn underneath it.
+    floor = (H - 100 - 14) if buttons else (H - 22 - stats_h - CHIP_H - 12)
 
     if log:
         sy = y + 6
@@ -509,9 +539,13 @@ def render_status(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     draw_status(d, img, job)
-    # A picture owns the lower half; tap targets belong to questions, not pictures.
-    hits = [] if job.get("image") else draw_buttons(d, job)
-    return img, hits
+    # A picture owns the lower half, and a question owns the bottom strip: the quick
+    # replies only get the space when neither is up.
+    if job.get("image"):
+        return img, []
+    if job.get("buttons"):
+        return img, draw_buttons(d, job)
+    return img, draw_quick_replies(img, d, job)
 
 
 def render_image(job):

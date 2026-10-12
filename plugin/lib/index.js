@@ -53,7 +53,7 @@ import { textToPcm } from './tts.js';
 export const name = 'mosaico-deck';
 // `agents` tells the root conversation from the subagent sessions on the same bus;
 // `sessionProjections` is the host's own fold of the session numbers the strip shows.
-export const inject = ['tools', 'agents', 'sessionProjections'];
+export const inject = ['tools', 'agents', 'sessionProjections', 'sessionController'];
 
 /** Short hash of this very file, reported at load and by deck_connect.
  *
@@ -146,6 +146,8 @@ export function apply(ctx) {
         // does not report them back, so they start at the values the firmware boots with
         // (kDefaultVolume and 90/255 brightness).
         lastReply: '',      // opening of the last reply, spoken when the turn ends
+        lastSent: '',       // last text sent from the device (chip press or voice)
+        chips: [],          // quick-reply hit regions from the last status frame
         panel: false,
         levels: { volume: 85, brightness: 35 },
         voiceName: process.env.DECK_VOICE_NAME || undefined,   // macOS voice, e.g. Tingting
@@ -247,6 +249,8 @@ export function apply(ctx) {
             // finger always lands on the geometry that is actually on screen.
             if (state.panel) {
                 panelHits = hits;
+            } else if (!state.asking) {
+                state.chips = hits;
             }
             return deck.sendRgb(rgb, { force });
         } catch (err) {
@@ -456,6 +460,98 @@ export function apply(ctx) {
         return Number.isFinite(v) ? v : 0;
     }
 
+    /** Send one user message into the conversation.
+     *
+     * This is the same path the user's own typing takes (`ctx.sessionController.prompt`,
+     * the Host Session API behind the GUI), so a chip press and a voice sentence are
+     * **real input**, not a side channel with its own semantics.
+     */
+    async function sendPrompt(text) {
+        const session = rootSession();
+        const controller = ctx.sessionController;
+        if (!session?.id || typeof controller?.prompt !== 'function') {
+            ctx.logger?.warn?.('mosaico-deck: no session controller, prompt dropped');
+            pushLog({ kind: 'error', text: 'cannot send' });
+            void paint({ force: true });
+            return false;
+        }
+        try {
+            await controller.prompt({
+                requestId: `deck-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                sessionId: session.id,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+                clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            }, new AbortController().signal);
+            state.lastSent = text;
+            pushLog({ kind: 'reply', text: `sent ${text.slice(0, 16)}` });
+            void paint({ force: true });
+            return true;
+        } catch (err) {
+            ctx.logger?.warn?.(`mosaico-deck: prompt failed: ${err?.message ?? err}`);
+            pushLog({ kind: 'error', text: 'send failed' });
+            void paint({ force: true });
+            return false;
+        }
+    }
+
+    /** Push to talk: the firmware streams the microphone up while the button is held. */
+    let recording = null;
+
+    /** Hold-to-talk ended: transcribe what was said and send it as this turn's input. */
+    async function finishRecording() {
+        const pcm = recording;
+        recording = null;
+        if (!pcm || pcm.length < 4800) {          // < 50 ms: a stray press, not speech
+            state.status = 'idle';
+            void paint({ force: true });
+            return;
+        }
+        state.status = 'thinking';
+        state.detail = '识别中…';
+        void paint({ force: true });
+        try {
+            const text = await transcribe(pcm);
+            if (text) {
+                await sendPrompt(text);
+            } else {
+                state.detail = '没听清';
+                void paint({ force: true });
+            }
+        } catch (err) {
+            ctx.logger?.warn?.(`mosaico-deck: transcription failed: ${err?.message ?? err}`);
+            state.detail = '识别失败';
+            void paint({ force: true });
+        }
+    }
+
+    /** 48 kHz stereo from the board -> text, via ffmpeg and whisper.cpp. */
+    async function transcribe(pcm) {
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const run = promisify(execFile);
+        const fs = await import('node:fs');
+        const os = await import('node:os');
+        const nodePath = await import('node:path');
+        const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'deck-stt-'));
+        try {
+            const raw = nodePath.join(dir, 'in.raw');
+            const wav = nodePath.join(dir, 'in.wav');
+            fs.writeFileSync(raw, pcm);
+            // whisper.cpp wants 16 kHz mono; the board sends 48 kHz stereo.
+            await run('ffmpeg', ['-y', '-loglevel', 'error', '-f', 's16le', '-ar', '48000',
+                '-ac', '2', '-i', raw, '-ar', '16000', '-ac', '1', wav], { timeout: 30000 });
+            const bin = process.env.DECK_WHISPER || 'whisper-cli';
+            const model = process.env.DECK_WHISPER_MODEL
+                || nodePath.join(os.homedir(), '.cache', 'whisper', 'ggml-small.bin');
+            const { stdout } = await run(bin, ['-m', model, '-l', 'zh', '-nt', '-f', wav],
+                { timeout: 120000, maxBuffer: 8 << 20 });
+            return String(stdout).replace(/\s+/g, ' ').trim();
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    }
+
     // ---- burn-in --------------------------------------------------------------
     //
     // This is an always-on AMOLED and the layout barely moves: the header and the stats
@@ -586,6 +682,14 @@ export function apply(ctx) {
         if (ev.t === 'touch') {
             markActivity();
             if (ev.ev === 'down') {
+                // Quick replies first: they are the one control on the status page.
+                const chip = !state.panel && !state.asking
+                    && state.chips.find((h) => ev.x >= h.x - 6 && ev.x <= h.x + h.w + 6
+                        && ev.y >= h.y - 6 && ev.y <= h.y + h.h + 6);
+                if (chip) {
+                    void sendPrompt(String(chip.value));
+                    return;
+                }
                 touchStart = { x: ev.x, y: ev.y };
                 lastTouch = { x: ev.x, y: ev.y };
                 if (state.panel) {
@@ -646,8 +750,14 @@ export function apply(ctx) {
         }
     });
 
-    deck.on('key', () => {
-        // The physical key cancels a pending question. Easier to find by touch
+    deck.on('key', (ev) => {
+        // Hold-to-talk release: the firmware says so, and the audio has already arrived.
+        if (ev?.ev === 'voice_end') {
+            markActivity();
+            void finishRecording();
+            return;
+        }
+        // Otherwise the physical key cancels a pending question. Easier to find by touch
         // than an on-screen cancel.
         if (!state.asking) return;
         const pending = state.asking;
@@ -657,7 +767,23 @@ export function apply(ctx) {
     });
 
     deck.on('audio', (pcm) => {
+        if (recording) {
+            recording = Buffer.concat([recording, pcm]);
+        }
         state.audio = Buffer.concat([state.audio, pcm]);
+    });
+
+    // Recording start/stop, as the firmware reports it.
+    deck.on('ack', (ev) => {
+        if (ev?.rec === undefined) return;
+        markActivity();
+        if (ev.rec) {
+            recording = Buffer.alloc(0);
+            state.status = 'listening';
+            state.tool = null;
+            state.detail = '松手结束';
+        }
+        void paint({ force: true });
     });
 
     // -----------------------------------------------------------------------
