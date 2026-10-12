@@ -608,6 +608,8 @@ await fire('tools/pre-execute', {
 }, () => {});
 await new Promise((r) => setTimeout(r, 80));
 check(job().page === 'ask', `提问会切到设备上的问题页：page=${job().page}`);
+check((job().footer || '').includes('本轮结束后生效'),
+    `页面写清了点选的语义（否则点了像没反应）：${job().footer}`);
 check((job().question || '').includes('要用哪种方案'), `问题内容在设备上：${job().question}`);
 check(JSON.stringify(job().options) === JSON.stringify(['方案甲', '方案乙']),
     `选项也在：${JSON.stringify(job().options)}`);
@@ -616,8 +618,10 @@ globalThis.__prompts = [];
 globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 240, y: 300 });
 await new Promise((r) => setTimeout(r, 120));
 const answered = globalThis.__prompts || [];
-check(answered.length === 1 && answered[0].content?.[0]?.text === '方案甲',
-    `点选项会作答：${JSON.stringify(answered[0]?.content)}`);
+check(answered.length === 1
+      && answered[0].content?.[0]?.text === '（设备上选择）方案甲',
+    `点选项发出的消息带来源标记（否则看起来像用户手打的）：`
+    + `${JSON.stringify(answered[0]?.content)}`);
 check(job().page !== 'ask', '答完问题页就撤掉');
 // 子代理的提问不该打断主会话
 await fire('agent/status', { status: 'running' });

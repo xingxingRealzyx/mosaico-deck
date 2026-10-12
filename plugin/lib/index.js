@@ -279,6 +279,11 @@ export function apply(ctx) {
                 page: state.question ? 'ask' : (state.panel ? 'panel' : 'status'),
                 question: state.question?.question,
                 options: state.question?.options,
+                // The two kinds of question look identical but behave differently; the
+                // footer is the only place that can say which one this is.
+                footer: state.question
+                    ? '点选会作为消息发出 · 本轮结束后生效'
+                    : undefined,
                 levels: state.panel ? state.levels : undefined,
                 voice: voiceOn,
                 image: state.panel ? null : state.image,
@@ -621,6 +626,11 @@ export function apply(ctx) {
         if (!q?.question) return;
         const options = (q.options ?? []).map((o) => String(o?.label ?? o));
         if (options.length === 0) return;
+        // Answering here cannot resolve the agent's pending question -- that request is
+        // answered through a channel this plugin has no handle on -- so the choice goes
+        // out as a message instead. It does arrive; it arrives after the current turn.
+        // The footer says so, because a tap that appears to do nothing is worse than one
+        // that explains itself.
         state.question = { question: String(q.question), options, multi: Boolean(q.multi_select) };
         state.status = 'waiting';
         state.tool = null;
@@ -849,8 +859,11 @@ export function apply(ctx) {
                         && ev.x <= h.x + h.w + 10 && ev.y >= h.y - 10
                         && ev.y <= h.y + h.h + 10);
                     if (opt) {
-                        const chosen = String(opt.value);
+                        // **Marked, because it arrives as an ordinary message** and would
+                        // otherwise look like something the user typed at the keyboard.
+                        const chosen = `（设备上选择）${String(opt.value)}`;
                         clearQuestion();
+                        pushLog({ kind: 'reply', text: 'answered on device' });
                         void sendPrompt(chosen);
                         void paint({ force: true });
                     }

@@ -664,6 +664,11 @@ def render_panel(job):
 
 
 def render_ask(job):
+    """A question, either from deck_ask (blocking: the tap *is* the answer) or mirrored
+    from the agent's own question tool (the tap becomes a message, which arrives after the
+    current turn). The footer says which one this is, because the two look identical and
+    behave differently.
+    """
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, 4), fill=WARN)
