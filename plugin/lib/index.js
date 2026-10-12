@@ -281,7 +281,7 @@ export function apply(ctx) {
                 state.log = [];
             }
             state.status = 'thinking';
-            state.detail = 'Working';
+            state.detail = '';   // not 'Working' -- the label already says 思考中
             state.target = '';
             state.tool = null;
         } else {
@@ -317,9 +317,13 @@ export function apply(ctx) {
     // waterfall with three parameters: (exec, result, next)
     ctx.on('tools/post-execute', (exec, result, next) => {
         try {
+            // **No "Tool finished".** It is the same string after every call, so it
+            // tells the user nothing -- the state label already reads 思考中 and the
+            // log line already names the tool that ran. Rule for this panel: the
+            // detail line must not restate the state label.
             state.status = 'thinking';
             state.tool = null;
-            state.detail = 'Tool finished';
+            state.detail = '';
         } catch {
             /* ignore */
         }
@@ -361,13 +365,35 @@ export function apply(ctx) {
         void paint();
     });
 
-    ctx.on('agent/error', () => {
+    ctx.on('agent/error', (payload) => {
         state.status = 'error';
         state.tool = null;
-        state.detail = 'Error';
+        // Not the constant 'Error' (the label already reads 出错): put the **actual
+        // failure** on the panel. That is the one thing here the user cannot get
+        // without switching windows, which is the whole point of the device.
+        state.detail = errorText(payload?.error);
         pushLog({ kind: 'error', text: 'error' });
         void paint({ force: true });
     });
+
+    /** One readable line for a failure, whatever shape the payload arrived in.
+     *
+     * `agent/error` carries `error: unknown` -- an Error, a plain object, a string, or
+     * anything the provider threw. Never let summarising it throw: a broken formatter
+     * inside an error handler would be a nasty little trap.
+     */
+    function errorText(err) {
+        if (err === undefined || err === null) return '';
+        let text = '';
+        try {
+            if (err instanceof Error) text = err.message;
+            else if (typeof err === 'object') text = err.message ?? JSON.stringify(err);
+            else text = String(err);
+        } catch {
+            text = 'unprintable error';
+        }
+        return text.replace(/\s+/g, ' ').slice(0, 40);
+    }
 
     function connect() {
         if (deck.connected) return true;

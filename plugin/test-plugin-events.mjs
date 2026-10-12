@@ -148,14 +148,37 @@ check(job().page === 'status', '空载荷不崩、退回状态页');
 await fire('tools/pre-execute', null, () => {});
 check(job().page === 'status', 'null 载荷不崩');
 
+console.log('detail 不允许只是状态词的同义重复');
+await pre('bash', { command: 'ls -la' });
+check(job().detail === 'Calling bash', '工具进行中 detail 是会变的工具名（有用）');
+await fire('tools/post-execute', { name: 'bash', arguments: {} }, {}, () => {});
+check(job().state === 'thinking' && !job().detail,
+    `工具结束后不写死 "Tool finished"（现在 detail=${JSON.stringify(job().detail)}）`);
+
 console.log('状态事件');
 await fire('agent/status', { status: 'running' });
-check(job().state === 'thinking', 'agent/status running -> thinking');
+check(job().state === 'thinking' && !job().detail,
+    `agent/status running -> 思考中，且不写死 "Working"（detail=${JSON.stringify(job().detail)}）`);
 await fire('agent/status', { status: 'idle' });
 check(job().state === 'idle', 'agent/status idle -> idle');
-await fire('agent/error', {});
+
+console.log('出错时把真实错误写到面板上（而不是写死的 "Error"）');
+await fire('agent/error', { error: new Error('connect ECONNREFUSED 127.0.0.1:19387') });
 check(job().state === 'error' && job().log?.at(-1)?.kind === 'error',
     'agent/error -> error 状态 + 结构化错误日志');
+check(job().detail.includes('ECONNREFUSED'), `detail 带真实信息：${job().detail}`);
+await fire('agent/error', { error: { message: '普通对象形式的失败' } });
+check(job().detail === '普通对象形式的失败', '对象形式的错误也能读出 message');
+await fire('agent/error', { error: '纯字符串失败' });
+check(job().detail === '纯字符串失败', '字符串形式的错误原样用');
+await fire('agent/error', {});
+check(job().detail === '', '没有错误信息时 detail 为空，而不是写死 "Error"');
+const circular = {};
+circular.self = circular;
+await fire('agent/error', { error: circular });
+check(typeof job().detail === 'string', '循环引用的错误对象不会让处理函数抛异常');
+await fire('agent/error', { error: new Error('x'.repeat(200)) });
+check(job().detail.length <= 40, `超长错误信息被截断到 ${job().detail.length} 字`);
 
 for (const dispose of effects) {
     if (typeof dispose === 'function') dispose();
