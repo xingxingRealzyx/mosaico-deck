@@ -190,19 +190,19 @@ check(last_line_bottom <= r.H - 6,
 # 现在改成按优先级装箱，并在这里做一组极端取值的属性断言。
 fstats = r.font(r.S_STATS)
 for label, st, expect in (
-    ("典型", {"context": 48213, "contextWindow": 128000, "input": 210000,
-              "output": 48000, "cacheRead": 160000, "turn": 7, "steps": 23},
+    ("典型", {"context": 625830, "contextWindow": 1000000, "input": 574196,
+              "output": 398731, "cacheHit": 100, "turn": 16, "steps": 389},
      "缓存"),
     ("极端大", {"context": 999999, "contextWindow": 1000000, "input": 99999999,
-                "output": 99999999, "cacheRead": 99999999, "turn": 999, "steps": 9999},
+                "output": 99999999, "cacheHit": 99, "turn": 999, "steps": 9999},
      "累计"),
     ("只有累计", {"context": 1000, "input": 123456, "output": 789}, "累计"),
 ):
     items = []
     if st.get("input"):
         items.append(f"累计 {r.kfmt(st['input'])}/{r.kfmt(st['output'])}")
-    if st.get("input") and st.get("cacheRead"):
-        items.append(f"缓存{round(100 * st['cacheRead'] / st['input'])}%")
+    if st.get("cacheHit"):
+        items.append(f"缓存{st['cacheHit']}%")
     turns = "".join(x for x in (
         f"{st['turn']}轮" if st.get("turn") else "",
         f"{st['steps']}步" if st.get("steps") else "",

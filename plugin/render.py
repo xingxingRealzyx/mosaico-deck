@@ -267,8 +267,11 @@ def draw_stats(d, job):
     items = []
     if s.get("input"):
         items.append(f"累计 {kfmt(s['input'])}/{kfmt(s['output'])}")
-    if s.get("input") and s.get("cacheRead"):
-        items.append(f"缓存{round(100 * s['cacheRead'] / s['input'])}%")
+    if s.get("cacheHit"):
+        # Straight from the host's totals. Do **not** recompute it as cacheRead/input:
+        # with real caching that divides a huge cached count by the uncached remainder
+        # and prints nonsense like "24700%".
+        items.append(f"缓存{s['cacheHit']}%")
     # Turn and step as one item: they answer one question ("how far along is this"), and
     # keeping them together is what leaves room for the cache figure too. No spaces
     # between number and unit -- that is ~20px, which is the difference between fitting

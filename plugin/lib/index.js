@@ -50,9 +50,9 @@ import { Deck, findPort } from './device.js';
 import { render, checkEnvironment } from './render.js';
 
 export const name = 'mosaico-deck';
-// `agents` is used only to tell the root conversation from the subagent sessions that
-// emit on the same bus: without that check a subagent's tokens land in the user's totals.
-export const inject = ['tools', 'agents'];
+// `agents` tells the root conversation from the subagent sessions on the same bus;
+// `sessionProjections` is the host's own fold of the session numbers the strip shows.
+export const inject = ['tools', 'agents', 'sessionProjections'];
 
 /** Short hash of this very file, reported at load and by deck_connect.
  *
@@ -126,15 +126,15 @@ export function apply(ctx) {
         elapsed: 0,
         startedAt: 0,
         log: [],
-        // Numbers for the bottom strip. All of it arrives on host events -- the window
-        // from `request/context`, the counts from `assistant/message`'s usage -- so
-        // nothing here is estimated.
+        // Last numbers read from the host's session projections (see readStats), plus
+        // the root session they belong to.
+        rootSession: null,
         stats: {
-            context: 0,       // tokens the latest request+reply actually occupied
-            contextWindow: 0, // adapter-declared capacity, when advertised
+            context: 0,       // pressure the compaction threshold is measured against
+            contextWindow: 0,
             input: 0,
             output: 0,
-            cacheRead: 0,
+            cacheHit: 0,
             turn: 0,
             steps: 0,
         },
@@ -203,7 +203,7 @@ export function apply(ctx) {
                 progress: state.progress,
                 elapsed: state.elapsed,
                 log: state.log,
-                stats: state.stats,
+                stats: readStats(),
                 // Tap targets exist only while a question is pending. Drawing
                 // them otherwise is noise, and a stray tap is expensive.
                 buttons: state.asking ? null : undefined,
@@ -235,23 +235,61 @@ export function apply(ctx) {
         }
     }
 
-    /** Fold one `assistant/message`'s usage into the session totals. */
-    function accumulateUsage(event) {
-        const u = event?.usage;
-        if (u && typeof u === 'object') {
-            const inTok = numOr0(u.inputTokens);
-            const outTok = numOr0(u.outputTokens);
-            state.stats.input += inTok;
-            state.stats.output += outTok;
-            state.stats.cacheRead += numOr0(u.cacheReadTokens);
-            // Latest request pressure = what the provider just charged for this
-            // prompt and its reply. That is the honest "how full is the context".
-            const total = numOr0(u.totalTokens) || (inTok + outTok);
-            if (total > 0) state.stats.context = total;
+    /** The user's own conversation, or null before one is known. */
+    function rootSession() {
+        try {
+            const roots = ctx.agents?.roots?.();
+            const withSession = Array.isArray(roots)
+                ? roots.find((a) => a?.session) : undefined;
+            if (withSession) return withSession.session;
+        } catch {
+            /* registry not reachable: fall back to whatever we saw on the bus */
         }
-        if (Number.isInteger(event?.turn)) state.stats.turn = event.turn;
-        if (Number.isInteger(event?.step)) state.stats.step = event.step;
-        state.stats.steps += 1;
+        return state.rootSession;
+    }
+
+    /** Read the host's own session numbers.
+     *
+     * **Do not recompute these.** `dsh-token-meter` and `dsh-session-stats` already
+     * fold them into session projections, driven incrementally as the log grows, so
+     * reading is both cheaper and more correct than replaying `assistant/message`
+     * usage here -- which is what this used to do, and why the strip stayed empty.
+     *
+     *   contextPressure  { pressureTokens, contextWindow, surfaceTokens }
+     *   tokenUsage       { totals: { uncachedInputTokens, outputTokens,
+     *                               cacheReadTokens, cacheWriteTokens } }
+     *   sessionStats     { turns, steps, llmMs, toolMs, ttftMs, decodeMs }
+     */
+    function readStats() {
+        const session = rootSession();
+        const snapshot = session && ctx.sessionProjections?.snapshot;
+        if (!snapshot) return state.stats;
+        try {
+            const { values } = ctx.sessionProjections.snapshot(session,
+                ['contextPressure', 'tokenUsage', 'sessionStats']);
+            const pressure = values?.contextPressure ?? {};
+            const totals = values?.tokenUsage?.totals ?? {};
+            const stats = values?.sessionStats ?? {};
+            const uncached = numOr0(totals.uncachedInputTokens);
+            const cacheRead = numOr0(totals.cacheReadTokens);
+            const read = uncached + cacheRead;
+            return {
+                // "How full is the context" is the pressure the compaction threshold is
+                // measured against -- not the raw surface size.
+                context: numOr0(pressure.pressureTokens),
+                contextWindow: numOr0(pressure.contextWindow),
+                input: uncached,
+                output: numOr0(totals.outputTokens),
+                // Share of the prompt that came from cache. Computed here, against
+                // uncached+cached: dividing by the uncached half alone yields absurd
+                // percentages once caching works (this session reads 99.6%).
+                cacheHit: read > 0 ? Math.round(100 * cacheRead / read) : 0,
+                turn: numOr0(stats.turns),
+                steps: numOr0(stats.steps),
+            };
+        } catch {
+            return state.stats;   // a projection that is missing is not an error
+        }
     }
 
     function numOr0(v) {
@@ -391,30 +429,19 @@ export function apply(ctx) {
     //
     //     session/event(session, event)                                        emit
     //     event = { type: 'assistant/message', turn, step, message, stream, usage? }
-    //     event = { type: 'request/context', provider, model, contextWindow? }
     //
     // Subscribing to the bare name was dead code: it never fired, so the assistant
     // text and the "replied" log line never appeared on the device. It went unnoticed
     // because the load self-test fires handlers by name; selftest.mjs now also asserts
     // that every subscribed name is part of the host's real event surface.
+    //
+    // The session numbers are **not** accumulated here. They used to be, from this
+    // event's `usage` field -- and the panel stayed empty, because that field does not
+    // reach a listener in practice. The host already computes all of it as session
+    // projections (see readStats); reading its numbers is both correct and cheaper.
     ctx.on('session/event', (session, event) => {
-        if (!event?.type) return;
-
-        // The adapter's declared capacity for this route, logged whenever the route or
-        // its capacity changes -- which is where the percentage on the strip comes
-        // from. No model lookup, no guessing.
-        if (event.type === 'request/context') {
-            if (isRootSession(session)
-                && Number.isInteger(event.contextWindow) && event.contextWindow > 0
-                && event.contextWindow !== state.stats.contextWindow) {
-                state.stats.contextWindow = event.contextWindow;
-                void paint();
-            }
-            return;
-        }
-
-        if (event.type !== 'assistant/message') return;
-        if (isRootSession(session)) accumulateUsage(event);
+        if (event?.type !== 'assistant/message') return;
+        if (isRootSession(session)) state.rootSession = session;
         try {
             const content = event.message?.content;
             const text = Array.isArray(content)

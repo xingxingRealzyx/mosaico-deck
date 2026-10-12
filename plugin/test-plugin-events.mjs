@@ -73,6 +73,22 @@ const SUBAGENT_SESSION = { who: 'subagent' };
 const ctx = {
     tools: { register: (t) => registered.push(t) },
     agents: { roots: () => [{ session: ROOT_SESSION }] },
+    // The host folds the session numbers itself; the plugin only reads them. Real
+    // projection names, with values shaped like the real ones.
+    sessionProjections: {
+        snapshot: (session) => ({
+            asOfSeq: 1,
+            values: session === ROOT_SESSION ? {
+                contextPressure: { pressureTokens: 625830, contextWindow: 1000000,
+                                   surfaceTokens: 481943 },
+                tokenUsage: { totals: { uncachedInputTokens: 574196,
+                                        outputTokens: 398731,
+                                        cacheReadTokens: 141789056,
+                                        cacheWriteTokens: 0 } },
+                sessionStats: { turns: 16, steps: 389, llmMs: 2693785, toolMs: 4616652 },
+            } : {},
+        }),
+    },
     on: (ev, fn) => {
         if (!listeners.has(ev)) listeners.set(ev, []);
         listeners.get(ev).push(fn);
@@ -185,49 +201,40 @@ check(typeof job().detail === 'string', '循环引用的错误对象不会让处
 await fire('agent/error', { error: new Error('x'.repeat(200)) });
 check(job().detail.length <= 40, `超长错误信息被截断到 ${job().detail.length} 字`);
 
-console.log('会话数字（上下文 / token 用量 / 轮次）');
-// 前面的读图/回复已经产生过 assistant/message，所以步数用相对基准断言，
-// 免得把"测试自己早先制造的步数"算进来。
-const baseSteps = job().stats?.steps ?? 0;
-await fire('session/event', ROOT_SESSION,
-    { type: 'request/context', provider: 'deepseek', model: 'x', contextWindow: 128000 });
-check(job().stats?.contextWindow === 128000,
-    `窗口来自 request/context 事件：${job().stats?.contextWindow}`);
-
-await fire('session/event', ROOT_SESSION, {
-    type: 'assistant/message', turn: 3, step: 2,
-    usage: { inputTokens: 40000, outputTokens: 1200, cacheReadTokens: 32000 },
-});
+console.log('会话数字：直接读宿主的投影，不自己累加');
+// 真实值取自本机的投影缓存，形状与宿主一致。
+await pre('bash', { command: 'ls' });        // 任意一次 paint 都会带上 stats
 let st = job().stats;
-check(st?.context === 41200, `上下文用量 = 最近一次请求+回复：${st?.context}`);
-check(st?.input === 40000 && st?.output === 1200, `累计 in/out：${st?.input}/${st?.output}`);
-check(st?.cacheRead === 32000, `缓存读取累计：${st?.cacheRead}`);
-check(st?.turn === 3 && st?.steps === baseSteps + 1,
-    `轮次与步数：第 ${st?.turn} 轮 / 共 ${st?.steps} 步`);
+check(st?.context === 625830, `上下文压力来自 contextPressure.pressureTokens：${st?.context}`);
+check(st?.contextWindow === 1000000, `窗口来自 contextPressure.contextWindow：${st?.contextWindow}`);
+check(st?.input === 574196 && st?.output === 398731,
+    `累计 token 来自 tokenUsage.totals：${st?.input}/${st?.output}`);
+check(st?.cacheHit === 100,
+    `缓存命中率 = cacheRead/(uncached+cacheRead)：${st?.cacheHit}%`
+    + `（真实值 141789056/(574196+141789056) 也是 100%）`);
+check(st?.turn === 16 && st?.steps === 389, `轮次/步数来自 sessionStats：${st?.turn}轮 ${st?.steps}步`);
 
-await fire('session/event', ROOT_SESSION, {
-    type: 'assistant/message', turn: 3, step: 3,
-    usage: { inputTokens: 45000, outputTokens: 800 },
-});
-st = job().stats;
-check(st?.input === 85000 && st?.steps === baseSteps + 2,
-    `多次调用会累加：in=${st?.input} steps=${st?.steps}`);
-check(st?.context === 45800, `上下文跟随最新一次：${st?.context}`);
+// 这条是**回归测试**：以前是自己从 assistant/message.usage 累加，而那个字段到不了
+// 监听器，于是底部一直空着。现在数字只有一个口径——投影。
+await fire('session/event', ROOT_SESSION,
+    { type: 'assistant/message', turn: 99, step: 9, usage: { inputTokens: 5, outputTokens: 5 } });
+await pre('bash', { command: 'echo x' });
+check(job().stats?.turn === 16 && job().stats?.input === 574196,
+    'assistant/message 的字段不再影响数字（口径只有投影一个）');
+check(job().stats?.steps === 389, '自己累加的步数已彻底移除，不再和宿主打架');
 
-await fire('session/event', SUBAGENT_SESSION, {
-    type: 'assistant/message', turn: 1, step: 1,
-    usage: { inputTokens: 999999, outputTokens: 999999 },
-});
-check(job().stats?.input === 85000,
-    `子代理会话的用量被排除在外（in 仍是 ${job().stats?.input}）`);
-check(job().stats?.steps === baseSteps + 2, '子代理的消息也不计步数');
-await fire('session/event', SUBAGENT_SESSION,
-    { type: 'request/context', contextWindow: 8000 });
-check(job().stats?.contextWindow === 128000, '子代理的窗口也不会覆盖根会话的');
+// 子代理的会话读同一组投影名，但插件只认根会话。
+await fire('session/event', SUBAGENT_SESSION, { type: 'assistant/message', turn: 1, step: 1 });
+await pre('bash', { command: 'echo y' });
+check(job().stats?.turn === 16, '根会话仍由 agents.roots() 决定，子代理不会替换它');
 
-await fire('session/event', ROOT_SESSION, { type: 'assistant/message', turn: 4, step: 1 });
-check(job().stats?.steps === baseSteps + 3, '没有 usage 的消息只计步数');
-check(job().stats?.input === 85000, '没有 usage 的消息不会把累计清零或重复计');
+// 投影服务不可用时必须降级，而不是把面板搞崩。
+const snapshotFn = ctx.sessionProjections.snapshot;
+ctx.sessionProjections.snapshot = () => { throw new Error('projection offline'); };
+await pre('bash', { command: 'echo z' });
+check(job().page === 'status' && job().stats?.context === 0,
+    '投影读取抛异常时降级为 0（面板照常绘制，渲染器会自动隐藏空统计条）');
+ctx.sessionProjections.snapshot = snapshotFn;
 
 for (const dispose of effects) {
     if (typeof dispose === 'function') dispose();
