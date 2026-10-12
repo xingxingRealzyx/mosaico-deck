@@ -311,6 +311,11 @@ export class Deck extends EventEmitter {
             }
             this._frame(TYPE_BAND, payload);
         }
+        // End of batch. The board stages the bands and then puts them on the glass as
+        // **one** transfer, started on a TE edge -- so the update appears as a picture
+        // rather than as a wipe from the top down. It cannot infer that on its own: the
+        // next band of this same update may still be in flight.
+        this.sendCtrl('commit', 0);
         this._last = Buffer.from(rgb);
         this.stats.bands += changed.length;
         this.stats.bytes += changed.length * BAND_PIXELS * 2;

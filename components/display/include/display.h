@@ -88,6 +88,27 @@ class Panel {
     // in a row, AcquireBand would block indefinitely.
     esp_err_t FlushBand(int band_index, const uint16_t* buffer);
 
+    // Write one band into the full-frame back buffer. **Does not touch the bus.**
+    //
+    // The band diff is a *transport* decision (USB at ~1 MB/s cannot carry 460 KB per
+    // update) and it must not leak into how the panel is driven: pushing each arriving
+    // band on its own makes the picture appear strip by strip, which is exactly the
+    // "the screen is refreshing" look.
+    //
+    // On success the caller's band buffer is already free again (the pixels were copied,
+    // not queued), so this returns the buffer to the pool itself.
+    esp_err_t StageBand(int band_index, const uint16_t* buffer);
+
+    // Push everything staged so far as **one** transfer, started on a TE edge.
+    //
+    // One transfer is the whole point: no intermediate states are ever visible. TE
+    // alignment is the other half -- at 80 MHz the full frame goes out in 11.5 ms while
+    // the panel scans out a frame in 16.7 ms, so a write that starts on the TE edge stays
+    // ahead of the scanout and there is no seam for the eye to catch.
+    //
+    // Returns ESP_ERR_INVALID_STATE when nothing is staged.
+    esp_err_t CommitFrame();
+
     // The panel is really usable: Init succeeded, there is a panel handle, and
     // there is also a buffer semaphore.
     bool ready() const { return panel_ != nullptr && buffers_free_ != nullptr; }

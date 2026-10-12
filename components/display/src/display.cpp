@@ -9,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_lcd_co5300.h"
 #include "esp_lcd_panel_io.h"
+#include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "fbox/board.h"
@@ -42,6 +43,18 @@ DMA_ATTR uint16_t g_band_buf[2][fluidbox::config::kBandPixels];
 // DMA_ATTR: it is never actually read by DMA, so it should not eat precious
 // internal DMA-capable RAM.
 uint16_t g_dummy_band[fluidbox::config::kBandPixels];
+
+// Full-frame back buffer, in PSRAM (OCT, 200 MHz, DMA-capable on this chip).
+//
+// It cannot live in internal SRAM: 480*480*2 = 460 KB is most of the 512 KB there, and
+// the two band buffers plus the USB and QSPI stacks have to fit as well. The panel's own
+// bandwidth is unchanged by this -- it is read once per commit, not continuously.
+uint16_t* g_frame_buf = nullptr;
+
+// Rows touched since the last commit. Kept as a span (not a bitmap): the panel has to be
+// written as one contiguous transfer anyway, so a bounding span is all that is needed.
+int g_dirty_top = -1;
+int g_dirty_bottom = -1;
 
 // TE rising-edge count. Only incremented in the ISR and read by the statistics,
 // so volatile is enough.
@@ -162,6 +175,21 @@ esp_err_t Panel::Init() {
     // is off, so an allocation failure aborts directly and the check branch would
     // be unreachable -- keeping it would only create the illusion that OOM is
     // already handled.
+    // Full-frame back buffer first: without it every band goes out on its own and the
+    // picture visibly assembles strip by strip. Failure is not fatal -- StageBand falls
+    // back to per-band pushes.
+    if (g_frame_buf == nullptr) {
+        g_frame_buf = static_cast<uint16_t*>(heap_caps_aligned_alloc(
+            64, static_cast<size_t>(fluidbox::config::kLcdHRes) * fluidbox::config::kLcdVRes * 2,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA));
+        if (g_frame_buf == nullptr) {
+            ESP_LOGW(kTag, "no PSRAM frame buffer: bands will be pushed one at a time");
+        } else {
+            ESP_LOGI(kTag, "full-frame staging buffer ready (PSRAM, %d KB)",
+                     fluidbox::config::kLcdHRes * fluidbox::config::kLcdVRes * 2 / 1024);
+        }
+    }
+
     buffers_free_ = new osal::CountingSemaphore(2, 2);
     g_buffers_free = static_cast<osal::CountingSemaphore*>(buffers_free_);
 
@@ -317,6 +345,60 @@ uint16_t* Panel::AcquireBand() {
         return g_dummy_band;
     }
     return g_band_buf[next_buffer_++ & 1u];
+}
+
+esp_err_t Panel::StageBand(int band_index, const uint16_t* buffer) {
+    if (panel_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    auto* sem = static_cast<osal::CountingSemaphore*>(buffers_free_);
+    if (g_frame_buf == nullptr) {
+        // No staging buffer (PSRAM allocation failed): fall back to pushing the band on
+        // its own. Strippy is better than blank.
+        const esp_err_t err = FlushBand(band_index, buffer);
+        if (sem != nullptr) {
+            sem->Give();
+        }
+        return err;
+    }
+    const int y0 = band_index * fluidbox::config::kBandRows;
+    memcpy(g_frame_buf + static_cast<size_t>(y0) * fluidbox::config::kLcdHRes, buffer,
+           fluidbox::config::kBandPixels * 2);
+    if (g_dirty_top < 0 || y0 < g_dirty_top) {
+        g_dirty_top = y0;
+    }
+    if (g_dirty_bottom < 0 || y0 + fluidbox::config::kBandRows > g_dirty_bottom) {
+        g_dirty_bottom = y0 + fluidbox::config::kBandRows;
+    }
+    // The pixels are copied, not queued: the band buffer is free again immediately.
+    // Without this the pool would drain after two bands and AcquireBand would start
+    // timing out.
+    if (sem != nullptr) {
+        sem->Give();
+    }
+    return ESP_OK;
+}
+
+esp_err_t Panel::CommitFrame() {
+    if (panel_ == nullptr || g_frame_buf == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_dirty_top < 0) {
+        return ESP_ERR_INVALID_STATE;   // nothing staged, nothing to do
+    }
+    const int top = g_dirty_top;
+    const int bottom = g_dirty_bottom;
+    g_dirty_top = -1;
+    g_dirty_bottom = -1;
+
+    // Align with the panel's scanout before starting. This is the half that removes the
+    // visible seam; a single transfer alone would still begin at an arbitrary point in
+    // the scan.
+    (void)WaitForTeTick(20);
+    return esp_lcd_panel_draw_bitmap(
+        static_cast<esp_lcd_panel_handle_t>(panel_), 0, top,
+        fluidbox::config::kLcdHRes, bottom,
+        g_frame_buf + static_cast<size_t>(top) * fluidbox::config::kLcdHRes);
 }
 
 esp_err_t Panel::FlushBand(int band_index, const uint16_t* buffer) {

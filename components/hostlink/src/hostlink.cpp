@@ -125,6 +125,26 @@ class RxStream {
         return got;
     }
 
+    // Is another message already waiting? **Non-blocking**, and whatever comes back is
+    // kept in carry so the normal read path finds it again.
+    //
+    // This is how the band path knows a batch has ended without the PC having to say so:
+    // a batch arrives back to back, so "nothing pending" means the update is complete.
+    bool HasPending() {
+        if (carry_len_ > 0) {
+            return true;
+        }
+        const osal::InputBuffer chunk = usb_console::ReceiveRx(0);
+        if (chunk.empty()) {
+            return false;
+        }
+        const size_t take = (chunk.size() < sizeof(carry_)) ? chunk.size() : sizeof(carry_);
+        memcpy(carry_, chunk.data(), take);
+        carry_len_ = take;
+        usb_console::ReturnRx(chunk);
+        return true;
+    }
+
     // Drop everything in carry. Called when the frame header does not match --
     // re-finding the sync point is safer than continuing to guess.
     void Resync() { carry_len_ = 0; }
@@ -330,9 +350,9 @@ void HandleBand(bool full_frame) {
     osal::LockGuard<osal::Mutex> draw_guard(g_panel->DrawMutex());
 
     if (full_frame) {
-        // Full screen: receive band by band, each 480x30x2 bytes. **No full-frame buffer
-        // is needed** -- push each band as it arrives, on the same path as a partial
-        // update.
+        // Full screen: receive band by band, each 480x30x2 bytes, stage them all, then
+        // push **one** transfer. Staging is what makes the update look like a new picture
+        // rather than a wipe.
         for (int band = 0; band < fluidbox::config::kBandCount; band++) {
             uint16_t* buf = g_panel->AcquireBand();
             if (buf == nullptr) {
@@ -343,8 +363,9 @@ void HandleBand(bool full_frame) {
                 g_stats.rx_timeout = g_stats.rx_timeout + 1;
                 return;
             }
-            g_panel->FlushBand(band, buf);
+            g_panel->StageBand(band, buf);
         }
+        g_panel->CommitFrame();
         g_stats.full = g_stats.full + 1;
         g_stats.bands = g_stats.bands + fluidbox::config::kBandCount;
         return;
@@ -359,8 +380,15 @@ void HandleBand(bool full_frame) {
         g_stats.rx_timeout = g_stats.rx_timeout + 1;
         return;
     }
-    g_panel->FlushBand(idx, buf);
+    // Staged, not pushed. It goes on the glass as one transfer once this update's bands
+    // have all arrived -- either because the PC said so (the `commit` control command) or
+    // because nothing else is in flight, which is what "the batch ended" means when the
+    // bands arrive back to back.
+    g_panel->StageBand(idx, buf);
     g_stats.bands = g_stats.bands + 1;
+    if (!g_rx.HasPending()) {
+        g_panel->CommitFrame();
+    }
 
     // Send one ack every 64 bands so the PC side can confirm the link is alive --
     // answering every one would be too noisy.
