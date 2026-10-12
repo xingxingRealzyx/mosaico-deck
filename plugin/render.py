@@ -663,6 +663,26 @@ def main():
     job = json.loads(line)
     img, hits = PAGES.get(job.get("page", "status"), render_status)(job)
 
+    # ---- burn-in: shift the whole picture by a few pixels ----
+    #
+    # This is an always-on AMOLED with a header and a stats strip that sit in exactly the
+    # same place for hours. Static bright content on an emissive panel is what wears it
+    # unevenly, and the damage is permanent, so the picture drifts instead: a slow cycle
+    # through a handful of offsets means no pixel holds the same content for long.
+    #
+    # Shifted here, in one place, rather than in every draw call -- and **the hit regions
+    # move with it**, otherwise the touch targets would be a few pixels away from what the
+    # user sees. The design keeps ~28px margins, so a few pixels of drift never pushes
+    # anything off the edge.
+    shift = job.get("shift") or {}
+    dx = int(shift.get("x") or 0)
+    dy = int(shift.get("y") or 0)
+    if dx or dy:
+        canvas = Image.new("RGB", (W, H), BG)
+        canvas.paste(img, (dx, dy))
+        img = canvas
+        hits = [dict(h, x=h["x"] + dx, y=h["y"] + dy) for h in hits]
+
     if job.get("hits"):
         # The caller wants button positions: send the hit regions over a
         # separate stderr side channel (stdout carries only pixels; structured

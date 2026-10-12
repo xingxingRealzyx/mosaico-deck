@@ -238,6 +238,7 @@ export function apply(ctx) {
                 elapsed: state.elapsed,
                 log: state.log,
                 stats: readStats(),
+                shift: driftShift(),
                 // Tap targets exist only while a question is pending. Drawing
                 // them otherwise is noise, and a stray tap is expensive.
                 buttons: state.asking ? null : undefined,
@@ -455,6 +456,37 @@ export function apply(ctx) {
         return Number.isFinite(v) ? v : 0;
     }
 
+    // ---- burn-in --------------------------------------------------------------
+    //
+    // This is an always-on AMOLED and the layout barely moves: the header and the stats
+    // strip sit in exactly the same place for hours. Static bright content on an emissive
+    // panel is what wears it unevenly, and **the damage is permanent** -- so the picture
+    // drifts through a small grid of offsets, and the panel dims when nothing is
+    // happening. The renderer does the shifting (see its `shift` handling); this decides
+    // when and how far.
+    const DRIFT_STEP_MS = 2 * 60 * 1000;   // a new offset every two minutes
+    const DIM_AFTER_MS = 5 * 60 * 1000;    // idle this long and the panel dims
+    const DIM_LEVEL = 8;                   // readable in a dark room, barely emitting
+    let lastShift = { x: 0, y: 0 };
+    let lastActivityAt = Date.now();
+    let dimmed = false;
+    let userBrightness = state.levels.brightness;
+
+    /** Where the picture sits right now: a 3x3 grid walked in order, +/-3 px. */
+    function driftShift() {
+        const step = Math.floor(Date.now() / DRIFT_STEP_MS) % 9;
+        return { x: ((step % 3) - 1) * 3, y: (Math.floor(step / 3) - 1) * 3 };
+    }
+
+    /** Something happened: wake the panel and restart the idle clock. */
+    function markActivity() {
+        lastActivityAt = Date.now();
+        if (!dimmed) return;
+        dimmed = false;
+        state.levels.brightness = userBrightness;
+        sendLevel('brightness', userBrightness, { force: true });
+    }
+
     /** Same question as isRootSession, for the agent-scoped stream events. */
     function isRootAgent(agent) {
         if (!agent) return true;
@@ -545,12 +577,14 @@ export function apply(ctx) {
             Math.round((x - hit.x) / hit.w * 100)));
         if (state.levels[dragging] === pct) return;
         state.levels[dragging] = pct;
+        if (dragging === 'brightness' && !dimmed) userBrightness = pct;
         sendLevel(dragging, pct);
         void paint();
     }
 
     deck.on('event', (ev) => {
         if (ev.t === 'touch') {
+            markActivity();
             if (ev.ev === 'down') {
                 touchStart = { x: ev.x, y: ev.y };
                 lastTouch = { x: ev.x, y: ev.y };
@@ -727,6 +761,7 @@ export function apply(ctx) {
                 state.log = [];
                 state.lastReply = '';
                 streamTail = '';
+                markActivity();
             }
             return;
         }
@@ -873,10 +908,25 @@ export function apply(ctx) {
             // The picture countdown has to tick while the agent is idle too, so it
             // cannot ride on the elapsed-seconds check alone.
             const left = secondsOfImageLeft();
-            if (next !== state.elapsed || left !== state.imageLeft) {
+            // The drift moves the whole picture, so it arrives as a full-frame update on
+            // its own schedule rather than riding on the seconds counter.
+            const drift = driftShift();
+            const moved = drift.x !== lastShift.x || drift.y !== lastShift.y;
+            if (moved) {
+                lastShift = drift;
+            }
+            // **Only dim while the agent is idle**: the panel exists to be read from
+            // across the room, and going dark in the middle of a turn hides the one
+            // thing it is for.
+            if (!dimmed && state.status === 'idle'
+                && Date.now() - lastActivityAt >= DIM_AFTER_MS) {
+                dimmed = true;
+                sendLevel('brightness', DIM_LEVEL, { force: true });
+            }
+            if (next !== state.elapsed || left !== state.imageLeft || moved) {
                 state.elapsed = next;
                 state.imageLeft = left;
-                void paint();
+                void paint({ force: false });
             }
         }, TICK_MS);
 
@@ -1113,6 +1163,7 @@ export function apply(ctx) {
                 if (v === undefined) continue;
                 const pct = Math.max(0, Math.min(100, Math.round(Number(v))));
                 state.levels[key] = pct;
+                if (key === 'brightness' && !dimmed) userBrightness = pct;
                 sendLevel(key, pct, { force: true });
                 done.push(`${key}=${pct}`);
             }

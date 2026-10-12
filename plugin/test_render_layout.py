@@ -290,6 +290,43 @@ full, _ = r.PAGES["panel"]({"page": "panel", "levels": {"volume": 100, "brightne
 check(strip_ink(full, 178) > strip_ink(full, 318),
       "音量 100 / 亮度 0 时，两条滑块的填充量确实不同（值真的画出来了）")
 
+print("烧屏防护：整屏位移")
+base, base_hits = r.PAGES["panel"]({"page": "panel", "levels": {"volume": 50},
+                                    "shift": {"x": 0, "y": 0}})
+
+
+def shifted(dx, dy):
+    img = Image.new("RGB", (r.W, r.H), r.BG)
+    img.paste(base, (dx, dy))
+    return img, [dict(h, x=h["x"] + dx, y=h["y"] + dy) for h in base_hits]
+
+
+import subprocess as _sp
+PY_BIN = "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3"
+
+
+def render_with_shift(dx, dy):
+    job = {"page": "panel", "levels": {"volume": 50}, "hits": True,
+           "shift": {"x": dx, "y": dy}}
+    p = _sp.run([PY_BIN, "plugin/render.py"], input=json.dumps(job).encode(),
+                capture_output=True)
+    hits = json.loads(p.stderr.decode()) if p.stderr.strip() else []
+    return Image.frombytes("RGB", (r.W, r.H), p.stdout), hits
+
+
+a, ha = render_with_shift(0, 0)
+b, hb = render_with_shift(3, -3)
+check(a.tobytes() != b.tobytes(), "位移会改变画面（否则等于没做）")
+check([h["x"] for h in hb] == [h["x"] + 3 for h in ha]
+      and [h["y"] for h in hb] == [h["y"] - 3 for h in ha],
+      "热区跟着位移走（否则触摸会错位）")
+# 位移幅度必须小于设计余量，否则文字会被切掉
+check(max(abs(v) for v in (3, -3)) < 28,
+      "位移幅度 3px 远小于 28px 边距，不会有内容被切")
+_real, real_hits = r.PAGES["panel"]({"page": "panel", "levels": {"volume": 50}})
+check(all(h["x"] + h["w"] <= r.W for h in real_hits),
+      "热区本来就在屏内（位移 3px 后仍在）")
+
 print("纯黑背景")
 for page, j in (("status", {"state": "tool", "detail": "x", "log": ["a"]}),
                 ("ask", {"question": "短问题", "options": ["是", "否"]}),
