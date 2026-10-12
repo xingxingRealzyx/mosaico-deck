@@ -109,6 +109,9 @@ class Panel {
     // Returns ESP_ERR_INVALID_STATE when nothing is staged.
     esp_err_t CommitFrame();
 
+    // Is there staged content that has not reached the glass yet?
+    bool HasStaged() const;
+
     // The panel is really usable: Init succeeded, there is a panel handle, and
     // there is also a buffer semaphore.
     bool ready() const { return panel_ != nullptr && buffers_free_ != nullptr; }

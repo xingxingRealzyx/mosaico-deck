@@ -516,10 +516,19 @@ export function apply(ctx) {
                 }
                 return;
             } else if (ev.ev === 'up') {
-                const releaseY = lastTouch ? lastTouch.y : touchStart?.y;
-                if (!state.panel && touchStart && touchStart.y <= PULL_EDGE
-                    && releaseY !== undefined && releaseY - touchStart.y >= PULL_DIST) {
-                    setPanel(true);
+                const from = touchStart;
+                const to = lastTouch ?? touchStart;
+                const dy = from && to ? to.y - from.y : 0;
+                // A vertical gesture is required for either panel gesture: without this a
+                // horizontal drag on a slider would also read as a swipe.
+                const vertical = from && to && Math.abs(dy) > Math.abs(to.x - from.x);
+                if (!state.panel && from && from.y <= PULL_EDGE && dy >= PULL_DIST) {
+                    setPanel(true);           // pull down from the top edge to open
+                } else if (state.panel && vertical && dy <= -PULL_DIST) {
+                    // **Swipe up to close.** Tapping outside also closes it, but swiping
+                    // up is what a phone has trained everyone to do -- without this the
+                    // panel feels like it cannot be dismissed at all.
+                    setPanel(false);
                 } else if (dragging) {
                     // The throttled stream may have dropped the final value.
                     sendLevel(dragging, state.levels[dragging], { force: true });

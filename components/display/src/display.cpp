@@ -379,6 +379,8 @@ esp_err_t Panel::StageBand(int band_index, const uint16_t* buffer) {
     return ESP_OK;
 }
 
+bool Panel::HasStaged() const { return g_dirty_top >= 0; }
+
 esp_err_t Panel::CommitFrame() {
     if (panel_ == nullptr || g_frame_buf == nullptr) {
         return ESP_ERR_INVALID_STATE;

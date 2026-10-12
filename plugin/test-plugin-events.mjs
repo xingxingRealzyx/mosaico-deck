@@ -358,6 +358,36 @@ globalThis.__deck.emit('event', { t: 'touch', ev: 'up' });
 await new Promise((r) => setTimeout(r, 60));
 check(job().page === 'status', '顶部轻点（没有拖动）不会弹出面板');
 
+// 手机的习惯是上滑关闭。从**滑块上**上滑才测得出这个手势：从空白处上滑在按下那一刻
+// 就已经关闭了，测过了也是白测。
+touch('down', 200, 30);
+touch('move', 200, 150);
+touch('up');
+await new Promise((r) => setTimeout(r, 60));
+check(job().page === 'panel', '重新打开面板以便测试上滑');
+
+touch('down', 240, 190);          // 手落在音量滑块上
+touch('move', 240, 140);
+touch('move', 240, 100);
+touch('up');
+await new Promise((r) => setTimeout(r, 60));
+check(job().page === 'status', '从滑块上上滑也能关闭面板');
+
+// 横向拖动滑块不能被误判成上滑
+touch('down', 200, 30);
+touch('move', 200, 150);
+touch('up');
+await new Promise((r) => setTimeout(r, 60));
+touch('down', 100, 190);
+touch('move', 240, 190);
+touch('up');
+await new Promise((r) => setTimeout(r, 60));
+check(job().page === 'panel', '横向拖动滑块不会误关闭面板');
+check(job().levels?.volume >= 45 && job().levels?.volume <= 55,
+    `而且音量确实改了：${job().levels?.volume}%`);
+touch('down', 240, 430);          // 收尾：关掉
+await new Promise((r) => setTimeout(r, 60));
+
 console.log('deck_control / deck_panel');
 check(registered.some((t) => t.name === 'deck_control'), 'deck_control 已注册');
 check(registered.some((t) => t.name === 'deck_panel'), 'deck_panel 已注册');
