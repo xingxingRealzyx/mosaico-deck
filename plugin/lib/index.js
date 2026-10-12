@@ -41,6 +41,8 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import path from 'node:path';
+
 import { Deck, findPort } from './device.js';
 import { render, checkEnvironment } from './render.js';
 
@@ -79,6 +81,8 @@ export function apply(ctx) {
         status: 'idle',
         detail: '',
         target: '',
+        tool: null,     // current tool name, so the panel can pick an icon + colour
+        image: null,    // a picture being looked at; render.py draws it full-panel
         progress: null,
         elapsed: 0,
         startedAt: 0,
@@ -91,8 +95,11 @@ export function apply(ctx) {
     let buttons = [];
     let painting = false;
 
-    const pushLog = (line) => {
-        state.log.push(line);
+    // Log entries carry **what kind of thing happened**, not just a string: the
+    // renderer turns the kind (and the tool name) into a colour emoji, which is what
+    // makes the tail readable at a glance instead of a wall of grey text.
+    const pushLog = (entry) => {
+        state.log.push(entry);
         state.log = state.log.slice(-6);
     };
 
@@ -101,17 +108,18 @@ export function apply(ctx) {
         painting = true;
         try {
             const { rgb } = await render({
-                page: 'status',
+                // An image being looked at takes over the whole panel; anything else
+                // is the status page.
+                page: state.image ? 'image' : 'status',
+                image: state.image,
                 project: state.project,
                 state: state.status,
+                tool: state.tool,
                 detail: state.detail,
                 target: state.target,
                 progress: state.progress,
                 elapsed: state.elapsed,
                 log: state.log,
-                files: state.files,
-                testsPassed: state.testsPassed,
-                testsTotal: state.testsTotal,
                 // Tap targets exist only while a question is pending. Drawing
                 // them otherwise is noise, and a stray tap is expensive.
                 buttons: state.asking ? null : undefined,
@@ -141,6 +149,28 @@ export function apply(ctx) {
             if (first) target = String(first);
         }
         return { toolName: String(rawName), target };
+    }
+
+    const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
+    const READ_TOOL = /^(read|read_image|open_image|view_image)$/i;
+
+    /** The picture this call is about to look at, or null.
+     *
+     * Only **reads** count: a write that happens to end in .png should not throw a
+     * picture up on the panel. The payoff is the point of having a panel at all --
+     * when the agent studies a screenshot, the screenshot is on the desk instead of
+     * being a path buried in a transcript.
+     *
+     * The image stays until the next tool call or assistant message replaces it, so
+     * it is visible for as long as that step lasts rather than flashing by.
+     */
+    function imageBeingRead(toolName, target) {
+        if (!target || !IMAGE_EXT.test(target) || !READ_TOOL.test(toolName)) return null;
+        try {
+            return path.isAbsolute(target) ? target : path.resolve(target);
+        } catch {
+            return target;
+        }
     }
 
     deck.on('event', (ev) => {
@@ -184,8 +214,10 @@ export function apply(ctx) {
             state.status = 'thinking';
             state.detail = 'Working';
             state.target = '';
+            state.tool = null;
         } else {
             state.status = 'idle';
+            state.tool = null;
         }
         void paint();
     });
@@ -195,10 +227,17 @@ export function apply(ctx) {
         try {
             const { toolName, target } = describeTool(exec);
             state.status = 'tool';
+            state.tool = toolName;
             state.detail = `Calling ${toolName}`;
-            if (target) state.target = target.slice(0, 34);
+            if (target) state.target = target.slice(0, 40);
             state.progress = null;
-            pushLog(`called ${toolName}`);
+            // A read of a picture puts the picture itself on the panel; any other
+            // call clears whatever was there.
+            state.image = imageBeingRead(toolName, target);
+            pushLog({ kind: 'tool', tool: toolName, text: `called ${toolName}` });
+            if (state.image) {
+                pushLog({ kind: 'image', tool: toolName, text: 'showing image' });
+            }
         } catch {
             /* payload shape changed; never break the tool pipeline over this */
         }
@@ -210,6 +249,7 @@ export function apply(ctx) {
     ctx.on('tools/post-execute', (exec, result, next) => {
         try {
             state.status = 'thinking';
+            state.tool = null;
             state.detail = 'Tool finished';
         } catch {
             /* ignore */
@@ -237,8 +277,10 @@ export function apply(ctx) {
                 : '';
             if (text) {
                 state.status = 'running';
-                state.detail = text.replace(/\s+/g, ' ').slice(0, 30);
-                pushLog('replied');
+                state.tool = null;
+                state.image = null;      // the reply replaces whatever picture was up
+                state.detail = text.replace(/\s+/g, ' ').slice(0, 34);
+                pushLog({ kind: 'reply', text: 'replied' });
             }
         } catch {
             /* ignore */
@@ -248,8 +290,9 @@ export function apply(ctx) {
 
     ctx.on('agent/error', () => {
         state.status = 'error';
+        state.tool = null;
         state.detail = 'Error';
-        pushLog('error');
+        pushLog({ kind: 'error', text: 'error' });
         void paint({ force: true });
     });
 
@@ -437,11 +480,46 @@ export function apply(ctx) {
             if (args.target !== undefined) state.target = String(args.target);
             if (args.state !== undefined) state.status = String(args.state);
             if (args.progress !== undefined) state.progress = Number(args.progress);
-            if (args.logLine) pushLog(String(args.logLine));
+            if (args.logLine) pushLog({ kind: 'info', text: String(args.logLine) });
             const n = await paint();
             return { message: n ? `updated (${n} bands)` : 'no change' };
         },
         presentCall: () => ({ card: 'generic', kind: 'read', title: 'Update device display' }),
+    }));
+
+    ctx.tools.register(defineTool({
+        name: 'deck_image',
+        description:
+            'Show a picture on the mosaico-deck device: a screenshot, a diagram, a photo. '
+            + 'Reading an image with the normal read tool already does this automatically, '
+            + 'so reach for this only when you want a specific picture on the panel -- '
+            + 'for example to show the user what you are looking at, or to compare two '
+            + 'images side by side over successive calls.',
+        parameters: {
+            path: { type: 'string', required: true, description: 'Image file to display.' },
+            caption: { type: 'string', description: 'One line to show under the picture.' },
+        },
+        output: textOutput((v) => v.message),
+        async execute(args) {
+            if (!deck.connected) return { message: 'device not connected' };
+            const p = String(args.path ?? '');
+            if (!p) return { message: 'no path given' };
+            state.image = path.isAbsolute(p) ? p : path.resolve(p);
+            if (args.caption) state.detail = String(args.caption);
+            state.status = 'tool';
+            state.tool = 'deck_image';
+            const n = await paint({ force: true });
+            return {
+                message: n
+                    ? `showing ${state.image} (${n} bands)`
+                    : `asked for ${state.image}, but the panel did not change`,
+            };
+        },
+        presentCall: (a) => ({
+            card: 'generic',
+            kind: 'read',
+            title: `Show: ${String(a.path ?? '').split('/').pop().slice(0, 20)}`,
+        }),
     }));
 
     ctx.logger?.info?.(

@@ -10,6 +10,13 @@
 #   stdout : 480*480*3 bytes of raw RGB (endianness-agnostic, just R,G,B order)
 #   stderr : one line of JSON with the tap rectangles, when job["hits"] is set
 #
+# Pages
+# -----
+#   status  the default: state, tool, detail, log tail
+#   image   one picture from disk, fitted, with a caption strip
+#   ask     a question with tap targets
+#   boot    the idle splash
+#
 # **Why raw RGB instead of PNG**: the caller (render.js) uses it for band
 # diffing and already compares the whole image byte by byte. PNG would have to
 # be decompressed first, wasting an extra encode/decode round.
@@ -21,8 +28,8 @@
 # (runtime/primary-runtime/dependencies/python), and CJK fonts come straight
 # from the system -- this chain is ready-made, no need to build another in Node.
 #
-# Two rules this file learned the hard way (both seen on the real panel)
-# ---------------------------------------------------------------------
+# Lessons this file learned the hard way (all seen on the real panel)
+# -------------------------------------------------------------------
 # 1. **Lay out from the space you have, never from a minimum.** The ask page used
 #    to floor the option height at 52px: with five options and a three-line
 #    question the last button was drawn *below the panel* while its tap rectangle
@@ -32,37 +39,37 @@
 # 2. **Measure text in pixels.** Characters are not a unit of width -- a CJK glyph
 #    is ~2x an ASCII one -- so wrapping by `len()` both wasted space and cut lines
 #    off past the edge.
-#
-# Why there is no monospace face, and no thin one
-# -----------------------------------------------
-# Paths and timers used to be drawn with `SFNSMono`. Two problems, both visible on
-# the panel: that face has **no CJK glyphs**, so a Chinese directory in a path
-# vanished and left stray slashes behind; and at 20-24px its strokes are thin enough
-# that grey on black stops being readable at desk distance.
-#
-# So: one single face for everything, and it is the **bold** one. Legibility on a
-# 480x480 panel comes from stroke weight and brightness, not from a second family.
-# Nothing here draws a column of aligned text, so monospace bought nothing anyway.
+# 3. **No monospace face and no thin one.** Paths used to be drawn with SFNSMono,
+#    which has no CJK glyphs (a Chinese directory simply vanished) and is thin
+#    enough that grey on black stops being readable. One bold face for everything.
+# 4. **Dimming is not hierarchy.** White -> grey -> darker grey meant the third
+#    step was unreadable on black. There are exactly two text colours now and the
+#    second one is bright; hierarchy comes from size and weight.
 
 import json
 import sys
 import os
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 W = H = 480
 
-BG = (0, 0, 0)              # Pure black: emits nothing on AMOLED, max contrast
-BORDER = (84, 95, 116)      # Panel outlines only -- surfaces stay black
-TEXT = (252, 253, 255)      # Primary reading colour: white, not "light grey"
-TEXT_SOFT = (214, 223, 238)  # Secondary. Still bright -- dimming is what made the
-#                              old grey-on-black text unreadable, so there is exactly
-#                              one step down from white and it is a small one.
+BG = (0, 0, 0)               # Pure black: emits nothing on AMOLED, max contrast
+BORDER = (84, 95, 116)
+TEXT = (252, 253, 255)
+TEXT_SOFT = (214, 223, 238)
 ACCENT = (110, 200, 255)
 OK = (90, 236, 172)
 WARN = (255, 200, 110)
 ERR = (255, 120, 145)
 IDLE = (176, 186, 206)
+# Extra hues so each family of tool reads as its own thing at a glance.
+BLUE = (126, 180, 255)
+PURPLE = (190, 154, 255)
+CYAN = (112, 226, 234)
+MAGENTA = (255, 146, 222)
+PINK = (255, 164, 196)
+TEAL = (124, 234, 210)
 
 STATE_COLORS = {
     "idle": IDLE, "thinking": ACCENT, "running": ACCENT, "editing": ACCENT,
@@ -74,13 +81,48 @@ STATE_LABELS = {
     "testing": "跑测试", "waiting": "等你决定", "done": "完成", "error": "出错",
     "failed": "失败", "tool": "调用工具",
 }
+STATE_ICONS = {
+    "idle": "💤", "thinking": "🤔", "running": "🏃", "editing": "✏️",
+    "testing": "🧪", "waiting": "⏳", "done": "✅", "error": "❌",
+    "failed": "❌", "tool": "🔧",
+}
+ICON_TOOL = "🔧"
 
-# Sizes live in one place so the whole hierarchy can be re-tuned at a glance.
-# Everything is deliberately large: this panel is read at arm's length on a desk,
-# not held in the hand.
+# Which emoji and colour a tool name gets. Matched by **longest key found inside
+# the name**, so `read_image` beats `read`.
+TOOL_STYLES = {
+    "read_image": ("🖼", PINK),
+    "read": ("📖", BLUE),
+    "write": ("📝", WARN),
+    "edit": ("✏️", WARN),
+    "glob": ("🔍", PURPLE),
+    "grep": ("🔍", PURPLE),
+    "bash": ("🖥", OK),
+    "shell": ("🖥", OK),
+    "pwsh": ("🖥", OK),
+    "web_search": ("🌐", CYAN),
+    "web_fetch": ("🌐", CYAN),
+    "subagent": ("🤖", MAGENTA),
+    "workflow": ("🕸", MAGENTA),
+    "task": ("🤖", MAGENTA),
+    "todo": ("✅", OK),
+    "ask_user": ("❓", WARN),
+    "question": ("❓", WARN),
+    "deck_ask": ("❓", WARN),
+    "deck_speak": ("🔊", TEAL),
+    "deck_image": ("🖼", PINK),
+    "deck_show": ("🖥", ACCENT),
+    "deck_connect": ("🔌", TEAL),
+    "job": ("⚙️", IDLE),
+    "present": ("🎁", PINK),
+    "skill": ("📚", BLUE),
+    "goal": ("🎯", WARN),
+}
+LOG_ICONS = {"tool": None, "reply": "💬", "error": "❌", "done": "✅", "info": None}
+
 S_PROJECT = 26
 S_ELAPSED = 24
-S_LABEL = 48
+S_LABEL = 46
 S_TARGET = 24
 S_DETAIL = 28
 S_PROGRESS = 21
@@ -107,17 +149,23 @@ S_BOOT = 36
 _FACES = [("/System/Library/Fonts/Hiragino Sans GB.ttc", 2),
           ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
           ("/Library/Fonts/Arial Unicode.ttf", 0)]
-_cache = {}
+_font_cache = {}
+
+# Apple's emoji face is a **bitmap** font: it only opens at its own strike sizes and
+# raises "invalid pixel size" for anything else, so a requested size is served by
+# rendering the nearest larger strike and scaling it down.
+_EMOJI_PATH = "/System/Library/Fonts/Apple Color Emoji.ttc"
+_EMOJI_STRIKES = (20, 32, 48, 64, 96, 160)
+_emoji_cache = {}
 
 
 def font(size, mono=False):
     """The one face, at `size`.
 
-    `mono` is accepted and ignored so call sites read the same as before; see the
-    note at the top for why the monospace family is gone.
+    `mono` is accepted and ignored so call sites read the same as before.
     """
-    if size in _cache:
-        return _cache[size]
+    if size in _font_cache:
+        return _font_cache[size]
     f = None
     for path, index in _FACES:
         if not os.path.exists(path):
@@ -129,24 +177,18 @@ def font(size, mono=False):
             continue
     if f is None:
         f = ImageFont.load_default()
-    _cache[size] = f
+    _font_cache[size] = f
     return f
+
+
+def font_for(text, size, mono=False):
+    """Kept for call-site clarity; there is only one face now."""
+    return font(size)
 
 
 def width_of(text, f):
     """Pixel width of one string in one font."""
     return ImageDraw.Draw(Image.new("RGB", (1, 1))).textlength(str(text), font=f)
-
-
-def font_for(text, size, mono=False):
-    """Kept for call-site clarity; there is only one face now.
-
-    This used to switch away from the monospace family whenever `text` contained a
-    non-ASCII character, because that face could not draw them. One bold CJK-capable
-    face makes the switch unnecessary, but the call sites still read as "the font for
-    this string", so the wrapper stays.
-    """
-    return font(size)
 
 
 def fit(text, f, max_w):
@@ -183,10 +225,73 @@ def wrap(text, f, max_w, max_lines=None):
     return lines
 
 
+def emoji(ch, px):
+    """One colour emoji as an RGBA tile `px` tall, or None when unavailable.
+
+    Cached per (character, size): the strike render plus Lanczos downscale costs a
+    few ms and the same dozen icons come back on every frame.
+    """
+    if not ch:
+        return None
+    key = (ch, px)
+    if key in _emoji_cache:
+        return _emoji_cache[key]
+    tile = None
+    if os.path.exists(_EMOJI_PATH):
+        strike = next((s for s in _EMOJI_STRIKES if s >= px), _EMOJI_STRIKES[-1])
+        try:
+            f = ImageFont.truetype(_EMOJI_PATH, strike)
+            box = int(strike * 1.5)
+            big = Image.new("RGBA", (box, box), (0, 0, 0, 0))
+            ImageDraw.Draw(big).text((box // 2, box // 2), ch, font=f,
+                                     embedded_color=True, anchor="mm")
+            bbox = big.getbbox()
+            if bbox:
+                big = big.crop(bbox)
+                w = max(1, round(big.width * px / big.height))
+                tile = big.resize((w, px), Image.LANCZOS)
+        except Exception:
+            tile = None
+    _emoji_cache[key] = tile
+    return tile
+
+
+def draw_emoji(img, ch, x, y, px):
+    """Paste an emoji with its top-left at (x, y). Returns its width (0 if none)."""
+    t = emoji(ch, px)
+    if t is None:
+        return 0
+    img.paste(t, (x, y), t)
+    return t.width
+
+
+def style_for(tool):
+    """(emoji, colour) for a tool name."""
+    if tool:
+        name = str(tool).lower()
+        best = None
+        for key, val in TOOL_STYLES.items():
+            if key in name and (best is None or len(key) > len(best[0])):
+                best = (key, val)
+        if best:
+            return best[1]
+    return ICON_TOOL, ACCENT
+
+
+def parse_log(entry):
+    """(kind, text, tool) from either a structured entry or a bare string."""
+    if isinstance(entry, dict):
+        return (entry.get("kind", "info"), str(entry.get("text", "")),
+                entry.get("tool"))
+    return "info", str(entry), None
+
+
 def draw_status(d, img, job):
     state = job.get("state", "idle")
-    color = STATE_COLORS.get(state, IDLE)
     label = job.get("label") or STATE_LABELS.get(state, state)
+    icon, color = STATE_ICONS.get(state, ICON_TOOL), STATE_COLORS.get(state, IDLE)
+    if state == "tool" and job.get("tool"):
+        icon, color = style_for(job["tool"])
 
     # Header: status dot + project, elapsed time on the right.
     cx, cy, r = 34, 38, 9
@@ -210,9 +315,11 @@ def draw_status(d, img, job):
 
     # State label -- the one thing that must be readable across the room.
     y = 84
+    iw = draw_emoji(img, icon, 28, y - 2, S_LABEL - 8)
+    tx = 28 + (iw + 14 if iw else 0)
     f_label = font_for(label, S_LABEL)
-    d.text((28, y), fit(label, f_label, W - 56), font=f_label, fill=color)
-    y += S_LABEL + 22
+    d.text((tx, y), fit(label, f_label, W - 28 - tx), font=f_label, fill=color)
+    y += S_LABEL + 24
 
     if job.get("target"):
         f = font_for(job["target"], S_TARGET, mono=True)
@@ -238,21 +345,32 @@ def draw_status(d, img, job):
 
     # Log tail. It yields to the buttons: those sit at H-100, so a log that ran
     # past them would be covered.
-    log = [str(x) for x in (job.get("log") or [])]
+    log = job.get("log") or []
     f_log = font(S_LOG)
-    step = S_LOG + 12
+    step = S_LOG + 14
     buttons = job.get("buttons") or []
     floor = (H - 100 - 14) if buttons else (H - 22)
 
     if log:
         sy = y + 6
         d.line((28, sy, W - 28, sy), fill=BORDER, width=1)
-        ly = sy + 16
+        ly = sy + 18
         room = (floor - ly) // step
         n = max(0, min(len(log), room))
-        for line in log[-n:] if n else []:
-            d.text((28, ly), "·", font=f_log, fill=ACCENT)
-            d.text((48, ly), fit(line, f_log, W - 48 - 28), font=f_log,
+        for entry in (log[-n:] if n else []):
+            kind, text, tool = parse_log(entry)
+            icon = None
+            if kind == "tool" and tool:
+                icon = style_for(tool)[0]
+            else:
+                icon = LOG_ICONS.get(kind)
+            if icon:
+                w = draw_emoji(img, icon, 28, ly - 1, S_LOG + 2)
+                tx = 28 + (w + 12 if w else 0)
+            else:
+                d.text((28, ly), "·", font=f_log, fill=ACCENT)
+                tx = 48
+            d.text((tx, ly), fit(text, f_log, W - tx - 28), font=f_log,
                    fill=TEXT_SOFT)
             ly += step
 
@@ -290,11 +408,65 @@ def render_status(job):
     return img, hits
 
 
+def render_image(job):
+    """One picture from disk, fitted, with a caption strip.
+
+    This is why the panel is worth having: when the agent looks at a screenshot or a
+    photo, the thing it is looking at appears on the desk instead of staying a path
+    in a transcript. The picture is letterboxed rather than cropped -- a cropped
+    screenshot is worse than a small one.
+    """
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    cap = 96
+    area_w, area_h = W, H - cap
+    path = str(job.get("image") or "")
+    state = job.get("state", "tool")
+    tool = job.get("tool")
+    icon, color = style_for(tool) if tool else (
+        STATE_ICONS.get(state, ICON_TOOL), STATE_COLORS.get(state, IDLE))
+    label = job.get("label") or STATE_LABELS.get(state, state)
+
+    dims, problem = "", ""
+    try:
+        with Image.open(path) as src:
+            # draft() lets libjpeg decode straight to a smaller size, so a 50MP
+            # photo does not cost seconds and hundreds of MB on the way to 480px.
+            src.draft("RGB", (area_w * 2, area_h * 2))
+            pic = ImageOps.exif_transpose(src).convert("RGB")
+        pic.thumbnail((area_w, area_h), Image.LANCZOS)
+        img.paste(pic, ((area_w - pic.width) // 2, (area_h - pic.height) // 2))
+        dims = f"{pic.width}×{pic.height}"
+    except Exception as exc:
+        problem = str(exc)
+
+    d.line((28, H - cap, W - 28, H - cap), fill=BORDER, width=1)
+    y = H - cap + 16
+    iw = draw_emoji(img, icon, 28, y, S_DETAIL + 4)
+    tx = 28 + (iw + 14 if iw else 0)
+    f_label = font(S_DETAIL)
+    d.text((tx, y), fit(label, f_label, W - tx - 150), font=f_label, fill=color)
+    if dims:
+        d.text((W - 28, y + 10), dims, font=font(S_PROGRESS), fill=TEXT_SOFT,
+               anchor="ra")
+    name = os.path.basename(path) or path
+    f_name = font(S_FOOTER)
+    if problem:
+        d.text((28, y + 44), fit(f"读不出这张图: {name}", f_name, W - 56),
+               font=f_name, fill=ERR)
+    else:
+        d.text((28, y + 44), fit(name, f_name, W - 56), font=f_name,
+               fill=TEXT_SOFT)
+    return img, []
+
+
 def render_ask(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, 4), fill=WARN)
-    d.text((28, 26), "需要你决定", font=font(S_ASK_LABEL), fill=WARN)
+    iw = draw_emoji(img, "❓", 28, 22, S_ASK_LABEL + 2)
+    d.text((28 + (iw + 10 if iw else 0), 26), "需要你决定",
+           font=font(S_ASK_LABEL), fill=WARN)
 
     q = str(job.get("question", ""))
     f_q = font_for(q, S_ASK_Q)
@@ -360,14 +532,16 @@ def render_ask(job):
 def render_boot(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    d.text((W // 2, H // 2 - 30), "mosaico-deck", font=font(S_BOOT), fill=TEXT,
+    iw = draw_emoji(img, "🐳", W // 2 - 70, H // 2 - 108, 96)
+    d.text((W // 2, H // 2 + 30), "mosaico-deck", font=font(S_BOOT), fill=TEXT,
            anchor="mm")
-    d.text((W // 2, H // 2 + 28), "等待 Harness…", font=font(S_ASK_LABEL),
+    d.text((W // 2, H // 2 + 74), "等待 Harness…", font=font(S_ASK_LABEL),
            fill=TEXT_SOFT, anchor="mm")
     return img, []
 
 
-PAGES = {"status": render_status, "ask": render_ask, "boot": render_boot}
+PAGES = {"status": render_status, "image": render_image, "ask": render_ask,
+         "boot": render_boot}
 
 
 def main():
