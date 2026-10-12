@@ -214,7 +214,19 @@ esp_err_t Panel::Init() {
     bus_config.data1_io_num = fluidbox::board::kPinLcdData1;
     bus_config.data2_io_num = fluidbox::board::kPinLcdData2;
     bus_config.data3_io_num = fluidbox::board::kPinLcdData3;
-    bus_config.max_transfer_sz = fluidbox::config::kBandPixels * sizeof(uint16_t);
+    // **The largest transfer the panel will ever be asked for is a whole frame**, because
+    // a staged update is pushed as one run (see CommitFrame).
+    //
+    // This used to be exactly one band, which was correct while every band was pushed on
+    // its own -- and became a silent ceiling the moment updates started being coalesced.
+    // Anything larger fails to queue:
+    //     E lcd_panel.io.spi: spi transmit (queue) color failed
+    //     E co5300_spi: send color data failed
+    // The visible result is a screen that only ever shows the bands small enough to fit,
+    // with the rest left black -- and because the PC diffs against what it already sent,
+    // those rows were never sent again.
+    bus_config.max_transfer_sz =
+        fluidbox::config::kLcdHRes * fluidbox::config::kLcdVRes * sizeof(uint16_t);
     ESP_RETURN_ON_ERROR(spi_bus_initialize(static_cast<spi_host_device_t>(kLcdHost),
                                            &bus_config, SPI_DMA_CH_AUTO),
                         kTag, "spi bus init failed");
