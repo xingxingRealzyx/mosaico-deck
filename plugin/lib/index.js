@@ -41,14 +41,55 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fsSync from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Deck, findPort } from './device.js';
 import { render, checkEnvironment } from './render.js';
 import { textToPcm } from './tts.js';
+
+/**
+ * Which external programs this machine actually has.
+ *
+ * **A missing PC-side dependency shows up as a symptom, not an error**: no ffmpeg and
+ * the speaker is silent, no Pillow and the panel stays blank, no whisper model and
+ * push-to-talk just does nothing. Someone installing this project from the repository
+ * should not have to guess which of those they are looking at, so the answer is probed
+ * once at load and reported by `deck_connect` and the startup log.
+ * `./check-deps.sh` prints the same list with install instructions.
+ */
+export const deps = (() => {
+    // Test seam, in the same spirit as DECK_IMAGE_HOLD_MS: the suites must not depend on
+    // which optional programs the machine running them happens to have.
+    if (process.env.DECK_ASSUME_DEPS === '1') {
+        return { ffmpeg: true, say: true, whisper: true, whisperModel: true,
+                 whisperName: 'whisper-cli' };
+    }
+    const has = (cmd) => {
+        try {
+            execFileSync('/usr/bin/env', ['which', cmd], { stdio: 'ignore' });
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    const whisperName = process.env.DECK_WHISPER || 'whisper-cli';
+    const whisperModel = process.env.DECK_WHISPER_MODEL
+        || path.join(os.homedir(), '.cache', 'whisper', 'ggml-small.bin');
+    return {
+        // Speech out needs both: `say` synthesizes, ffmpeg converts to what the board plays.
+        ffmpeg: has('ffmpeg'),
+        // macOS-only, and the one genuinely platform-bound piece of this project.
+        say: has('say'),
+        whisper: has(whisperName),
+        whisperModel: fsSync.existsSync(whisperModel),
+        whisperName,
+    };
+})();
 
 export const name = 'mosaico-deck';
 // `agents` tells the root conversation from the subagent sessions on the same bus;
@@ -287,9 +328,22 @@ export function apply(ctx) {
      * **Serialized on purpose**: `speakPcm` paces itself to the playback rate, so two
      * overlapping utterances would interleave PCM on the wire and come out as noise.
      */
+    let warnedNoVoice = false;
     function say(text, { respectGap = false } = {}) {
         const line = String(text ?? '').replace(/\s+/g, ' ').trim();
         if (!line || !voiceOn || !deck.connected) return;
+        if (!deps.say || !deps.ffmpeg) {
+            // Say why, once: otherwise "the speaker never says anything" is a mystery
+            // that looks like a bug in this plugin rather than a missing program.
+            if (!warnedNoVoice) {
+                warnedNoVoice = true;
+                ctx.logger?.warn?.('mosaico-deck: speech disabled — '
+                    + `${deps.say ? '' : 'macOS `say` not found '}`
+                    + `${deps.ffmpeg ? '' : 'ffmpeg not found '}`
+                    + '(run ./check-deps.sh)');
+            }
+            return;
+        }
         if (respectGap && Date.now() - lastSpokeAt < SPEAK_GAP_MS) return;
         speechChain = speechChain.then(async () => {
             try {
@@ -510,6 +564,14 @@ export function apply(ctx) {
         state.status = 'thinking';
         state.detail = '识别中…';
         void paint({ force: true });
+        if (!deps.whisper || !deps.whisperModel) {
+            const what = !deps.whisper ? `需要 ${deps.whisperName}` : '需要 whisper 模型';
+            state.detail = what;
+            ctx.logger?.warn?.(`mosaico-deck: push-to-talk unavailable — ${what}`
+                + ' (run ./install-deps.sh)');
+            void paint({ force: true });
+            return;
+        }
         try {
             const text = await transcribe(pcm);
             if (text) {
@@ -1082,7 +1144,16 @@ export function apply(ctx) {
         parameters: {},
         output: textOutput((v) => v.message),
         async execute() {
-            if (deck.connected) return { message: `already connected to ${deck.port} (build ${build})` };
+            const missing = [
+                deps.ffmpeg ? '' : 'ffmpeg', deps.say ? '' : 'say(macOS)',
+                deps.whisper && deps.whisperModel ? '' : 'whisper',
+            ].filter(Boolean);
+            const health = missing.length
+                ? ` | missing: ${missing.join(', ')} — see ./check-deps.sh`
+                : ' | all deps present';
+            if (deck.connected) {
+                return { message: `already connected to ${deck.port} (build ${build})${health}` };
+            }
             if (!connect()) {
                 return {
                     message: 'no mosaico-deck data port found: the board must be running '
@@ -1090,7 +1161,7 @@ export function apply(ctx) {
                         + '/dev/cu.usbmodem* nodes; the higher node of the pair is used',
                 };
             }
-            return { message: `connected to ${deck.port} (build ${build})` };
+            return { message: `connected to ${deck.port} (build ${build})${health}` };
         },
         presentCall: () => ({ card: 'generic', kind: 'read', title: 'Connect to device' }),
     }));
@@ -1323,6 +1394,8 @@ export function apply(ctx) {
 
     ctx.logger?.info?.(
         `mosaico-deck: build=${build} python=${checkEnvironment().python} `
-        + `port=${findPort() ?? 'none'}`,
+        + `port=${findPort() ?? 'none'} `
+        + `voice=${deps.say && deps.ffmpeg ? 'on' : 'off'} `
+        + `speech-in=${deps.whisper && deps.whisperModel ? 'on' : 'off'}`,
     );
 }

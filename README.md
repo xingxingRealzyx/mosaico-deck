@@ -115,6 +115,45 @@ assistant/message  agent/error
 5. **按键的长按/短按必须一次 Poll 出结果**。拆成两个函数会让它们共用同一份去抖
    状态互相踩，双双失灵。
 
+## PC 端依赖
+
+**这块板子本身不需要 PC 就能显示**（烧好固件就亮）。但插件是在 PC 上渲染和发声的，
+所以运行插件需要下面这些。缺了不会崩，而是"面板空白""喇叭不响"这类难查的症状 ——
+所以先跑一次自检，它会直接告诉你缺什么：
+
+```bash
+./check-deps.sh      # 检查
+./install-deps.sh    # 安装（macOS 用 brew/pip；其他平台会打印该装什么）
+```
+
+| 依赖 | 用途 | 必需 | 平台 |
+|---|---|---|---|
+| Python 3 + Pillow | 渲染界面（`plugin/render.py`） | **是** | 跨平台 |
+| ffmpeg | 语音编解码（朗读与语音输入都要） | 否 | 跨平台 |
+| `say` | 语音合成 | 否 | **仅 macOS** |
+| whisper.cpp（`whisper-cli`）+ 模型 | 语音转文字（按键说话） | 否 | 跨平台 |
+
+没有可选依赖时会优雅降级，并且**在启动日志和 `deck_connect` 的返回里说明缺了什么**，
+不会静默失效：
+
+- 缺 ffmpeg / `say` → 不朗读，日志里说明一次
+- 缺 whisper / 模型 → 按住说话时面板显示"需要 whisper"，不做无用的识别
+
+模型放 `~/.cache/whisper/ggml-small.bin`（约 465MB），可用 `DECK_WHISPER_MODEL`
+指定别处；`DECK_WHISPER` 可以换用别的 whisper.cpp 可执行文件。
+
+### 平台支持
+
+| | 显示 | 语音播报 | 按键说话 |
+|---|---|---|---|
+| macOS | ✓ | ✓（`say`） | ✓ |
+| Linux | ✓ | ✗ 需自己接一个 TTS（如 espeak-ng） | ✓ |
+| Windows | 未验证 | 未验证 | 未验证 |
+
+**目前只在 macOS 上开发和实测过。** 代码里平台相关的部分集中在两处：`plugin/lib/tts.js`
+里的 `say`，以及 `plugin/lib/device.js` 里的串口节点匹配（`/dev/cu.usbmodem*`）。
+移植的难点主要在后者——不同系统的串口命名与"控制口 vs 数据口"的配对方式不一样。
+
 ## 烧录
 
 ```bash

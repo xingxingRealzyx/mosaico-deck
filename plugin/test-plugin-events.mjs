@@ -30,6 +30,8 @@ if (!fs.existsSync(DSH_MODULES)) {
 
 // Watch the picture expiry for real, in milliseconds rather than ten seconds.
 process.env.DECK_IMAGE_HOLD_MS = '300';
+// 语音/转写相关的断言不应取决于跑测试的机器装没装 say/ffmpeg/whisper
+process.env.DECK_ASSUME_DEPS = '1';
 process.env.DECK_ANNOUNCE_MS = '0';     // 让"回合结束播报"立即满足条件
 process.env.DECK_SPEAK_GAP_MS = '0';    // 也不要因为刚说过话而被间隔挡住
 

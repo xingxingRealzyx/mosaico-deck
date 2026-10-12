@@ -22,6 +22,11 @@ const SCRIPT = path.join(HERE, '..', 'render.py');
 
 const CANDIDATES = [
     // the one bundled with DSH (first choice: Pillow is guaranteed to be there)
+    // Candidates in order. The DeepSeek Harness bundles a Python that already has
+    // Pillow, which is the easiest path for someone running this as a DSH plugin -- but
+    // it is one candidate among several, not a requirement: a plain `python3` with
+    // Pillow installed works just as well, which is what a user of this repository on
+    // any other setup will have. See ./check-deps.sh
     process.env.DSH_PYTHON,
     '/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3',
     // the virtualenv used during development
