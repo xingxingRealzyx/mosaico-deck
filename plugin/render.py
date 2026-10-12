@@ -240,8 +240,8 @@ def pack_items(items, f, max_w):
 def draw_stats(d, job):
     """Two lines of session numbers pinned to the bottom. Returns the height used.
 
-    Nothing here is invented: the window comes from the host's `request/context`
-    session event and the counts from `assistant/message`'s usage field.
+    Nothing here is invented: the numbers come from the host's own session projections
+    (contextPressure / tokenUsage / sessionStats), read by the plugin.
     """
     s = job.get("stats") or {}
     context = int(s.get("context") or 0)

@@ -30,6 +30,8 @@ if (!fs.existsSync(DSH_MODULES)) {
 
 // Watch the picture expiry for real, in milliseconds rather than ten seconds.
 process.env.DECK_IMAGE_HOLD_MS = '300';
+process.env.DECK_ANNOUNCE_MS = '0';     // 让"回合结束播报"立即满足条件
+process.env.DECK_SPEAK_GAP_MS = '0';    // 也不要因为刚说过话而被间隔挡住
 
 // ---------------------------------------------------------------- scratch copy
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deck-events-'));
@@ -49,6 +51,14 @@ export class Deck {
     close() {}
     on() { return this; }
     sendRgb() { globalThis.__frames = (globalThis.__frames || 0) + 1; return 1; }
+}
+`);
+
+fs.writeFileSync(path.join(root, 'lib', 'tts.js'), `
+export async function textToPcm(text) {
+    globalThis.__spoken = globalThis.__spoken || [];
+    globalThis.__spoken.push(text);
+    return Buffer.alloc(4800);          // 50ms 的假 PCM，不用真合成
 }
 `);
 
@@ -121,7 +131,8 @@ check(typeof mod.build === 'string' && mod.build.length === 7,
       `导出 build 指纹：${mod.build}（用来判断进程里跑的是哪份代码）`);
 
 console.log('注册的工具');
-check(registered.length === 5, `5 个工具：${registered.map((t) => t.name).join(', ')}`);
+check(registered.length === 6,
+    `6 个工具：${registered.map((t) => t.name).join(', ')}`);
 check(registered.some((t) => t.name === 'deck_image'), 'deck_image 已注册');
 
 console.log('工具调用 -> 渲染 job');
@@ -235,6 +246,54 @@ await pre('bash', { command: 'echo z' });
 check(job().page === 'status' && job().stats?.context === 0,
     '投影读取抛异常时降级为 0（面板照常绘制，渲染器会自动隐藏空统计条）');
 ctx.sessionProjections.snapshot = snapshotFn;
+
+console.log('语音：关键节点自动出声（不再等模型主动想起来调 deck_speak）');
+check(mod.shouldAnnounce({ voiceOn: true, elapsedMs: 31000, sinceLastMs: 99999,
+                           minMs: 30000, minGapMs: 4000 }),
+    '长回合该播报');
+check(!mod.shouldAnnounce({ voiceOn: true, elapsedMs: 3000, sinceLastMs: 99999,
+                            minMs: 30000, minGapMs: 4000 }),
+    '短回合不播报 —— 3 秒的来回不值得打断房间');
+check(!mod.shouldAnnounce({ voiceOn: false, elapsedMs: 60000, sinceLastMs: 99999,
+                            minMs: 30000, minGapMs: 4000 }),
+    '静音时一律不播报');
+check(!mod.shouldAnnounce({ voiceOn: true, elapsedMs: 60000, sinceLastMs: 100,
+                            minMs: 30000, minGapMs: 4000 }),
+    '刚说过话时不连着说');
+
+globalThis.__spoken = [];
+await fire('agent/error', { error: new Error('连接被拒绝') });
+await new Promise((r) => setTimeout(r, 80));
+check((globalThis.__spoken || []).some((t) => t.includes('出错') && t.includes('连接被拒绝')),
+    `出错会念出来：${JSON.stringify(globalThis.__spoken)}`);
+
+globalThis.__spoken = [];
+await fire('agent/status', { status: 'running' });
+await new Promise((r) => setTimeout(r, 60));   // 让 startedAt 落在过去
+await fire('agent/status', { status: 'idle' });
+await new Promise((r) => setTimeout(r, 80));
+check((globalThis.__spoken || []).length === 1,
+    `足够长的回合结束会播报：${JSON.stringify(globalThis.__spoken)}`);
+
+globalThis.__spoken = [];
+await fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => {});
+await new Promise((r) => setTimeout(r, 60));
+check((globalThis.__spoken || []).length === 0,
+    '普通工具调用不会出声（否则就是噪音）');
+
+console.log('deck_voice 可以静音');
+check(registered.some((t) => t.name === 'deck_voice'), 'deck_voice 已注册');
+globalThis.__spoken = [];
+await fire('agent/error', { error: new Error('静音时的失败') });
+await new Promise((r) => setTimeout(r, 80));
+check((globalThis.__spoken || []).length === 1, '静音前先确认它能说话');
+const voiceTool = registered.find((t) => t.name === 'deck_voice');
+await voiceTool.execute({ enabled: false });
+globalThis.__spoken = [];
+await fire('agent/error', { error: new Error('静音后的失败') });
+await new Promise((r) => setTimeout(r, 80));
+check((globalThis.__spoken || []).length === 0, '关掉之后不再出声');
+await voiceTool.execute({ enabled: true });
 
 for (const dispose of effects) {
     if (typeof dispose === 'function') dispose();

@@ -48,6 +48,7 @@ import { fileURLToPath } from 'node:url';
 
 import { Deck, findPort } from './device.js';
 import { render, checkEnvironment } from './render.js';
+import { textToPcm } from './tts.js';
 
 export const name = 'mosaico-deck';
 // `agents` tells the root conversation from the subagent sessions on the same bus;
@@ -74,6 +75,18 @@ export const build = (() => {
         return 'unknown';
     }
 })();
+
+/**
+ * Should a finished turn be announced out loud?
+ *
+ * Pure and exported so the rule can be tested without a speech synthesiser, and so the
+ * **policy** is readable in one place. Speaking is for the moments you are not looking
+ * at the screen: a turn that ran for half a minute, a failure, a question waiting for
+ * an answer. A three-second exchange is not one of them.
+ */
+export function shouldAnnounce({ voiceOn, elapsedMs, sinceLastMs, minMs, minGapMs }) {
+    return Boolean(voiceOn) && elapsedMs >= minMs && sinceLastMs >= minGapMs;
+}
 
 // Port polling policy: **at most one attempt at startup, then nothing.**
 //
@@ -129,6 +142,7 @@ export function apply(ctx) {
         // Last numbers read from the host's session projections (see readStats), plus
         // the root session they belong to.
         rootSession: null,
+        voiceName: process.env.DECK_VOICE_NAME || undefined,   // macOS voice, e.g. Tingting
         stats: {
             context: 0,       // pressure the compaction threshold is measured against
             contextWindow: 0,
@@ -216,6 +230,39 @@ export function apply(ctx) {
         } finally {
             painting = false;
         }
+    }
+
+    // ---- voice ----------------------------------------------------------------
+    // The board has had a speaker from the beginning and it was never used: speaking
+    // was a tool the model had to remember to call, and it never did. Same lesson as
+    // the screen -- **anything that should happen by itself must be driven by host
+    // events, not by the model's goodwill.**
+    const ANNOUNCE_MIN_MS = Number(process.env.DECK_ANNOUNCE_MS || 30000);
+    // Both are env-overridable so the tests can watch a real announcement happen in
+    // milliseconds instead of sleeping thirty seconds.
+    const SPEAK_GAP_MS = Number(process.env.DECK_SPEAK_GAP_MS || 4000);
+    let voiceOn = String(process.env.DECK_VOICE || '').toLowerCase() !== 'off';
+    let lastSpokeAt = 0;
+    let speechChain = Promise.resolve();
+
+    /** Queue one utterance.
+     *
+     * **Serialized on purpose**: `speakPcm` paces itself to the playback rate, so two
+     * overlapping utterances would interleave PCM on the wire and come out as noise.
+     */
+    function say(text, { respectGap = false } = {}) {
+        const line = String(text ?? '').replace(/\s+/g, ' ').trim();
+        if (!line || !voiceOn || !deck.connected) return;
+        if (respectGap && Date.now() - lastSpokeAt < SPEAK_GAP_MS) return;
+        speechChain = speechChain.then(async () => {
+            try {
+                const pcm = await textToPcm(line, state.voiceName);
+                lastSpokeAt = Date.now();
+                await deck.speakPcm(pcm);
+            } catch (err) {
+                ctx.logger?.debug?.(`mosaico-deck: speech failed: ${err.message}`);
+            }
+        });
     }
 
     /** Is this the user's own conversation, rather than a subagent's?
@@ -378,6 +425,19 @@ export function apply(ctx) {
             state.target = '';
             state.tool = null;
         } else {
+            // The turn just ended. Announce it only when it was long enough to have
+            // been worth walking away from -- see shouldAnnounce().
+            const elapsed = state.startedAt ? Date.now() - state.startedAt : 0;
+            if (shouldAnnounce({
+                voiceOn,
+                elapsedMs: elapsed,
+                sinceLastMs: Date.now() - lastSpokeAt,
+                minMs: ANNOUNCE_MIN_MS,
+                minGapMs: SPEAK_GAP_MS,
+            })) {
+                const mins = Math.floor(elapsed / 60000);
+                say(mins >= 1 ? `完成，用时 ${mins} 分` : '完成');
+            }
             state.status = 'idle';
             state.tool = null;
         }
@@ -472,6 +532,9 @@ export function apply(ctx) {
         // without switching windows, which is the whole point of the device.
         state.detail = errorText(payload?.error);
         pushLog({ kind: 'error', text: 'error' });
+        // A failure is worth interrupting a room for, and it carries the one piece of
+        // information you cannot get without switching windows.
+        say(state.detail ? `出错。${state.detail}` : '出错', { respectGap: true });
         void paint({ force: true });
     });
 
@@ -652,6 +715,9 @@ export function apply(ctx) {
                 }, { once: true });
             });
 
+            // Read the question out: the whole point of asking on the device is that
+            // the user is not looking at a window.
+            say(String(args.question));
             void paint({ force: true });
             return { answer };
         },
@@ -725,43 +791,28 @@ export function apply(ctx) {
         }),
     }));
 
+    ctx.tools.register(defineTool({
+        name: 'deck_voice',
+        description:
+            'Turn the mosaico-deck speaker on or off. Announcements are automatic -- a '
+            + 'failure, a question waiting for an answer, or a turn that ran long -- so '
+            + 'this is the mute switch, e.g. before a meeting.',
+        parameters: {
+            enabled: { type: 'boolean', description: 'Omit to just report the current state.' },
+        },
+        output: textOutput((v) => v.message),
+        async execute(args) {
+            if (args.enabled !== undefined) voiceOn = Boolean(args.enabled);
+            return {
+                message: `voice ${voiceOn ? 'on' : 'off'}`
+                    + (deck.connected ? '' : ' (device not connected)'),
+            };
+        },
+        presentCall: () => ({ card: 'generic', kind: 'read', title: 'Deck voice' }),
+    }));
+
     ctx.logger?.info?.(
         `mosaico-deck: build=${build} python=${checkEnvironment().python} `
         + `port=${findPort() ?? 'none'}`,
     );
-}
-
-/** Synthesize speech into the PCM format the board expects.
- *
- * TTS lives on the PC on purpose: the board has 512 KB of SRAM and no neural
- * acceleration, so it cannot run any real TTS. macOS say is high quality and
- * speaks Chinese out of the box. The board only plays the samples.
- *
- * Output must be 48 kHz interleaved stereo 16-bit, matching the I2S/codec
- * configuration in components/audio.
- */
-async function textToPcm(text, voice) {
-    const { execFile } = await import('node:child_process');
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const fs = await import('node:fs');
-    const { promisify } = await import('node:util');
-    const run = promisify(execFile);
-
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deck-'));
-    const aiff = path.join(dir, 't.aiff');
-    const pcm = path.join(dir, 't.pcm');
-    try {
-        const sayArgs = ['-o', aiff];
-        if (voice) sayArgs.push('-v', voice);
-        sayArgs.push(text);
-        await run('say', sayArgs, { timeout: 60000 });
-        await run('ffmpeg', [
-            '-y', '-loglevel', 'error', '-i', aiff,
-            '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '48000', '-ac', '2', pcm,
-        ], { timeout: 60000 });
-        return fs.readFileSync(pcm);
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
 }
