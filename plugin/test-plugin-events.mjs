@@ -94,20 +94,27 @@ const ctx = {
     agents: { roots: () => [{ session: ROOT_SESSION }] },
     // The host folds the session numbers itself; the plugin only reads them. Real
     // projection names, with values shaped like the real ones.
+    // Mirrors the host: `snapshot` exposes only client-visible units (contextPressure has
+    // a wire face), while tokenUsage / sessionStats are state-only and are reachable
+    // through the checkpoint read face. Getting this wrong is what left the strip showing
+    // a ring and nothing else.
     sessionProjections: {
         snapshot: (session) => ({
             asOfSeq: 1,
-            values: session === ROOT_SESSION ? {
-                contextPressure: { pressureTokens: 625830, contextWindow: 1000000,
-                                   surfaceTokens: 481943 },
-                tokenUsage: { totals: { uncachedInputTokens: 574196,
-                                        outputTokens: 398731,
-                                        cacheReadTokens: 141789056,
-                                        cacheWriteTokens: 0 } },
-                sessionStats: { turns: 16, steps: 389, llmMs: 2693785, toolMs: 4616652,
-                                ttftMs: 760550, decodeMs: 1933235, decodeTokens: 398731 },
-            } : {},
+            values: session === ROOT_SESSION
+                ? { contextPressure: { pressureTokens: 625830, contextWindow: 1000000,
+                                       surfaceTokens: 481943 } }
+                : {},
         }),
+        checkpoint: (session) => ({ session }),
+        viewCheckpoint: (cp) => (cp?.session === ROOT_SESSION ? {
+            tokenUsage: { totals: { uncachedInputTokens: 574196,
+                                    outputTokens: 398731,
+                                    cacheReadTokens: 141789056,
+                                    cacheWriteTokens: 0 } },
+            sessionStats: { turns: 16, steps: 389, llmMs: 2693785, toolMs: 4616652,
+                            ttftMs: 760550, decodeMs: 1933235, decodeTokens: 398731 },
+        } : {}),
     },
     on: (ev, fn) => {
         if (!listeners.has(ev)) listeners.set(ev, []);
@@ -253,11 +260,15 @@ check(job().stats?.turn === 16, '根会话仍由 agents.roots() 决定，子代�
 
 // 投影服务不可用时必须降级，而不是把面板搞崩。
 const snapshotFn = ctx.sessionProjections.snapshot;
+const checkpointFn = ctx.sessionProjections.checkpoint;
 ctx.sessionProjections.snapshot = () => { throw new Error('projection offline'); };
+ctx.sessionProjections.checkpoint = () => { throw new Error('projection offline'); };
 await pre('bash', { command: 'echo z' });
-check(job().page === 'status' && job().stats?.context === 0,
-    '投影读取抛异常时降级为 0（面板照常绘制，渲染器会自动隐藏空统计条）');
+check(job().page === 'status' && job().stats?.context === 625830,
+    `投影读取抛异常时不崩、也**不清零**，保留上次读数（context 仍是 ${job().stats?.context}）`);
+check(job().stats?.cacheHit === 100, '缓存命中同样保留，不会因为一次读失败就消失');
 ctx.sessionProjections.snapshot = snapshotFn;
+ctx.sessionProjections.checkpoint = checkpointFn;
 
 console.log('语音：关键节点自动出声（不再等模型主动想起来调 deck_speak）');
 check(mod.shouldAnnounce({ voiceOn: true, elapsedMs: 31000, sinceLastMs: 99999,
@@ -308,10 +319,14 @@ check((globalThis.__spoken || []).length === 0, '关掉之后不再出声');
 await voiceTool.execute({ enabled: true });
 
 console.log('控制中心：顶部下拉打开 / 拖动滑块 / 点空白关闭');
-const touch = (ev, x, y) => globalThis.__deck.emit('event', { t: 'touch', ev, x, y });
+// **`up` carries no coordinates** -- that is the real firmware payload, and reading
+// `ev.y` off it is why the pull-down never fired.
+const touch = (ev, x, y) => globalThis.__deck.emit('event',
+    ev === 'up' ? { t: 'touch', ev } : { t: 'touch', ev, x, y });
 touch('down', 200, 30);
-touch('move', 200, 70);
-touch('up', 200, 140);
+touch('move', 200, 70);      // 真机上手指是连续移动的，move 会一路跟到抬手处
+touch('move', 200, 150);
+touch('up');
 await new Promise((r) => setTimeout(r, 60));
 check(job().page === 'panel', `从顶部下拉会打开控制中心（page=${job().page}）`);
 check(job().levels?.volume === 85, `面板带着当前档位：音量 ${job().levels?.volume}%`);
@@ -321,7 +336,7 @@ check(job().levels?.volume === 85, `面板带着当前档位：音量 ${job().le
 globalThis.__ctrl = [];
 touch('down', 100, 190);          // 音量滑块那一行
 touch('move', 240, 190);          // 拖到中间
-touch('up', 240, 190);
+touch('up');
 await new Promise((r) => setTimeout(r, 60));
 const vol = job().levels?.volume;
 check(vol >= 45 && vol <= 55, `拖动滑块把音量调到 ${vol}%`);
@@ -332,6 +347,12 @@ globalThis.__ctrl = [];
 touch('down', 240, 430);          // 滑块之外
 await new Promise((r) => setTimeout(r, 60));
 check(job().page === 'status', '点空白处关闭面板');
+
+// 只有 down + up、中间没有 move 时不能算下拉（否则一次顶部轻点就会弹出面板）
+globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 200, y: 20 });
+globalThis.__deck.emit('event', { t: 'touch', ev: 'up' });
+await new Promise((r) => setTimeout(r, 60));
+check(job().page === 'status', '顶部轻点（没有拖动）不会弹出面板');
 
 console.log('deck_control / deck_panel');
 check(registered.some((t) => t.name === 'deck_control'), 'deck_control 已注册');

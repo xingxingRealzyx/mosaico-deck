@@ -338,8 +338,22 @@ export function apply(ctx) {
         const snapshot = session && ctx.sessionProjections?.snapshot;
         if (!snapshot) return state.stats;
         try {
-            const { values } = ctx.sessionProjections.snapshot(session,
-                ['contextPressure', 'tokenUsage', 'sessionStats']);
+            // **Two read faces, on purpose.** `snapshot()` returns only the
+            // *client-visible* units, and `tokenUsage` / `sessionStats` are registered
+            // state-only (no `wire` face) -- which is exactly why the strip used to show
+            // the context ring and nothing else. The state side is reachable through the
+            // checkpoint read face instead.
+            const keys = ['contextPressure', 'tokenUsage', 'sessionStats'];
+            const values = { ...(ctx.sessionProjections.snapshot(session, keys)?.values ?? {}) };
+            try {
+                const checkpoint = ctx.sessionProjections.checkpoint?.(session);
+                if (checkpoint) {
+                    Object.assign(values, ctx.sessionProjections
+                        .viewCheckpoint?.(checkpoint, keys) ?? {});
+                }
+            } catch (err) {
+                ctx.logger?.debug?.(`mosaico-deck: checkpoint read failed: ${err.message}`);
+            }
             const pressure = values?.contextPressure ?? {};
             const totals = values?.tokenUsage?.totals ?? {};
             const stats = values?.sessionStats ?? {};
@@ -348,23 +362,31 @@ export function apply(ctx) {
             const uncached = numOr0(totals.uncachedInputTokens);
             const cacheRead = numOr0(totals.cacheReadTokens);
             const read = uncached + cacheRead;
-            return {
+            // **Never zero a number just because this read did not carry it.** A
+            // projection that is briefly absent would otherwise blank the whole line.
+            const keep = (next, previous) => (next > 0 ? next : (previous ?? 0));
+            const next = {
                 // Matches the Harness UI exactly (`contextOccupancy`): it prefers
                 // projectedTokens and falls back to pressureTokens, and the renderer
                 // clamps the ratio to 100 the same way. The panel and the window must
                 // never disagree about how full the context is.
-                context: numOr0(pressure.projectedTokens ?? pressure.pressureTokens),
-                contextWindow: numOr0(pressure.contextWindow),
-                input: uncached,
-                output: numOr0(totals.outputTokens),
+                context: keep(numOr0(pressure.projectedTokens ?? pressure.pressureTokens),
+                              state.stats.context),
+                contextWindow: keep(numOr0(pressure.contextWindow), state.stats.contextWindow),
+                input: keep(uncached, state.stats.input),
+                output: keep(numOr0(totals.outputTokens), state.stats.output),
                 // Share of the prompt that came from cache. Computed here, against
                 // uncached+cached: dividing by the uncached half alone yields absurd
                 // percentages once caching works (this session reads 99.6%).
-                cacheHit: read > 0 ? Math.round(100 * cacheRead / read) : 0,
-                tokensPerSecond: decodeMs > 0 ? (decodeTokens / decodeMs) * 1000 : 0,
-                turn: numOr0(stats.turns),
-                steps: numOr0(stats.steps),
+                cacheHit: read > 0 ? Math.round(100 * cacheRead / read) : (state.stats.cacheHit ?? 0),
+                tokensPerSecond: decodeMs > 0
+                    ? (decodeTokens / decodeMs) * 1000
+                    : (state.stats.tokensPerSecond ?? 0),
+                turn: keep(numOr0(stats.turns), state.stats.turn),
+                steps: keep(numOr0(stats.steps), state.stats.steps),
             };
+            state.stats = next;
+            return next;
         } catch {
             return state.stats;   // a projection that is missing is not an error
         }
@@ -421,6 +443,10 @@ export function apply(ctx) {
     const PULL_EDGE = 60;      // a pull has to start within this many px of the top
     const PULL_DIST = 70;      // ... and travel this far before the panel opens
     let touchStart = null;
+    // **The firmware's `up` event carries no coordinates** (`{"t":"touch","ev":"up"}`),
+    // so a gesture measured on the release event reads `undefined.y` and never fires.
+    // The last position seen on `down`/`move` is what the release is judged against.
+    let lastTouch = null;
     let dragging = null;       // 'volume' | 'brightness' while a slider is held
     let lastCtrlAt = 0;
 
@@ -456,6 +482,7 @@ export function apply(ctx) {
         if (ev.t === 'touch') {
             if (ev.ev === 'down') {
                 touchStart = { x: ev.x, y: ev.y };
+                lastTouch = { x: ev.x, y: ev.y };
                 if (state.panel) {
                     const hit = panelHits.find((h) => ev.x >= h.x - 10
                         && ev.x <= h.x + h.w + 10 && ev.y >= h.y - 10
@@ -469,14 +496,16 @@ export function apply(ctx) {
                     return;
                 }
             } else if (ev.ev === 'move') {
+                lastTouch = { x: ev.x, y: ev.y };
                 if (state.panel && dragging) {
                     const hit = panelHits.find((h) => String(h.value) === dragging);
                     if (hit) levelFromX(hit, ev.x);
                 }
                 return;
             } else if (ev.ev === 'up') {
+                const releaseY = lastTouch ? lastTouch.y : touchStart?.y;
                 if (!state.panel && touchStart && touchStart.y <= PULL_EDGE
-                    && ev.y - touchStart.y >= PULL_DIST) {
+                    && releaseY !== undefined && releaseY - touchStart.y >= PULL_DIST) {
                     setPanel(true);
                 } else if (dragging) {
                     // The throttled stream may have dropped the final value.
@@ -484,6 +513,7 @@ export function apply(ctx) {
                 }
                 dragging = null;
                 touchStart = null;
+                lastTouch = null;
                 return;
             }
         }
