@@ -51,6 +51,13 @@ uint16_t g_dummy_band[fluidbox::config::kBandPixels];
 // bandwidth is unchanged by this -- it is read once per commit, not continuously.
 uint16_t* g_frame_buf = nullptr;
 
+// How much is pushed in one transfer. **Not the whole frame**: a 460 KB transfer is a
+// long DMA chain and the queue rejected it in practice (`spi transmit (queue) color
+// failed` right after a reconnect, i.e. on the first full-screen commit). Four bands is
+// 115 KB -- still 4 transfers for a whole screen instead of 16, each one atomic, and the
+// total time on the bus is unchanged because it is the same number of pixels.
+constexpr int kCommitChunkBands = 4;
+
 // Which bands have been staged since the last commit -- **a bitmap, not a span.**
 //
 // A span (min..max) is wrong here and the symptom is severe: the PC sends a *diff*, so
@@ -226,7 +233,7 @@ esp_err_t Panel::Init() {
     // with the rest left black -- and because the PC diffs against what it already sent,
     // those rows were never sent again.
     bus_config.max_transfer_sz =
-        fluidbox::config::kLcdHRes * fluidbox::config::kLcdVRes * sizeof(uint16_t);
+        kCommitChunkBands * fluidbox::config::kBandPixels * sizeof(uint16_t);
     ESP_RETURN_ON_ERROR(spi_bus_initialize(static_cast<spi_host_device_t>(kLcdHost),
                                            &bus_config, SPI_DMA_CH_AUTO),
                         kTag, "spi bus init failed");
@@ -424,14 +431,21 @@ esp_err_t Panel::CommitFrame() {
         while (run < fluidbox::config::kBandCount && (mask & (1u << run)) != 0) {
             run++;
         }
-        const int y0 = band * fluidbox::config::kBandRows;
-        const int y1 = run * fluidbox::config::kBandRows;
-        err = esp_lcd_panel_draw_bitmap(
-            static_cast<esp_lcd_panel_handle_t>(panel_), 0, y0,
-            fluidbox::config::kLcdHRes, y1,
-            g_frame_buf + static_cast<size_t>(y0) * fluidbox::config::kLcdHRes);
-        if (err != ESP_OK) {
-            break;
+        for (int b = band; b < run; b += kCommitChunkBands) {
+            const int upto = (b + kCommitChunkBands < run) ? b + kCommitChunkBands : run;
+            const int y0 = b * fluidbox::config::kBandRows;
+            const int y1 = upto * fluidbox::config::kBandRows;
+            err = esp_lcd_panel_draw_bitmap(
+                static_cast<esp_lcd_panel_handle_t>(panel_), 0, y0,
+                fluidbox::config::kLcdHRes, y1,
+                g_frame_buf + static_cast<size_t>(y0) * fluidbox::config::kLcdHRes);
+            if (err != ESP_OK) {
+                // Loud on purpose: a failed push means rows on screen stay stale, and the
+                // PC will not send them again (it diffs against what it already sent).
+                ESP_LOGE(kTag, "commit rows %d..%d failed: %s", y0, y1,
+                         esp_err_to_name(err));
+                return err;
+            }
         }
         band = run;
     }
