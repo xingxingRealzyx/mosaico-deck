@@ -92,6 +92,10 @@ const pre = (name, args) => fire('tools/pre-execute', { name, arguments: args },
 const reply = (text) => fire('session/event', null,
     { type: 'assistant/message', message: { content: [{ type: 'text', text }] } });
 
+console.log('构建指纹');
+check(typeof mod.build === 'string' && mod.build.length === 7,
+      `导出 build 指纹：${mod.build}（用来判断进程里跑的是哪份代码）`);
+
 console.log('注册的工具');
 check(registered.length === 5, `5 个工具：${registered.map((t) => t.name).join(', ')}`);
 check(registered.some((t) => t.name === 'deck_image'), 'deck_image 已注册');

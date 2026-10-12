@@ -41,13 +41,37 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
+import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { Deck, findPort } from './device.js';
 import { render, checkEnvironment } from './render.js';
 
 export const name = 'mosaico-deck';
 export const inject = ['tools'];
+
+/** Short hash of this very file, reported at load and by deck_connect.
+ *
+ * Why it exists: **editing the plugin's JavaScript does not take effect until the
+ * Harness process restarts.** Node caches ES modules by URL for the life of the
+ * process, so unloading and re-applying the bundle re-runs apply() on the *cached*
+ * old module -- the port reconnects, the tools re-register, and nothing looks wrong
+ * while the new code silently never runs. That cost a confusing round of "the panel
+ * still shows no image" debugging.
+ *
+ * With this stamp, "which build is live?" is one deck_connect away instead of a guess.
+ */
+export const build = (() => {
+    try {
+        const self = fileURLToPath(import.meta.url);
+        return crypto.createHash('sha256').update(fsSync.readFileSync(self))
+            .digest('hex').slice(0, 7);
+    } catch {
+        return 'unknown';
+    }
+})();
 
 // Port polling policy: **at most one attempt at startup, then nothing.**
 //
@@ -364,7 +388,7 @@ export function apply(ctx) {
         parameters: {},
         output: textOutput((v) => v.message),
         async execute() {
-            if (deck.connected) return { message: 'already connected' };
+            if (deck.connected) return { message: `already connected to ${deck.port} (build ${build})` };
             if (!connect()) {
                 return {
                     message: 'no mosaico-deck data port found: the board must be running '
@@ -372,7 +396,7 @@ export function apply(ctx) {
                         + '/dev/cu.usbmodem* nodes; the higher node of the pair is used',
                 };
             }
-            return { message: `connected to ${deck.port}` };
+            return { message: `connected to ${deck.port} (build ${build})` };
         },
         presentCall: () => ({ card: 'generic', kind: 'read', title: 'Connect to device' }),
     }));
@@ -531,7 +555,8 @@ export function apply(ctx) {
     }));
 
     ctx.logger?.info?.(
-        `mosaico-deck: python=${checkEnvironment().python} port=${findPort() ?? 'none'}`,
+        `mosaico-deck: build=${build} python=${checkEnvironment().python} `
+        + `port=${findPort() ?? 'none'}`,
     );
 }
 
