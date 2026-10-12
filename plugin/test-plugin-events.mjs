@@ -95,7 +95,8 @@ const ctx = {
                                         outputTokens: 398731,
                                         cacheReadTokens: 141789056,
                                         cacheWriteTokens: 0 } },
-                sessionStats: { turns: 16, steps: 389, llmMs: 2693785, toolMs: 4616652 },
+                sessionStats: { turns: 16, steps: 389, llmMs: 2693785, toolMs: 4616652,
+                                ttftMs: 760550, decodeMs: 1933235, decodeTokens: 398731 },
             } : {},
         }),
     },
@@ -224,6 +225,8 @@ check(st?.cacheHit === 100,
     `缓存命中率 = cacheRead/(uncached+cacheRead)：${st?.cacheHit}%`
     + `（真实值 141789056/(574196+141789056) 也是 100%）`);
 check(st?.turn === 16 && st?.steps === 389, `轮次/步数来自 sessionStats：${st?.turn}轮 ${st?.steps}步`);
+check(Math.abs((st?.tokensPerSecond ?? 0) - 206.25) < 0.1,
+    `解码速度 = decodeTokens/decodeMs，与 Harness 同口径：${st?.tokensPerSecond?.toFixed(1)} tok/s`);
 
 // 这条是**回归测试**：以前是自己从 assistant/message.usage 累加，而那个字段到不了
 // 监听器，于是底部一直空着。现在数字只有一个口径——投影。

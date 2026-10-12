@@ -181,10 +181,19 @@ check(r.kfmt(950) == "950" and r.kfmt(48213) == "48.2K" and r.kfmt(128000) == "1
       f"紧凑计数：48213 -> {r.kfmt(48213)}，128000 -> {r.kfmt(128000)}，1300000 -> {r.kfmt(1_300_000)}")
 check(r.kfmt(None) == "—" and r.kfmt(-5) == "—", "缺失/负数显示占位符而不是崩")
 
-# 高度必须装得下两行 —— 之前算少了一行，第二行被屏幕边缘切掉（"23 步"直接不见了）。
-last_line_bottom = (r.H - r.STATS_H + 6) + 10 + (r.S_STATS + 8) + r.S_STATS
-check(last_line_bottom <= r.H - 6,
-      f"两行都装得下：最后一行底部 {last_line_bottom}px ≤ {r.H}px")
+# 高度预算。之前这里算少了一行，第二行被屏幕边缘切掉（"23 步"直接不见了），
+# 所以现在把环和文字都量出来。
+stats_top = r.H - r.STATS_H
+ring_bottom = stats_top + 10 + r.RING_R * 2
+# 文字用 anchor="lm" 垂直居中，所以下半高是 S_STATS_LINE//2，不是整行高。
+text_bottom = stats_top + 10 + r.RING_R + 12 + r.S_STATS_LINE // 2
+check(ring_bottom <= r.H - 4,
+      f"进度环装得下：下沿 {ring_bottom}px ≤ {r.H}px")
+check(text_bottom <= r.H - 4,
+      f"环右侧第二行装得下：下沿 {text_bottom}px ≤ {r.H}px")
+check(12 * 2 + r.S_STATS_LINE <= r.RING_R * 2,
+      f"两行文字高度 {12 * 2 + r.S_STATS_LINE}px 不超过环的直径 {r.RING_R * 2}px —— 否则统计条又要变高")
+check(r.STATS_H < 78, f"比两行纯文字那版省空间：{r.STATS_H}px < 78px")
 
 # 宽度同样要装得下。修好纵向之后横向又溢出了（"23 步"被右边切掉），所以
 # 现在改成按优先级装箱，并在这里做一组极端取值的属性断言。
@@ -203,6 +212,8 @@ for label, st, expect in (
         items.append(f"累计 {r.kfmt(st['input'])}/{r.kfmt(st['output'])}")
     if st.get("cacheHit"):
         items.append(f"缓存{st['cacheHit']}%")
+    if st.get("tokensPerSecond"):
+        items.append(f"{r.tpsfmt(st['tokensPerSecond'])}tok/s")
     turns = "".join(x for x in (
         f"{st['turn']}轮" if st.get("turn") else "",
         f"{st['steps']}步" if st.get("steps") else "",

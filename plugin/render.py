@@ -109,7 +109,13 @@ IMG_MAX_H = 250
 # The height is a budget, not a guess: divider + two text lines + a bottom margin. An
 # earlier value clipped the second line at the panel edge ("23 步" simply was not there).
 S_STATS = 20
-STATS_H = 78
+# The context ring replaces two lines of text, so the strip is 20px shorter and the log
+# (or the picture preview) gets that space back.
+RING_R = 23          # radius
+RING_W = 5           # stroke
+S_RING = 16          # percentage inside the ring
+S_STATS_LINE = 19    # two of these fit beside the ring's 46px
+STATS_H = 62
 
 # Every entry is (path, face index inside the file).
 #
@@ -204,19 +210,55 @@ def parse_log(entry):
 
 
 def kfmt(n):
-    """Compact token counts: 950 -> "950", 48213 -> "48.2K", 128000 -> "128K"."""
+    """Format a count the way the Harness UI does (`formatTokens`).
+
+    Aligned deliberately: the same number must not read "1.0M" on the panel and "1M" in
+    Harness. Under 1e3 plain, under 1e6 with a K, above with an M -- and one decimal only
+    while the scaled value is under 100.
+    """
     try:
         n = int(n)
     except (TypeError, ValueError):
         return "—"
     if n < 0:
         return "—"
-    if n < 1000:
+
+    def scaled(v):
+        if v >= 100:
+            return str(int(round(v)))
+        r = round(v * 10) / 10
+        return str(int(r)) if float(r).is_integer() else str(r)
+
+    if n < 1e3:
         return str(n)
-    if n < 1_000_000:
-        # One decimal only while it still adds information: 48.2K, but 128K not 128.0K.
-        return f"{n / 1000:.1f}K" if n < 100_000 else f"{round(n / 1000)}K"
-    return f"{n / 1_000_000:.1f}M" if n < 10_000_000 else f"{round(n / 1_000_000)}M"
+    if n < 1e6:
+        return scaled(n / 1e3) + "K"
+    return scaled(n / 1e6) + "M"
+
+
+def draw_ring(img, cx, cy, radius, pct, color, width=RING_W):
+    """Circular progress for the context occupancy.
+
+    Replaces the "上下文 574K / 1M" text plus its right-aligned "63%": same information,
+    a third of the width, and it reads at a glance from across the desk.
+    """
+    d = ImageDraw.Draw(img)
+    box = (cx - radius, cy - radius, cx + radius, cy + radius)
+    d.arc(box, 0, 360, fill=BORDER, width=width)
+    if pct > 0:
+        d.arc(box, -90, -90 + max(2, round(3.6 * min(pct, 100))), fill=color, width=width)
+    d.text((cx, cy), f"{pct}%", font=font(S_RING), fill=color, anchor="mm")
+
+
+def tpsfmt(v):
+    """Tokens per second, one decimal only while that adds information."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        return ""
+    return f"{v:.0f}" if v >= 100 else f"{v:.1f}"
 
 
 def pack_items(items, f, max_w):
@@ -237,54 +279,63 @@ def pack_items(items, f, max_w):
     return ""
 
 
-def draw_stats(d, job):
-    """Two lines of session numbers pinned to the bottom. Returns the height used.
+def draw_stats(img, d, job):
+    """Context ring plus one packed line of session numbers. Returns the height used.
 
-    Nothing here is invented: the numbers come from the host's own session projections
-    (contextPressure / tokenUsage / sessionStats), read by the plugin.
+    Nothing here is invented: the host folds these into session projections
+    (contextPressure / tokenUsage / sessionStats) and the plugin reads them. The
+    percentage and the number formatting follow the Harness UI exactly, so the panel and
+    the window never disagree.
     """
     s = job.get("stats") or {}
     context = int(s.get("context") or 0)
     if not context:
         return 0
-    top = H - STATS_H + 6
+    top = H - STATS_H
     d.line((28, top, W - 28, top), fill=BORDER, width=1)
     f = font(S_STATS)
-    y = top + 10
 
     window = int(s.get("contextWindow") or 0)
-    head = f"上下文 {kfmt(context)}" + (f" / {kfmt(window)}" if window else "")
-    d.text((28, y), head, font=f, fill=TEXT)
+    cy = top + 10 + RING_R
     if window:
-        pct = min(999, round(100 * context / window))
-        # Warn as the window fills: that is when the host starts compacting.
-        d.text((W - 28, y), f"{pct}%", font=f,
-               fill=WARN if pct >= 80 else TEXT_SOFT, anchor="ra")
+        pct = min(100, round(100 * context / window))
+        draw_ring(img, 28 + RING_R, cy, RING_R, pct, WARN if pct >= 80 else ACCENT)
+        text_x = 28 + RING_R * 2 + 16
+    else:
+        # Without a declared capacity there is no ring to draw -- but the counts below
+        # are still worth showing.
+        text_x = 28
 
-    y += S_STATS + 8
-    # One packed line, most important first. A fixed two-column split was tried and
-    # overflowed silently at large counts.
-    items = []
+    # The ring is 46px tall, so **two** text lines fit beside it without growing the
+    # strip -- which is the only reason all four numbers fit at all. One line was tried
+    # and the packing silently shed the speed and the turn count.
+    f_line = font(S_STATS_LINE)
+    top_items = []
     if s.get("input"):
-        items.append(f"累计 {kfmt(s['input'])}/{kfmt(s['output'])}")
+        top_items.append(f"累计 {kfmt(s['input'])}/{kfmt(s['output'])}")
     if s.get("cacheHit"):
         # Straight from the host's totals. Do **not** recompute it as cacheRead/input:
         # with real caching that divides a huge cached count by the uncached remainder
         # and prints nonsense like "24700%".
-        items.append(f"缓存{s['cacheHit']}%")
-    # Turn and step as one item: they answer one question ("how far along is this"), and
-    # keeping them together is what leaves room for the cache figure too. No spaces
-    # between number and unit -- that is ~20px, which is the difference between fitting
-    # all four items and silently shedding one.
+        top_items.append(f"缓存{s['cacheHit']}%")
+    tps = tpsfmt(s.get("tokensPerSecond"))
+    bottom_items = []
+    if tps:
+        bottom_items.append(f"{tps}tok/s")
     turns = "".join(x for x in (
         f"{s['turn']}轮" if s.get("turn") else "",
         f"{s['steps']}步" if s.get("steps") else "",
     ) if x)
     if turns:
-        items.append(turns)
-    line = pack_items(items, f, W - 56)
-    if line:
-        d.text((28, y), line, font=f, fill=TEXT_SOFT)
+        bottom_items.append(turns)
+
+    width = W - text_x - 28
+    line1 = pack_items(top_items, f_line, width)
+    line2 = pack_items(bottom_items, f_line, width)
+    if line1:
+        d.text((text_x, cy - 12), line1, font=f_line, fill=TEXT_SOFT, anchor="lm")
+    if line2:
+        d.text((text_x, cy + 12), line2, font=f_line, fill=TEXT_SOFT, anchor="lm")
     return STATS_H
 
 
@@ -386,7 +437,7 @@ def draw_status(d, img, job):
         f_cap = font(S_FOOTER)
         d.text((28, py + used + 12), fit(" · ".join(bits), f_cap, W - 56),
                font=f_cap, fill=ERR if err else TEXT_SOFT)
-        draw_stats(d, job)
+        draw_stats(img, d, job)
         return
 
     progress = job.get("progress")
@@ -426,7 +477,7 @@ def draw_status(d, img, job):
                    fill=TEXT_SOFT)
             ly += step
 
-    draw_stats(d, job)
+    draw_stats(img, d, job)
 
 
 def draw_buttons(d, job):

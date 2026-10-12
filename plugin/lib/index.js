@@ -149,6 +149,7 @@ export function apply(ctx) {
             input: 0,
             output: 0,
             cacheHit: 0,
+            tokensPerSecond: 0,
             turn: 0,
             steps: 0,
         },
@@ -317,13 +318,17 @@ export function apply(ctx) {
             const pressure = values?.contextPressure ?? {};
             const totals = values?.tokenUsage?.totals ?? {};
             const stats = values?.sessionStats ?? {};
+            const decodeMs = numOr0(stats.decodeMs);
+            const decodeTokens = numOr0(stats.decodeTokens);
             const uncached = numOr0(totals.uncachedInputTokens);
             const cacheRead = numOr0(totals.cacheReadTokens);
             const read = uncached + cacheRead;
             return {
-                // "How full is the context" is the pressure the compaction threshold is
-                // measured against -- not the raw surface size.
-                context: numOr0(pressure.pressureTokens),
+                // Matches the Harness UI exactly (`contextOccupancy`): it prefers
+                // projectedTokens and falls back to pressureTokens, and the renderer
+                // clamps the ratio to 100 the same way. The panel and the window must
+                // never disagree about how full the context is.
+                context: numOr0(pressure.projectedTokens ?? pressure.pressureTokens),
                 contextWindow: numOr0(pressure.contextWindow),
                 input: uncached,
                 output: numOr0(totals.outputTokens),
@@ -331,6 +336,7 @@ export function apply(ctx) {
                 // uncached+cached: dividing by the uncached half alone yields absurd
                 // percentages once caching works (this session reads 99.6%).
                 cacheHit: read > 0 ? Math.round(100 * cacheRead / read) : 0,
+                tokensPerSecond: decodeMs > 0 ? (decodeTokens / decodeMs) * 1000 : 0,
                 turn: numOr0(stats.turns),
                 steps: numOr0(stats.steps),
             };
