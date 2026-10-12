@@ -88,11 +88,14 @@ const registered = [];
 const effects = [];
 // The root conversation vs a subagent's session. Usage from the first must be counted
 // and from the second ignored, so the mock registry has to tell them apart.
-const ROOT_SESSION = { who: 'root' };
+const ROOT_AGENT_OBJ = { id: 'root-agent', session: { who: 'root' } };
+const ROOT_AGENT = ROOT_AGENT_OBJ;
+const SUBAGENT_AGENT = { id: 'sub-agent' };
+const ROOT_SESSION = ROOT_AGENT_OBJ.session;
 const SUBAGENT_SESSION = { who: 'subagent' };
 const ctx = {
     tools: { register: (t) => registered.push(t) },
-    agents: { roots: () => [{ session: ROOT_SESSION }] },
+    agents: { roots: () => [ROOT_AGENT_OBJ] },
     // The host folds the session numbers itself; the plugin only reads them. Real
     // projection names, with values shaped like the real ones.
     // Mirrors the host: `snapshot` exposes only client-visible units (contextPressure has
@@ -274,6 +277,25 @@ check(job().page === 'status' && job().stats?.context === 625830,
 check(job().stats?.cacheHit === 100, '缓存命中同样保留，不会因为一次读失败就消失');
 ctx.sessionProjections.snapshot = snapshotFn;
 ctx.sessionProjections.checkpoint = checkpointFn;
+
+console.log('生成过程中显示实时输出（否则整段只有"思考中"）');
+await fire('agent/status', { status: 'running' });
+const stream = (text, type = 'text-delta') => fire('agent/assistant-stream',
+    { agent: ROOT_AGENT, frame: { type: 'chunk', chunk: { type, text } } });
+await new Promise((r) => setTimeout(r, 300));      // 越过 250ms 节流
+await stream('面板上的字');
+check(job().state === 'thinking', '生成中状态是 thinking');
+check((job().detail || '').includes('面板上的字'),
+    `正在生成的文字出现在 detail 行：${JSON.stringify(job().detail)}`);
+await stream('继续写', 'reasoning-delta');
+await new Promise((r) => setTimeout(r, 300));
+check((job().detail || '').includes('继续写'),
+    `reasoning-delta 也显示：${JSON.stringify(job().detail)}`);
+await fire('agent/assistant-stream', { agent: SUBAGENT_AGENT,
+    frame: { type: 'chunk', chunk: { type: 'text-delta', text: '子代理不该出现' } } });
+await new Promise((r) => setTimeout(r, 300));
+check(!(job().detail || '').includes('子代理不该出现'),
+    '子代理的流式输出不会写进主会话面板');
 
 console.log('回合结束：两个独立信号都要能把状态落回 idle');
 // agent/status 走 idle

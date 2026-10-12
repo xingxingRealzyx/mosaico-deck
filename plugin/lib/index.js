@@ -439,6 +439,18 @@ export function apply(ctx) {
         return Number.isFinite(v) ? v : 0;
     }
 
+    /** Same question as isRootSession, for the agent-scoped stream events. */
+    function isRootAgent(agent) {
+        if (!agent) return true;
+        try {
+            const roots = ctx.agents?.roots?.();
+            if (!Array.isArray(roots) || roots.length === 0) return true;
+            return roots.includes(agent);
+        } catch {
+            return true;
+        }
+    }
+
     /** Pull a readable tool name and argument out of a ToolExecution.
      *
      * The exact payload shape is not a contract worth relying on, so probe a
@@ -610,6 +622,7 @@ export function apply(ctx) {
             if (state.status === 'idle' || state.status === 'error') {
                 state.startedAt = Date.now();
                 state.log = [];
+                streamTail = '';       // a new turn starts with an empty stream tail
             }
             state.status = 'thinking';
             state.detail = '';   // not 'Working' -- the label already says 思考中
@@ -705,6 +718,36 @@ export function apply(ctx) {
         } catch {
             /* ignore */
         }
+        void paint();
+    });
+
+    // Live output on the panel -- **this is what fills the 思考中 stretch.**
+    //
+    // A turn is mostly model generation: tools are quick, so before this the detail line
+    // sat empty for the whole of it and the panel said 思考中 and nothing else, which is
+    // exactly what the user reported. The stream is right there on the bus:
+    //
+    //     agent/assistant-stream { agent, frame }                       emit
+    //     frame   = { type: 'chunk', chunk: StreamChunk, turn, step }
+    //     chunk   = { type: 'text-delta' | 'reasoning-delta', text }
+    //
+    // Reasoning deltas are shown too: when a model exposes its thinking, that answers
+    // "what is it doing" far better than the word 思考中.
+    let streamTail = '';
+    let streamPaintedAt = 0;
+    ctx.on('agent/assistant-stream', (payload) => {
+        if (!isRootAgent(payload?.agent)) return;
+        const chunk = payload?.frame?.chunk;
+        if (chunk?.type !== 'text-delta' && chunk?.type !== 'reasoning-delta') return;
+        if (typeof chunk.text !== 'string') return;
+        streamTail = (streamTail + chunk.text).slice(-400);
+        // Chunks arrive per token; the panel cannot and need not keep up with that.
+        const now = Date.now();
+        if (now - streamPaintedAt < 250) return;
+        streamPaintedAt = now;
+        state.status = 'thinking';
+        state.tool = null;
+        state.detail = streamTail.replace(/\s+/g, ' ').trim().slice(-60);
         void paint();
     });
 
