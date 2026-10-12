@@ -112,38 +112,28 @@ band = img.crop((0, 152, r.W, 186)).tobytes()
 n_ink = sum(1 for i in range(0, len(band), 3) if band[i] or band[i + 1] or band[i + 2])
 check(n_ink > 1500, f"目标路径那一行有实际字形（非黑像素 {n_ink}）")
 
-print("彩色 emoji 图标")
-tile = r.emoji("🖥", 28)
-check(tile is not None and tile.height == 28, "emoji 渲染成 28px 高的图块")
-check(r.emoji("", 28) is None, "空字符返回 None 而不是抛异常")
+print("配色只表达状态，不表达工具（emoji + 按工具上色那版被否掉了）")
+for gone in ("emoji", "draw_emoji", "style_for", "STATE_ICONS", "TOOL_STYLES",
+             "LOG_ICONS", "TEXT_FAINT"):
+    check(not hasattr(r, gone), f"图标机制 {gone} 已移除")
 
 
-def spread_of(ch, px=28):
-    t = r.emoji(ch, px)
-    if t is None:
-        return 0
-    raw = t.convert("RGB").tobytes()
-    return max(max(raw[i:i + 3]) - min(raw[i:i + 3]) for i in range(0, len(raw), 3))
+def status_for(tool, state="tool", **kw):
+    im, _ = r.PAGES["status"]({"state": state, "tool": tool, **kw})
+    return im.tobytes()
 
 
-# 挑本身高饱和的 emoji：🖥 是银灰色显示器，通道差本来就小，拿它验"彩色"会误判。
-sat = {ch: spread_of(ch) for ch in ("✅", "🎁", "📖")}
-check(max(sat.values()) > 60,
-      f"emoji 带真实色彩而不是灰度字形（{'  '.join(f'{k}={v}' for k, v in sat.items())}）")
+check(status_for("bash") == status_for("edit"),
+      "同一个状态下，不同工具画出来完全一样（颜色不跟着工具变）")
+check(status_for("bash", state="error") != status_for("bash"),
+      "但状态变了画面就变（颜色确实表达状态）")
+check(status_for("bash", state="done") != status_for("bash", state="error"),
+      "不同状态之间互不相同")
 
-print("工具配色：每个工具家族有自己的图标和颜色")
-for name, want in (("bash", r.OK), ("read", r.BLUE), ("edit", r.WARN),
-                   ("web_search", r.CYAN), ("subagent", r.MAGENTA)):
-    icon, color = r.style_for(name)
-    check(color == want and bool(icon), f"{name} -> {icon} 颜色正确")
-check(r.style_for("read_image")[0] != r.style_for("read")[0],
-      "read_image 与 read 图标不同（按最长键匹配）")
-hues = {r.style_for(t)[1] for t in
-        ("bash", "read", "edit", "glob", "web_search", "subagent", "job")}
-check(len(hues) >= 6, f"至少 6 种不同颜色（实际 {len(hues)}）")
-check(r.style_for("完全没见过的工具")[1] == r.ACCENT, "未知工具回退到默认色")
+print("状态配色表齐全且够亮")
 for st in r.STATE_LABELS:
-    check(bool(r.STATE_ICONS.get(st)), f"状态 {st} 有对应 emoji")
+    check(st in r.STATE_COLORS, f"状态 {st} 有配色")
+check(set(r.STATE_COLORS) == set(r.STATE_LABELS), "状态配色表与文字表一致")
 
 print("图片预览：画在状态页里，**不整屏接管**")
 tmp_img = "/tmp/_deck_test_image.png"

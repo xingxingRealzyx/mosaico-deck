@@ -63,13 +63,6 @@ OK = (90, 236, 172)
 WARN = (255, 200, 110)
 ERR = (255, 120, 145)
 IDLE = (176, 186, 206)
-# Extra hues so each family of tool reads as its own thing at a glance.
-BLUE = (126, 180, 255)
-PURPLE = (190, 154, 255)
-CYAN = (112, 226, 234)
-MAGENTA = (255, 146, 222)
-PINK = (255, 164, 196)
-TEAL = (124, 234, 210)
 
 STATE_COLORS = {
     "idle": IDLE, "thinking": ACCENT, "running": ACCENT, "editing": ACCENT,
@@ -81,44 +74,14 @@ STATE_LABELS = {
     "testing": "跑测试", "waiting": "等你决定", "done": "完成", "error": "出错",
     "failed": "失败", "tool": "调用工具",
 }
-STATE_ICONS = {
-    "idle": "💤", "thinking": "🤔", "running": "🏃", "editing": "✏️",
-    "testing": "🧪", "waiting": "⏳", "done": "✅", "error": "❌",
-    "failed": "❌", "tool": "🔧",
-}
-ICON_TOOL = "🔧"
 
-# Which emoji and colour a tool name gets. Matched by **longest key found inside
-# the name**, so `read_image` beats `read`.
-TOOL_STYLES = {
-    "read_image": ("🖼", PINK),
-    "read": ("📖", BLUE),
-    "write": ("📝", WARN),
-    "edit": ("✏️", WARN),
-    "glob": ("🔍", PURPLE),
-    "grep": ("🔍", PURPLE),
-    "bash": ("🖥", OK),
-    "shell": ("🖥", OK),
-    "pwsh": ("🖥", OK),
-    "web_search": ("🌐", CYAN),
-    "web_fetch": ("🌐", CYAN),
-    "subagent": ("🤖", MAGENTA),
-    "workflow": ("🕸", MAGENTA),
-    "task": ("🤖", MAGENTA),
-    "todo": ("✅", OK),
-    "ask_user": ("❓", WARN),
-    "question": ("❓", WARN),
-    "deck_ask": ("❓", WARN),
-    "deck_speak": ("🔊", TEAL),
-    "deck_image": ("🖼", PINK),
-    "deck_show": ("🖥", ACCENT),
-    "deck_connect": ("🔌", TEAL),
-    "job": ("⚙️", IDLE),
-    "present": ("🎁", PINK),
-    "skill": ("📚", BLUE),
-    "goal": ("🎯", WARN),
-}
-LOG_ICONS = {"tool": None, "reply": "💬", "error": "❌", "done": "✅", "info": None}
+# On icons, and on colouring by tool
+# ----------------------------------
+# Both were tried on the panel and both were rejected: colour emoji read as a toy,
+# and giving each family of tool its own hue turned a quiet status display into a
+# rainbow. The colour here carries **state** -- idle / working / waiting / failed --
+# which is the one thing worth reading from across the room, and nothing else.
+# Which tool is running is already in the detail line, in words.
 
 S_PROJECT = 26
 S_ELAPSED = 24
@@ -155,13 +118,6 @@ _FACES = [("/System/Library/Fonts/Hiragino Sans GB.ttc", 2),
           ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
           ("/Library/Fonts/Arial Unicode.ttf", 0)]
 _font_cache = {}
-
-# Apple's emoji face is a **bitmap** font: it only opens at its own strike sizes and
-# raises "invalid pixel size" for anything else, so a requested size is served by
-# rendering the nearest larger strike and scaling it down.
-_EMOJI_PATH = "/System/Library/Fonts/Apple Color Emoji.ttc"
-_EMOJI_STRIKES = (20, 32, 48, 64, 96, 160)
-_emoji_cache = {}
 
 
 def font(size, mono=False):
@@ -230,59 +186,6 @@ def wrap(text, f, max_w, max_lines=None):
     return lines
 
 
-def emoji(ch, px):
-    """One colour emoji as an RGBA tile `px` tall, or None when unavailable.
-
-    Cached per (character, size): the strike render plus Lanczos downscale costs a
-    few ms and the same dozen icons come back on every frame.
-    """
-    if not ch:
-        return None
-    key = (ch, px)
-    if key in _emoji_cache:
-        return _emoji_cache[key]
-    tile = None
-    if os.path.exists(_EMOJI_PATH):
-        strike = next((s for s in _EMOJI_STRIKES if s >= px), _EMOJI_STRIKES[-1])
-        try:
-            f = ImageFont.truetype(_EMOJI_PATH, strike)
-            box = int(strike * 1.5)
-            big = Image.new("RGBA", (box, box), (0, 0, 0, 0))
-            ImageDraw.Draw(big).text((box // 2, box // 2), ch, font=f,
-                                     embedded_color=True, anchor="mm")
-            bbox = big.getbbox()
-            if bbox:
-                big = big.crop(bbox)
-                w = max(1, round(big.width * px / big.height))
-                tile = big.resize((w, px), Image.LANCZOS)
-        except Exception:
-            tile = None
-    _emoji_cache[key] = tile
-    return tile
-
-
-def draw_emoji(img, ch, x, y, px):
-    """Paste an emoji with its top-left at (x, y). Returns its width (0 if none)."""
-    t = emoji(ch, px)
-    if t is None:
-        return 0
-    img.paste(t, (x, y), t)
-    return t.width
-
-
-def style_for(tool):
-    """(emoji, colour) for a tool name."""
-    if tool:
-        name = str(tool).lower()
-        best = None
-        for key, val in TOOL_STYLES.items():
-            if key in name and (best is None or len(key) > len(best[0])):
-                best = (key, val)
-        if best:
-            return best[1]
-    return ICON_TOOL, ACCENT
-
-
 def parse_log(entry):
     """(kind, text, tool) from either a structured entry or a bare string."""
     if isinstance(entry, dict):
@@ -323,9 +226,9 @@ def draw_image_preview(img, d, path, y):
 def draw_status(d, img, job):
     state = job.get("state", "idle")
     label = job.get("label") or STATE_LABELS.get(state, state)
-    icon, color = STATE_ICONS.get(state, ICON_TOOL), STATE_COLORS.get(state, IDLE)
-    if state == "tool" and job.get("tool"):
-        icon, color = style_for(job["tool"])
+    # The job also carries `tool`, deliberately unused for styling: which tool is
+    # running belongs in words on the detail line, not in a second colour scale.
+    color = STATE_COLORS.get(state, IDLE)
 
     # Header: status dot + project, elapsed time on the right.
     cx, cy, r = 34, 38, 9
@@ -347,12 +250,11 @@ def draw_status(d, img, job):
                                   W - 24 - stamp_w - 24 - (cx + r + 14)),
            font=f_project, fill=TEXT, anchor="lm")
 
-    # State label -- the one thing that must be readable across the room.
+    # State label -- the one thing that must be readable across the room, and the only
+    # place colour is spent.
     y = 84
-    iw = draw_emoji(img, icon, 28, y - 2, S_LABEL - 8)
-    tx = 28 + (iw + 14 if iw else 0)
     f_label = font_for(label, S_LABEL)
-    d.text((tx, y), fit(label, f_label, W - 28 - tx), font=f_label, fill=color)
+    d.text((28, y), fit(label, f_label, W - 56), font=f_label, fill=color)
     y += S_LABEL + 24
 
     # With a picture up, the path and the "Calling x" line are noise -- the caption
@@ -413,19 +315,12 @@ def draw_status(d, img, job):
         room = (floor - ly) // step
         n = max(0, min(len(log), room))
         for entry in (log[-n:] if n else []):
-            kind, text, tool = parse_log(entry)
-            icon = None
-            if kind == "tool" and tool:
-                icon = style_for(tool)[0]
-            else:
-                icon = LOG_ICONS.get(kind)
-            if icon:
-                w = draw_emoji(img, icon, 28, ly - 1, S_LOG + 2)
-                tx = 28 + (w + 12 if w else 0)
-            else:
-                d.text((28, ly), "·", font=f_log, fill=ACCENT)
-                tx = 48
-            d.text((tx, ly), fit(text, f_log, W - tx - 28), font=f_log,
+            kind, text, _tool = parse_log(entry)
+            # Colour on the bullet only -- a failed step is worth spotting in the tail,
+            # everything else stays one shade. No icons: they were tried and rejected.
+            d.text((28, ly), "·", font=f_log,
+                   fill=ERR if kind == "error" else ACCENT)
+            d.text((48, ly), fit(text, f_log, W - 48 - 28), font=f_log,
                    fill=TEXT_SOFT)
             ly += step
 
@@ -479,9 +374,7 @@ def render_ask(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, 4), fill=WARN)
-    iw = draw_emoji(img, "❓", 28, 22, S_ASK_LABEL + 2)
-    d.text((28 + (iw + 10 if iw else 0), 26), "需要你决定",
-           font=font(S_ASK_LABEL), fill=WARN)
+    d.text((28, 26), "需要你决定", font=font(S_ASK_LABEL), fill=WARN)
 
     q = str(job.get("question", ""))
     f_q = font_for(q, S_ASK_Q)
@@ -547,10 +440,9 @@ def render_ask(job):
 def render_boot(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    iw = draw_emoji(img, "🐳", W // 2 - 70, H // 2 - 108, 96)
-    d.text((W // 2, H // 2 + 30), "mosaico-deck", font=font(S_BOOT), fill=TEXT,
+    d.text((W // 2, H // 2 - 30), "mosaico-deck", font=font(S_BOOT), fill=TEXT,
            anchor="mm")
-    d.text((W // 2, H // 2 + 74), "等待 Harness…", font=font(S_ASK_LABEL),
+    d.text((W // 2, H // 2 + 28), "等待 Harness…", font=font(S_ASK_LABEL),
            fill=TEXT_SOFT, anchor="mm")
     return img, []
 
