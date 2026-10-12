@@ -271,17 +271,22 @@ print("控制中心")
 panel, panel_hits = r.PAGES["panel"]({"page": "panel",
                                       "levels": {"volume": 85, "brightness": 35}})
 check(panel.size == (r.W, r.H), "面板画得出来")
-check([h["value"] for h in panel_hits] == ["volume", "brightness"],
-      f"两个滑块各有热区：{[h['value'] for h in panel_hits]}")
+check([h["value"] for h in panel_hits] == ["close", "volume", "brightness"],
+      f"✕ 在最前，两条滑块随后：{[h['value'] for h in panel_hits]}")
 check(all(h["x"] >= 0 and h["x"] + h["w"] <= r.W and h["y"] + h["h"] <= r.H
           for h in panel_hits), "热区都在屏内")
 check(all(h["h"] >= 44 for h in panel_hits),
       f"热区高度够手指点：{[h['h'] for h in panel_hits]}")
-check(all(abs(h["x"] - 20) < 2 and abs(h["w"] - (r.W - 40)) < 2 for h in panel_hits),
-      "热区横跨整行（左边留一点余量给手指）")
+sliders = [h for h in panel_hits if h["value"] != "close"]
+check(all(abs(h["x"] - 20) < 2 and abs(h["w"] - (r.W - 40)) < 2 for h in sliders),
+      "两条滑块的热区横跨整行（左边留一点余量给手指）")
+close = [h for h in panel_hits if h["value"] == "close"][0]
+check(close["x"] > r.W * 0.7 and close["y"] < 100,
+      f"✕ 在右上角：x={close['x']} y={close['y']}")
+check(close["w"] >= 44 and close["h"] >= 44, f"✕ 热区够手指点：{close['w']}x{close['h']}")
 # 桩里写死的 y 必须和真实几何一致，否则触摸会命中不到。
-check([h["y"] for h in panel_hits] == [160, 300],
-      f"热区位置与测试桩一致：{[h['y'] for h in panel_hits]}")
+check([h["y"] for h in sliders] == [160, 300],
+      f"滑块热区位置与测试桩一致：{[h['y'] for h in sliders]}")
 
 def strip_ink(im, y, h=14):
     band = im.crop((0, y, r.W, y + h)).tobytes()

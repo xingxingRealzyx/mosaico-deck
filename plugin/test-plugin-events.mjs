@@ -76,13 +76,15 @@ export function checkEnvironment() { return { python: 'stub', script: 'stub', ex
 export function render(job) {
     globalThis.__jobs = globalThis.__jobs || [];
     globalThis.__jobs.push(JSON.parse(JSON.stringify(job)));
+    // Any throw in here must surface: it used to be swallowed into "the hit list is
+    // empty", which reads as a plugin bug and sent me hunting in the wrong file.
     // The touch handler hit-tests whatever the renderer last reported, so the stub has to
     // return the panel's real rows -- an empty list makes the panel untouchable here.
     // render.py owns the geometry and plugin/test_render_layout.py pins these numbers.
     const hits = job.page === 'panel'
         ? [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
            { x: 20, y: 300, w: 440, h: 54, value: 'brightness' },
-           { x: W_CLOSE_X, y: 10, w: 64, h: 64, value: 'close', kind: 'close' }]
+           { x: 408, y: 10, w: 64, h: 64, value: 'close', kind: 'close' }]
         : (job.replies || []).map((c, i, all) => ({
             x: 28 + i * (140 + 10), y: 360, w: 140, h: 46,
             value: c.text, kind: c.kind }));
@@ -492,7 +494,7 @@ check(job().page === 'status', '向下滑也能关闭（不只是向上）');
 
 await openPanel();
 check(job().page === 'panel', '再打开一次');
-await new Promise((r) => setTimeout(r, 2300));   // 超过注入的 2000ms 空闲关闭
+await new Promise((r) => setTimeout(r, 3500));   // 跨过 2000ms 阈值 + 一个 tick 周期
 check(job().page === 'status', '放着不动会自动关闭（不可能卡住）');
 
 console.log('快捷回复：内容随状态变化，点一下就生效');
@@ -511,7 +513,9 @@ globalThis.__cancels = [];
 globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 60, y: 380 });
 await new Promise((r) => setTimeout(r, 80));
 check((globalThis.__cancels || []).length === 1,
-    `点"停下"走的是会话中断而不是发消息：${JSON.stringify(globalThis.__cancels)}`);
+    `点"停下"走的是会话中断：cancels=${JSON.stringify(globalThis.__cancels)} `
+    + `prompts=${JSON.stringify(globalThis.__prompts)} `
+    + `replies=${JSON.stringify(job().replies)} page=${job().page}`);
 check((globalThis.__prompts || []).length === 0,
     '"停下"不会作为一条消息发给模型（那等于让它做完再读到"停下"）');
 // 回到空闲，测"继续"
