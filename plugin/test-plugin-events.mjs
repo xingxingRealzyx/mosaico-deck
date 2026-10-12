@@ -87,7 +87,8 @@ export function render(job) {
     if (job.page === 'panel') {
         hits = [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
                 { x: 20, y: 300, w: 440, h: 54, value: 'brightness' },
-                { x: 408, y: 10, w: 64, h: 64, value: 'close', kind: 'close' }];
+                { x: 408, y: 10, w: 64, h: 64, value: 'close', kind: 'close' },
+                { x: 284, y: 356, w: 178, h: 60, value: 'voice', kind: 'toggle' }];
     } else if (job.page === 'ask') {
         hits = (job.options || []).map((o, i) => ({
             x: 28, y: 260 + i * 80, w: 424, h: 64, value: o }));
@@ -481,6 +482,7 @@ touch('down', 240, 430);          // 收尾：关掉
 await new Promise((r) => setTimeout(r, 60));
 
 console.log('控制中心一定关得掉（三种出口）');
+const setPanelClosedNote = () => {};
 const openPanel = async () => {
     touch('down', 200, 30);
     touch('move', 200, 150);
@@ -560,6 +562,25 @@ globalThis.__deck.emit('ack', { t: 'ack', rec: true });
 globalThis.__deck.emit('key', { t: 'key', ev: 'voice_end' });
 await new Promise((r) => setTimeout(r, 120));
 check(job().state === 'idle', '过短的按压（<50ms）直接回到空闲，不做无用的识别');
+
+console.log('语音开关：下拉栏里能关掉播报');
+await openPanel();
+check(job().voice === true, `默认是开：voice=${job().voice}`);
+globalThis.__spoken = [];
+touch('down', 380, 380);          // 落在开关上
+await new Promise((r) => setTimeout(r, 120));
+check(job().voice === false, `点一下就关：voice=${job().voice}`);
+globalThis.__spoken = [];
+await fire('agent/error', { error: new Error('关掉之后不该播报') });
+await new Promise((r) => setTimeout(r, 120));
+check((globalThis.__spoken || []).length === 0, '关掉之后确实不播报了');
+touch('down', 380, 380);          // 再打开
+await new Promise((r) => setTimeout(r, 200));
+check(job().voice === true, `再点一下打开：voice=${job().voice}`);
+check((globalThis.__spoken || []).some((t) => t.includes('语音已开启')),
+    `打开时用语音本身确认：${JSON.stringify(globalThis.__spoken)}`);
+setPanelClosedNote();
+await openPanel();
 
 console.log('提问镜像到设备：看得到、点得选');
 await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 30 });

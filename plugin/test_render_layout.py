@@ -271,13 +271,20 @@ print("控制中心")
 panel, panel_hits = r.PAGES["panel"]({"page": "panel",
                                       "levels": {"volume": 85, "brightness": 35}})
 check(panel.size == (r.W, r.H), "面板画得出来")
-check([h["value"] for h in panel_hits] == ["close", "volume", "brightness"],
-      f"✕ 在最前，两条滑块随后：{[h['value'] for h in panel_hits]}")
+check([h["value"] for h in panel_hits] == ["close", "volume", "brightness", "voice"],
+      f"顺序：✕、音量、亮度、语音开关 -> {[h['value'] for h in panel_hits]}")
 check(all(h["x"] >= 0 and h["x"] + h["w"] <= r.W and h["y"] + h["h"] <= r.H
           for h in panel_hits), "热区都在屏内")
+toggle = [h for h in panel_hits if h.get("kind") == "toggle"]
+check(len(toggle) == 1, f"有一个语音开关热区：{toggle}")
+check(toggle[0]["h"] >= 44 and toggle[0]["x"] > r.W * 0.5,
+      f"开关热区够大且在下半部右侧：{toggle[0]}")
+on_img, _ = r.PAGES["panel"]({"page": "panel", "levels": {"volume": 50}, "voice": True})
+off_img, _ = r.PAGES["panel"]({"page": "panel", "levels": {"volume": 50}, "voice": False})
+check(on_img.tobytes() != off_img.tobytes(), "开/关两种状态画出来不一样（否则看不出当前状态）")
 check(all(h["h"] >= 44 for h in panel_hits),
       f"热区高度够手指点：{[h['h'] for h in panel_hits]}")
-sliders = [h for h in panel_hits if h["value"] != "close"]
+sliders = [h for h in panel_hits if h["value"] in ("volume", "brightness")]
 check(all(abs(h["x"] - 20) < 2 and abs(h["w"] - (r.W - 40)) < 2 for h in sliders),
       "两条滑块的热区横跨整行（左边留一点余量给手指）")
 close = [h for h in panel_hits if h["value"] == "close"][0]

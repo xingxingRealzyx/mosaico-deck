@@ -271,6 +271,7 @@ export function apply(ctx) {
                 question: state.question?.question,
                 options: state.question?.options,
                 levels: state.panel ? state.levels : undefined,
+                voice: voiceOn,
                 image: state.panel ? null : state.image,
                 imageLeft: secondsOfImageLeft(),
                 caption: state.caption,
@@ -865,6 +866,13 @@ export function apply(ctx) {
                         && ev.y <= h.y + h.h + 10);
                     if (hit && hit.kind === 'close') {
                         setPanel(false);
+                    } else if (hit && hit.kind === 'toggle') {
+                        voiceOn = !voiceOn;
+                        pushLog({ kind: 'reply', text: voiceOn ? 'voice on' : 'voice off' });
+                        // Confirming by voice when it is switched *on* is the one case
+                        // where the feedback can be the thing itself.
+                        if (voiceOn) say('语音已开启', { respectGap: false });
+                        void paint({ force: true });
                     } else if (hit) {
                         dragging = String(hit.value);
                         levelFromX(hit, ev.x);

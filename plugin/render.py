@@ -588,6 +588,20 @@ def draw_slider(d, x, y, w, value, color):
     d.ellipse((cx - 13, cy - 13, cx + 13, cy + 13), fill=BG, outline=color, width=3)
 
 
+def draw_switch(d, x, y, w, h, on, color):
+    """A phone-style toggle: rounded track with the knob at one end.
+
+    Used for voice, which is the one setting you want to change **without a keyboard in
+    front of you** -- a meeting starts and the desk panel should stop talking.
+    """
+    d.rounded_rectangle((x, y, x + w, y + h), radius=h // 2,
+                        fill=color if on else BG, outline=color if on else BORDER,
+                        width=2)
+    knob = h - 8
+    kx = (x + w - knob - 4) if on else (x + 4)
+    d.ellipse((kx, y + 4, kx + knob, y + 4 + knob), fill=BG if on else TEXT_SOFT)
+
+
 def render_panel(job):
     """Control centre: volume and brightness, dragged like a phone's.
 
@@ -628,8 +642,22 @@ def render_panel(job):
         # A generous touch row: the track is 16px but a finger is not.
         hits.append({"x": 20, "y": track_y - 18, "w": W - 40, "h": 54, "value": key})
 
+    # Voice on/off. Sits below the sliders because it is the third thing you reach for,
+    # not the first.
+    voice_on = bool(job.get("voice", True))
+    ty = 368
+    sw_w, sw_h = 68, 36
+    sx = W - 28 - sw_w
+    d.text((28, ty + 4), "语音播报", font=font(24), fill=TEXT)
+    d.text((sx - 16, ty + sw_h // 2), "开" if voice_on else "关",
+           font=font(S_PROGRESS, True), fill=OK if voice_on else TEXT_SOFT, anchor="rm")
+    draw_switch(d, sx, ty, sw_w, sw_h, voice_on, OK)
+    # A wide hit area: the switch is 68px, a finger is not.
+    hits.append({"x": sx - 100, "y": ty - 12, "w": sw_w + 110, "h": sw_h + 24,
+                 "value": "voice", "kind": "toggle"})
+
     d.line((28, H - 58, W - 28, H - 58), fill=BORDER, width=1)
-    d.text((28, H - 44), "✕ 或上滑关闭 · 拖动滑块调节",
+    d.text((28, H - 44), "右上角按钮或上滑关闭 · 拖动滑块调节",
            font=font(S_FOOTER), fill=TEXT_SOFT)
     return img, hits
 
