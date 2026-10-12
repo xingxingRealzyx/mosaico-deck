@@ -32,6 +32,9 @@ if (!fs.existsSync(DSH_MODULES)) {
 process.env.DECK_IMAGE_HOLD_MS = '300';
 // 语音/转写相关的断言不应取决于跑测试的机器装没装 say/ffmpeg/whisper
 process.env.DECK_ASSUME_DEPS = '1';
+// 2 秒：足够长，不会把前面那些"打开→拖滑块"的测试误关掉；又足够短，
+// 自动关闭那条能在 2.3 秒内观察到。
+process.env.DECK_PANEL_IDLE_CLOSE_MS = '2000';
 process.env.DECK_ANNOUNCE_MS = '0';     // 让"回合结束播报"立即满足条件
 process.env.DECK_SPEAK_GAP_MS = '0';    // 也不要因为刚说过话而被间隔挡住
 
@@ -78,7 +81,8 @@ export function render(job) {
     // render.py owns the geometry and plugin/test_render_layout.py pins these numbers.
     const hits = job.page === 'panel'
         ? [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
-           { x: 20, y: 300, w: 440, h: 54, value: 'brightness' }]
+           { x: 20, y: 300, w: 440, h: 54, value: 'brightness' },
+           { x: W_CLOSE_X, y: 10, w: 64, h: 64, value: 'close', kind: 'close' }]
         : (job.replies || []).map((c, i, all) => ({
             x: 28 + i * (140 + 10), y: 360, w: 140, h: 46,
             value: c.text, kind: c.kind }));
@@ -92,6 +96,7 @@ const registered = [];
 const effects = [];
 // The root conversation vs a subagent's session. Usage from the first must be counted
 // and from the second ignored, so the mock registry has to tell them apart.
+const W_CLOSE_X = 408;   // ✕ 按钮的热区（与 render.py 一致）
 const ROOT_AGENT_OBJ = { id: 'root-agent', session: { who: 'root', id: 'session-root' } };
 const ROOT_AGENT = ROOT_AGENT_OBJ;
 const SUBAGENT_AGENT = { id: 'sub-agent' };
@@ -406,7 +411,7 @@ touch('down', 200, 30);
 touch('move', 200, 70);      // 真机上手指是连续移动的，move 会一路跟到抬手处
 touch('move', 200, 150);
 touch('up');
-await new Promise((r) => setTimeout(r, 60));
+await new Promise((r) => setTimeout(r, 300));
 check(job().page === 'panel', `从顶部下拉会打开控制中心（page=${job().page}）`);
 check(job().levels?.volume === 85, `面板带着当前档位：音量 ${job().levels?.volume}%`);
 
@@ -418,7 +423,9 @@ touch('move', 240, 190);          // 拖到中间
 touch('up');
 await new Promise((r) => setTimeout(r, 60));
 const vol = job().levels?.volume;
-check(vol >= 45 && vol <= 55, `拖动滑块把音量调到 ${vol}%`);
+check(vol >= 45 && vol <= 55,
+    `拖动滑块把音量调到 ${vol}%（诊断：page=${job().page} state=${job().state} `
+    + `panel=${job().page === 'panel'} 画过的最后一个 job 的 levels=${JSON.stringify(job().levels)}）`);
 check((globalThis.__ctrl || []).some(([c, v]) => c === 'volume' && Math.abs(v - vol) <= 6),
     `命令也发给了板子：${JSON.stringify(globalThis.__ctrl)}`);
 
@@ -462,6 +469,31 @@ check(job().levels?.volume >= 45 && job().levels?.volume <= 55,
     `而且音量确实改了：${job().levels?.volume}%`);
 touch('down', 240, 430);          // 收尾：关掉
 await new Promise((r) => setTimeout(r, 60));
+
+console.log('控制中心一定关得掉（三种出口）');
+const openPanel = async () => {
+    touch('down', 200, 30);
+    touch('move', 200, 150);
+    touch('up');
+    await new Promise((r) => setTimeout(r, 80));
+};
+await openPanel();
+check(job().page === 'panel', '下拉打开');
+touch('down', 408 + 20, 40);          // 落在 ✕ 上
+await new Promise((r) => setTimeout(r, 80));
+check(job().page === 'status', '点右上角 ✕ 关闭');
+
+await openPanel();
+touch('down', 240, 120);              // 从空白处向下滑
+touch('move', 240, 220);
+touch('up');
+await new Promise((r) => setTimeout(r, 80));
+check(job().page === 'status', '向下滑也能关闭（不只是向上）');
+
+await openPanel();
+check(job().page === 'panel', '再打开一次');
+await new Promise((r) => setTimeout(r, 2300));   // 超过注入的 2000ms 空闲关闭
+check(job().page === 'status', '放着不动会自动关闭（不可能卡住）');
 
 console.log('快捷回复：内容随状态变化，点一下就生效');
 await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 20 });

@@ -740,6 +740,10 @@ export function apply(ctx) {
     // It only works at all because the firmware now reports `move` events.
     const PULL_EDGE = 60;      // a pull has to start within this many px of the top
     const PULL_DIST = 70;      // ... and travel this far before the panel opens
+    // **The panel must never be able to get stuck open**, so there are three ways out:
+    // the ✕ button, a vertical swipe in *either* direction, and simply leaving it alone.
+    const PANEL_IDLE_CLOSE_MS = Number(process.env.DECK_PANEL_IDLE_CLOSE_MS || 20000);
+    let panelTouchedAt = 0;
     let touchStart = null;
     // **The firmware's `up` event carries no coordinates** (`{"t":"touch","ev":"up"}`),
     // so a gesture measured on the release event reads `undefined.y` and never fires.
@@ -760,6 +764,7 @@ export function apply(ctx) {
     function setPanel(open) {
         if (state.panel === open) return;
         state.panel = open;
+        panelTouchedAt = Date.now();
         panelHits = [];
         dragging = null;
         // force: the panel is a full-page swap, and while the agent is idle nothing else
@@ -793,10 +798,13 @@ export function apply(ctx) {
                 touchStart = { x: ev.x, y: ev.y };
                 lastTouch = { x: ev.x, y: ev.y };
                 if (state.panel) {
+                    panelTouchedAt = Date.now();
                     const hit = panelHits.find((h) => ev.x >= h.x - 10
                         && ev.x <= h.x + h.w + 10 && ev.y >= h.y - 10
                         && ev.y <= h.y + h.h + 10);
-                    if (hit) {
+                    if (hit && hit.kind === 'close') {
+                        setPanel(false);
+                    } else if (hit) {
                         dragging = String(hit.value);
                         levelFromX(hit, ev.x);
                     } else {
@@ -820,10 +828,11 @@ export function apply(ctx) {
                 const vertical = from && to && Math.abs(dy) > Math.abs(to.x - from.x);
                 if (!state.panel && from && from.y <= PULL_EDGE && dy >= PULL_DIST) {
                     setPanel(true);           // pull down from the top edge to open
-                } else if (state.panel && vertical && dy <= -PULL_DIST) {
-                    // **Swipe up to close.** Tapping outside also closes it, but swiping
-                    // up is what a phone has trained everyone to do -- without this the
-                    // panel feels like it cannot be dismissed at all.
+                } else if (state.panel && vertical
+                    && (dy <= -PULL_DIST || dy >= PULL_DIST)) {
+                    // **Swipe either way to close.** Up is what a phone trains for a
+                    // control centre; down is what it trains for a sheet. Accepting both
+                    // costs nothing and removes a way to get stuck.
                     setPanel(false);
                 } else if (dragging) {
                     // The throttled stream may have dropped the final value.
@@ -1144,6 +1153,13 @@ export function apply(ctx) {
             // **Only dim while the agent is idle**: the panel exists to be read from
             // across the room, and going dark in the middle of a turn hides the one
             // thing it is for.
+            // Safety net: an open panel with no touch for a while closes itself, so it
+            // can never sit there blocking the status page.
+            if (PANEL_IDLE_CLOSE_MS > 0 && state.panel
+                && Date.now() - panelTouchedAt >= PANEL_IDLE_CLOSE_MS) {
+                setPanel(false);
+                return;
+            }
             if (!dimmed && state.status === 'idle'
                 && Date.now() - lastActivityAt >= DIM_AFTER_MS) {
                 dimmed = true;

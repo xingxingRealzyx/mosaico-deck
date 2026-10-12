@@ -601,8 +601,21 @@ def render_panel(job):
     hits = []
 
     d.text((28, 30), "控制中心", font=font(26), fill=TEXT)
-    d.text((W - 28, 38), "点空白关闭", font=font(S_FOOTER), fill=TEXT_SOFT,
-           anchor="ra")
+
+    # A real close button, not a hint. **Tapping anywhere else was not enough**: the two
+    # slider rows span the full width and are ~74px tall with the finger tolerance, so
+    # "tap the empty space to dismiss" lands on a slider surprisingly often -- and then it
+    # adjusts the volume instead of closing, which reads as "the panel will not close".
+    close = (W - 28 - 44, 20, W - 28, 64)
+    d.rounded_rectangle(close, radius=22, fill=BG, outline=BORDER, width=2)
+    cx = (close[0] + close[2]) // 2
+    cy = (close[1] + close[3]) // 2
+    r = 11
+    d.line((cx - r, cy - r, cx + r, cy + r), fill=TEXT, width=3)
+    d.line((cx - r, cy + r, cx + r, cy - r), fill=TEXT, width=3)
+    # Generous hit area: a 44px glyph is below the comfortable touch size.
+    hits.append({"x": close[0] - 10, "y": close[1] - 10, "w": 64, "h": 64,
+                 "value": "close", "kind": "close"})
 
     rows = (("音量", "volume", 132, ACCENT), ("亮度", "brightness", 272, WARN))
     for label, key, y, color in rows:
@@ -616,7 +629,7 @@ def render_panel(job):
         hits.append({"x": 20, "y": track_y - 18, "w": W - 40, "h": 54, "value": key})
 
     d.line((28, H - 58, W - 28, H - 58), fill=BORDER, width=1)
-    d.text((28, H - 44), "从顶部边缘下拉打开 · 拖动滑块调节",
+    d.text((28, H - 44), "✕ 或上滑关闭 · 拖动滑块调节",
            font=font(S_FOOTER), fill=TEXT_SOFT)
     return img, hits
 
