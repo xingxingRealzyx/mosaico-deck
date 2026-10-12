@@ -117,6 +117,10 @@ export class Deck extends EventEmitter {
         return true;
     }
 
+    // Note: open() clears this._last, so every (re)connect sends one full frame. That
+    // matters more than it looks -- a board reset wipes the panel but not this cache, and
+    // diffs against a picture the board no longer has would leave rows blank for ever.
+
     get connected() {
         return this.fd !== null;
     }

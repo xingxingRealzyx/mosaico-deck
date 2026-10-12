@@ -51,10 +51,18 @@ uint16_t g_dummy_band[fluidbox::config::kBandPixels];
 // bandwidth is unchanged by this -- it is read once per commit, not continuously.
 uint16_t* g_frame_buf = nullptr;
 
-// Rows touched since the last commit. Kept as a span (not a bitmap): the panel has to be
-// written as one contiguous transfer anyway, so a bounding span is all that is needed.
-int g_dirty_top = -1;
-int g_dirty_bottom = -1;
+// Which bands have been staged since the last commit -- **a bitmap, not a span.**
+//
+// A span (min..max) is wrong here and the symptom is severe: the PC sends a *diff*, so
+// it is entirely normal for band 0 (the timer) and bands 14..15 (the stats strip) to
+// arrive with nothing in between. The bounding span then covers rows that were **never
+// received**, and pushing it sends the uninitialised frame buffer -- zeros, i.e. black --
+// over the middle of the screen. Worse, it is permanent: the PC considers those bands
+// unchanged, so it never sends them again.
+//
+// With a bitmap only rows that actually arrived are ever pushed, and a normal update
+// (one contiguous run) is still a single transfer.
+uint16_t g_dirty_mask = 0;
 
 // TE rising-edge count. Only incremented in the ISR and read by the statistics,
 // so volatile is enough.
@@ -364,12 +372,8 @@ esp_err_t Panel::StageBand(int band_index, const uint16_t* buffer) {
     const int y0 = band_index * fluidbox::config::kBandRows;
     memcpy(g_frame_buf + static_cast<size_t>(y0) * fluidbox::config::kLcdHRes, buffer,
            fluidbox::config::kBandPixels * 2);
-    if (g_dirty_top < 0 || y0 < g_dirty_top) {
-        g_dirty_top = y0;
-    }
-    if (g_dirty_bottom < 0 || y0 + fluidbox::config::kBandRows > g_dirty_bottom) {
-        g_dirty_bottom = y0 + fluidbox::config::kBandRows;
-    }
+    g_dirty_mask = static_cast<uint16_t>(
+        g_dirty_mask | (1u << band_index));
     // The pixels are copied, not queued: the band buffer is free again immediately.
     // Without this the pool would drain after two bands and AcquireBand would start
     // timing out.
@@ -379,28 +383,47 @@ esp_err_t Panel::StageBand(int band_index, const uint16_t* buffer) {
     return ESP_OK;
 }
 
-bool Panel::HasStaged() const { return g_dirty_top >= 0; }
+bool Panel::HasStaged() const { return g_dirty_mask != 0; }
 
 esp_err_t Panel::CommitFrame() {
-    if (panel_ == nullptr || g_frame_buf == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (g_dirty_top < 0) {
+    if (panel_ == nullptr || g_frame_buf == nullptr || g_dirty_mask == 0) {
         return ESP_ERR_INVALID_STATE;   // nothing staged, nothing to do
     }
-    const int top = g_dirty_top;
-    const int bottom = g_dirty_bottom;
-    g_dirty_top = -1;
-    g_dirty_bottom = -1;
+    const uint16_t mask = g_dirty_mask;
+    g_dirty_mask = 0;
 
     // Align with the panel's scanout before starting. This is the half that removes the
     // visible seam; a single transfer alone would still begin at an arbitrary point in
     // the scan.
     (void)WaitForTeTick(20);
-    return esp_lcd_panel_draw_bitmap(
-        static_cast<esp_lcd_panel_handle_t>(panel_), 0, top,
-        fluidbox::config::kLcdHRes, bottom,
-        g_frame_buf + static_cast<size_t>(top) * fluidbox::config::kLcdHRes);
+
+    // One transfer per **contiguous run** of staged bands. A whole-screen update is one
+    // run and therefore one transfer, which is the case that matters; a genuinely
+    // scattered update becomes two or three, and that is correct -- the alternative is
+    // pushing rows this board has no pixels for.
+    esp_err_t err = ESP_OK;
+    int band = 0;
+    while (band < fluidbox::config::kBandCount) {
+        if ((mask & (1u << band)) == 0) {
+            band++;
+            continue;
+        }
+        int run = band;
+        while (run < fluidbox::config::kBandCount && (mask & (1u << run)) != 0) {
+            run++;
+        }
+        const int y0 = band * fluidbox::config::kBandRows;
+        const int y1 = run * fluidbox::config::kBandRows;
+        err = esp_lcd_panel_draw_bitmap(
+            static_cast<esp_lcd_panel_handle_t>(panel_), 0, y0,
+            fluidbox::config::kLcdHRes, y1,
+            g_frame_buf + static_cast<size_t>(y0) * fluidbox::config::kLcdHRes);
+        if (err != ESP_OK) {
+            break;
+        }
+        band = run;
+    }
+    return err;
 }
 
 esp_err_t Panel::FlushBand(int band_index, const uint16_t* buffer) {
