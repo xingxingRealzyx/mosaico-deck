@@ -294,6 +294,36 @@ export function apply(ctx) {
         });
     }
 
+    /** The turn is over: settle the label, and say so if it was a long one.
+     *
+     * **Two independent signals call this**, because one was not enough: the panel sat on
+     * 思考中 until the next turn started, which means `agent/status` going idle does not
+     * always arrive (and the spoken "完成" hung off the same event, so both symptoms --
+     * stuck label, no announcement -- are one cause).
+     *
+     *   agent/status {status:'idle'}   the loop's own transition
+     *   session event `turn/end`       the session log's end-of-turn marker
+     *
+     * Announcements are gap-guarded, so when both arrive milliseconds apart only one is
+     * ever spoken.
+     */
+    function endTurn() {
+        const elapsed = state.startedAt ? Date.now() - state.startedAt : 0;
+        state.status = 'idle';
+        state.tool = null;
+        if (shouldAnnounce({
+            voiceOn,
+            elapsedMs: elapsed,
+            sinceLastMs: Date.now() - lastSpokeAt,
+            minMs: ANNOUNCE_MIN_MS,
+            minGapMs: SPEAK_GAP_MS,
+        })) {
+            const mins = Math.floor(elapsed / 60000);
+            say(mins >= 1 ? `完成，用时 ${mins} 分` : '完成', { respectGap: true });
+        }
+        void paint();
+    }
+
     /** Is this the user's own conversation, rather than a subagent's?
      *
      * Every live agent shares this event bus, so a subagent reading files and running
@@ -586,21 +616,8 @@ export function apply(ctx) {
             state.target = '';
             state.tool = null;
         } else {
-            // The turn just ended. Announce it only when it was long enough to have
-            // been worth walking away from -- see shouldAnnounce().
-            const elapsed = state.startedAt ? Date.now() - state.startedAt : 0;
-            if (shouldAnnounce({
-                voiceOn,
-                elapsedMs: elapsed,
-                sinceLastMs: Date.now() - lastSpokeAt,
-                minMs: ANNOUNCE_MIN_MS,
-                minGapMs: SPEAK_GAP_MS,
-            })) {
-                const mins = Math.floor(elapsed / 60000);
-                say(mins >= 1 ? `完成，用时 ${mins} 分` : '完成');
-            }
-            state.status = 'idle';
-            state.tool = null;
+            endTurn();
+            return;
         }
         void paint();
     });
@@ -661,6 +678,12 @@ export function apply(ctx) {
     // reach a listener in practice. The host already computes all of it as session
     // projections (see readStats); reading its numbers is both correct and cheaper.
     ctx.on('session/event', (session, event) => {
+        // The session log's own end-of-turn marker: a second, independent "the turn is
+        // over" signal. See endTurn().
+        if (event?.type === 'turn/end') {
+            if (isRootSession(session)) endTurn();
+            return;
+        }
         if (event?.type !== 'assistant/message') return;
         if (isRootSession(session)) state.rootSession = session;
         try {

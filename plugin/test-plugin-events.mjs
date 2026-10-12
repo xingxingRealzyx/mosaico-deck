@@ -275,6 +275,25 @@ check(job().stats?.cacheHit === 100, '缓存命中同样保留，不会因为一
 ctx.sessionProjections.snapshot = snapshotFn;
 ctx.sessionProjections.checkpoint = checkpointFn;
 
+console.log('回合结束：两个独立信号都要能把状态落回 idle');
+// agent/status 走 idle
+await fire('agent/status', { status: 'running' });
+await fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => {});
+await fire('agent/status', { status: 'idle' });
+check(job().state === 'idle', 'agent/status idle -> 空闲');
+// 只有 turn/end 时也必须落回 idle（这是卡在"思考中"的那条路径）
+await fire('agent/status', { status: 'running' });
+await fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => {});
+check(job().state === 'tool', '工具调用中显示调用工具');
+await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 9 });
+check(job().state === 'idle',
+    `只有 turn/end 也能落回 idle（否则面板会一直停在思考中）：${job().state}`);
+// 子代理的 turn/end 不该影响主会话
+await fire('agent/status', { status: 'running' });
+await fire('session/event', SUBAGENT_SESSION, { type: 'turn/end', turn: 1 });
+check(job().state !== 'idle', '子代理的 turn/end 不会把主会话标成空闲');
+await fire('agent/status', { status: 'idle' });
+
 console.log('语音：关键节点自动出声（不再等模型主动想起来调 deck_speak）');
 check(mod.shouldAnnounce({ voiceOn: true, elapsedMs: 31000, sinceLastMs: 99999,
                            minMs: 30000, minGapMs: 4000 }),
