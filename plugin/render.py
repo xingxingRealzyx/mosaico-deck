@@ -425,7 +425,7 @@ def render_image(job):
     tool = job.get("tool")
     icon, color = style_for(tool) if tool else (
         STATE_ICONS.get(state, ICON_TOOL), STATE_COLORS.get(state, IDLE))
-    label = job.get("label") or STATE_LABELS.get(state, state)
+    label = job.get("caption") or job.get("label") or STATE_LABELS.get(state, state)
 
     dims, problem = "", ""
     try:

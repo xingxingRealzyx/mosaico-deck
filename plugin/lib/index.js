@@ -83,6 +83,7 @@ export function apply(ctx) {
         target: '',
         tool: null,     // current tool name, so the panel can pick an icon + colour
         image: null,    // a picture being looked at; render.py draws it full-panel
+        caption: null,  // optional line under a picture the model asked to show
         progress: null,
         elapsed: 0,
         startedAt: 0,
@@ -112,6 +113,7 @@ export function apply(ctx) {
                 // is the status page.
                 page: state.image ? 'image' : 'status',
                 image: state.image,
+                caption: state.caption,
                 project: state.project,
                 state: state.status,
                 tool: state.tool,
@@ -234,6 +236,7 @@ export function apply(ctx) {
             // A read of a picture puts the picture itself on the panel; any other
             // call clears whatever was there.
             state.image = imageBeingRead(toolName, target);
+            state.caption = null;
             pushLog({ kind: 'tool', tool: toolName, text: `called ${toolName}` });
             if (state.image) {
                 pushLog({ kind: 'image', tool: toolName, text: 'showing image' });
@@ -509,6 +512,7 @@ export function apply(ctx) {
             const p = String(args.path ?? '');
             if (!p) return { message: 'no path given' };
             state.image = path.isAbsolute(p) ? p : path.resolve(p);
+            state.caption = args.caption ? String(args.caption) : null;
             if (args.caption) state.detail = String(args.caption);
             state.status = 'tool';
             state.tool = 'deck_image';
