@@ -106,15 +106,19 @@ const ctx = {
                                        surfaceTokens: 481943 } }
                 : {},
         }),
-        checkpoint: (session) => ({ session }),
-        viewCheckpoint: (cp) => (cp?.session === ROOT_SESSION ? {
-            tokenUsage: { totals: { uncachedInputTokens: 574196,
-                                    outputTokens: 398731,
-                                    cacheReadTokens: 141789056,
-                                    cacheWriteTokens: 0 } },
-            sessionStats: { turns: 16, steps: 389, llmMs: 2693785, toolMs: 4616652,
-                            ttftMs: 760550, decodeMs: 1933235, decodeTokens: 398731 },
+        // Real semantics: raw state per key, wrapped as {ver, seq, val} -- and this is
+        // the ONLY read face that sees state-only units.
+        checkpoint: (session) => (session === ROOT_SESSION ? {
+            contextPressure: { ver: 5, seq: 1, val: { pressureTokens: 625830,
+                                                       contextWindow: 1000000 } },
+            tokenUsage: { ver: 2, seq: 1, val: { totals: {
+                uncachedInputTokens: 574196, outputTokens: 398731,
+                cacheReadTokens: 141789056, cacheWriteTokens: 0 } } },
+            sessionStats: { ver: 1, seq: 1, val: { turns: 16, steps: 389, llmMs: 2693785,
+                                                   toolMs: 4616652, ttftMs: 760550,
+                                                   decodeMs: 1933235, decodeTokens: 398731 } },
         } : {}),
+        viewCheckpoint: () => ({}),   // 只给有 wire 的单元：这里什么都不给（真实行为）
     },
     on: (ev, fn) => {
         if (!listeners.has(ev)) listeners.set(ev, []);

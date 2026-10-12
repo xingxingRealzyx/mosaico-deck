@@ -170,6 +170,9 @@ export function apply(ctx) {
     // the panel showing a stale value -- hit squarely by dragging a slider, where the
     // updates come faster than a frame renders. One trailing repaint fixes it.
     let repaintWanted = null;
+    // When the (expensive) checkpoint read last ran; see readStats.
+    let statsReadAt = 0;
+    const STATS_READ_MS = 2000;
 
     // Log entries carry **what kind of thing happened**, not just a string: the
     // renderer turns the kind (and the tool name) into a colour emoji, which is what
@@ -335,50 +338,60 @@ export function apply(ctx) {
      */
     function readStats() {
         const session = rootSession();
-        const snapshot = session && ctx.sessionProjections?.snapshot;
-        if (!snapshot) return state.stats;
-        try {
-            // **Two read faces, on purpose.** `snapshot()` returns only the
-            // *client-visible* units, and `tokenUsage` / `sessionStats` are registered
-            // state-only (no `wire` face) -- which is exactly why the strip used to show
-            // the context ring and nothing else. The state side is reachable through the
-            // checkpoint read face instead.
-            const keys = ['contextPressure', 'tokenUsage', 'sessionStats'];
-            const values = { ...(ctx.sessionProjections.snapshot(session, keys)?.values ?? {}) };
+        if (!session || !ctx.sessionProjections) return state.stats;
+
+        // **Two read faces, and the cheap one carries the important number.**
+        //
+        //   snapshot(session, ['contextPressure'])   client-visible units only; cheap
+        //   checkpoint(session)                      every registered unit's raw state
+        //
+        // `tokenUsage` and `sessionStats` are registered **state-only** (no `wire` face),
+        // and both `snapshot()` and `viewCheckpoint()` begin with
+        // `if (registration.def.wire === void 0) continue;` -- which is why the ring drew
+        // while the token totals stayed empty through two attempts at fixing it.
+        // `checkpoint()` is the only read face that sees them.
+        //
+        // It is also the expensive one: it structuredClones every unit, including
+        // `turnOutline`, which grows with the conversation. So it is throttled -- these
+        // numbers move once per model reply, not once per frame.
+        const now = Date.now();
+        let rows = null;
+        if (now - statsReadAt >= STATS_READ_MS || !state.stats.context) {
+            statsReadAt = now;
             try {
-                const checkpoint = ctx.sessionProjections.checkpoint?.(session);
-                if (checkpoint) {
-                    Object.assign(values, ctx.sessionProjections
-                        .viewCheckpoint?.(checkpoint, keys) ?? {});
-                }
+                rows = ctx.sessionProjections.checkpoint?.(session) ?? null;
             } catch (err) {
                 ctx.logger?.debug?.(`mosaico-deck: checkpoint read failed: ${err.message}`);
             }
-            const pressure = values?.contextPressure ?? {};
-            const totals = values?.tokenUsage?.totals ?? {};
-            const stats = values?.sessionStats ?? {};
+        }
+
+        try {
+            const pressure = ctx.sessionProjections
+                .snapshot(session, ['contextPressure'])?.values?.contextPressure ?? {};
+            const totals = rows?.tokenUsage?.val?.totals ?? {};
+            const stats = rows?.sessionStats?.val ?? {};
             const decodeMs = numOr0(stats.decodeMs);
             const decodeTokens = numOr0(stats.decodeTokens);
             const uncached = numOr0(totals.uncachedInputTokens);
             const cacheRead = numOr0(totals.cacheReadTokens);
             const read = uncached + cacheRead;
-            // **Never zero a number just because this read did not carry it.** A
-            // projection that is briefly absent would otherwise blank the whole line.
+            // **Never zero a number just because this read did not carry it.** A unit
+            // that is briefly absent would otherwise blank the whole line.
             const keep = (next, previous) => (next > 0 ? next : (previous ?? 0));
             const next = {
                 // Matches the Harness UI exactly (`contextOccupancy`): it prefers
                 // projectedTokens and falls back to pressureTokens, and the renderer
-                // clamps the ratio to 100 the same way. The panel and the window must
-                // never disagree about how full the context is.
+                // clamps the ratio to 100 the same way.
                 context: keep(numOr0(pressure.projectedTokens ?? pressure.pressureTokens),
                               state.stats.context),
                 contextWindow: keep(numOr0(pressure.contextWindow), state.stats.contextWindow),
                 input: keep(uncached, state.stats.input),
                 output: keep(numOr0(totals.outputTokens), state.stats.output),
-                // Share of the prompt that came from cache. Computed here, against
-                // uncached+cached: dividing by the uncached half alone yields absurd
-                // percentages once caching works (this session reads 99.6%).
-                cacheHit: read > 0 ? Math.round(100 * cacheRead / read) : (state.stats.cacheHit ?? 0),
+                // Share of the prompt that came from cache. Against uncached+cached:
+                // dividing by the uncached half alone yields "24700%" once caching works.
+                cacheHit: read > 0
+                    ? Math.round(100 * cacheRead / read)
+                    : (state.stats.cacheHit ?? 0),
                 tokensPerSecond: decodeMs > 0
                     ? (decodeTokens / decodeMs) * 1000
                     : (state.stats.tokensPerSecond ?? 0),
