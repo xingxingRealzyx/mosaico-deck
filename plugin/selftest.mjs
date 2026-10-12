@@ -22,6 +22,7 @@
 
 const registered = [];
 const listeners = new Map();
+const effects = [];
 const logs = [];
 
 const ctx = {
@@ -29,6 +30,12 @@ const ctx = {
     on: (ev, fn) => {
         if (!listeners.has(ev)) listeners.set(ev, []);
         listeners.get(ev).push(fn);
+    },
+    // The real `ctx.effect(body)` runs the body now and disposes whatever it returns
+    // when the plugin's fiber goes away. Raw resources must be registered this way:
+    // there is no `dispose` event to listen for (see the name guard below).
+    effect: (body) => {
+        effects.push(body());
     },
     logger: { info: (m) => logs.push(`I ${m}`), debug: (m) => logs.push(`D ${m}`) },
 };
@@ -61,10 +68,36 @@ console.log('  [ok] apply() returned normally');
 console.log(`  [ok] registered ${registered.length} tools: ${registered.map((t) => t.name).join(', ')}`);
 console.log(`  [ok] listening to ${listeners.size} events: ${[...listeners.keys()].join(', ')}`);
 
-const fire = (ev, payload) => {
+// Every subscribed name must be a **real bus event**.
+//
+// This guard exists because the plugin once subscribed to `assistant/message`, which is
+// a session event *type* carried by `session/event` -- not an event name. Nothing failed
+// here: the handler simply never ran on the host, while this file fired it by name and
+// reported success. A name missing from the host's `Events` interfaces is dead code, and
+// dead code that only shows up on hardware is the worst kind.
+//
+// Sources: the `Events` declarations of @deepseek-ai/dsh-agent, dsh-tools and dsh-session.
+// Add a name here only after finding it in one of those.
+const KNOWN_EVENTS = new Set([
+    'agent/created', 'agent/disposed', 'agent/status', 'agent/error',
+    'agent/inbox/inserted', 'agent/inbox/claimed', 'agent/inbox/discarded',
+    'agent/session-start', 'agent/pre-step', 'agent/request', 'agent/request-error',
+    'agent/assistant-stream', 'agent/turn-stopping',
+    'tools/change', 'tools/pre-execute', 'tools/execute', 'tools/post-execute',
+    'tools/ptc-dispatch-log', 'tools/result',
+    'session/created', 'session/disposed', 'session/event', 'session/flush',
+]);
+const unknown = [...listeners.keys()].filter((e) => !KNOWN_EVENTS.has(e));
+if (unknown.length > 0) {
+    console.log(`  [FAIL] not bus events: ${unknown.join(', ')} -- find the real name in the host types`);
+    process.exit(1);
+}
+console.log('  [ok] every subscribed name is a real bus event');
+
+const fire = (ev, ...args) => {
     let ok = true;
     for (const fn of listeners.get(ev) || []) {
-        try { fn(payload); } catch (e) {
+        try { fn(...args); } catch (e) {
             console.log(`  [FAIL] handler for event ${ev} threw: ${e.message}`);
             ok = false;
         }
@@ -77,15 +110,30 @@ const fire = (ev, payload) => {
 let ok = true;
 ok = fire('agent/status', { status: 'running' }) && ok;
 ok = fire('agent/status', { status: 'idle' }) && ok;
+// The real ToolExecution carries name/arguments at the TOP level, and pre/post are
+// waterfalls -- so pass a `next` and make sure the handler forwards it.
+ok = fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => Promise.resolve({ kind: 'allow' })) && ok;
 ok = fire('tools/pre-execute', { call: { name: 'bash', arguments: { command: 'ls' } } }) && ok;
 ok = fire('tools/pre-execute', {}) && ok;
 ok = fire('tools/pre-execute', null) && ok;
+ok = fire('tools/post-execute', { name: 'bash', arguments: {} }, {}, () => Promise.resolve({ kind: 'accept' })) && ok;
 ok = fire('tools/post-execute', {}) && ok;
-ok = fire('assistant/message', { message: { content: [{ type: 'text', text: 'hello' }] } }) && ok;
-ok = fire('assistant/message', {}) && ok;
+// `session/event(session, event)` -- `assistant/message` arrives as an event TYPE.
+ok = fire('session/event', null, { type: 'assistant/message', message: { content: [{ type: 'text', text: 'hello' }] } }) && ok;
+ok = fire('session/event', null, { type: 'tool/result' }) && ok;
+ok = fire('session/event', null, {}) && ok;
+ok = fire('session/event') && ok;
 ok = fire('agent/error', {}) && ok;
 console.log(ok ? '  [ok] no event handler crashed (including empty/null payloads)' : '  [FAIL] a handler threw');
 
-for (const fn of listeners.get('dispose') || []) fn();
-console.log(`  [ok] dispose ok  ${logs[0] ? `| ${logs[0].slice(0, 90)}` : ''}`);
+// Cleanup is registered through ctx.effect; if the plugin ever stops doing that, the
+// interval and the serial fd leak (which is how a stale process kept the port busy).
+if (effects.length === 0) {
+    console.log('  [FAIL] no ctx.effect() cleanup registered -- the port would never be released');
+    process.exit(1);
+}
+for (const dispose of effects) {
+    if (typeof dispose === 'function') dispose();
+}
+console.log(`  [ok] effect cleanup ok  ${logs[0] ? `| ${logs[0].slice(0, 90)}` : ''}`);
 console.log('\n[ok] safe to restart DeepSeek Harness');

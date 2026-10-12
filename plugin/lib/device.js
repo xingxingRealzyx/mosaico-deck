@@ -38,7 +38,46 @@ const TYPE_AUDIO = 0x20;
 
 const AUDIO_BYTES_PER_SEC = 48000 * 4; // 48kHz interleaved stereo 16-bit
 
-/** Find a mosaico-deck serial port.
+/** Pick the **data** port out of a list of `/dev` basenames, or null for "not there".
+ *
+ * With CONFIG_TINYUSB_CDC_COUNT=2 one board exposes a *pair* of nodes:
+ *
+ *     cu.usbmodem21201   port 0 (kFlashItf)   flashing -- owns the DTR/RTS line callback
+ *     cu.usbmodem21203   port 1 (kCdcItf)     the display protocol
+ *
+ * macOS derives both names from one device with a shared non-digit prefix and appends
+ * an interface suffix, so the pair is "same prefix, suffix differs by the interface
+ * step (2)". **Take the higher suffix**: the lower one is the flashing port, and
+ * opening it asserts DTR/RTS, which is the reset signal while the chip sits in ROM
+ * download mode.
+ *
+ * Requiring the pair -- rather than taking any single node -- is what makes it safe to
+ * leave this plugin running while flashing: in ROM download mode the composite device
+ * is not present, only a lone node (or none) is, so this returns null and the plugin
+ * never touches the port.
+ *
+ * Pure function of the name list, so the choice can be tested without hardware
+ * (plugin/test-port-selection.mjs).
+ */
+export function pickDataPort(names, interfaceStep = 2) {
+    const parsed = [];
+    for (const name of [...names].sort()) {
+        const m = /^(.*?)(\d+)$/.exec(name);
+        if (m) parsed.push({ name, prefix: m[1], suffix: Number(m[2]) });
+    }
+    // Deterministic: the higher node of the first pair in name order.
+    for (const lower of parsed) {
+        const higher = parsed.find(
+            (p) => p !== lower
+                && p.prefix === lower.prefix
+                && p.suffix - lower.suffix === interfaceStep,
+        );
+        if (higher) return `/dev/${higher.name}`;
+    }
+    return null;
+}
+
+/** Find the mosaico-deck data port, or null when the board is not there.
  *
  * Matching by name takes priority -- there may be other usbmodem devices plugged in.
  */
@@ -49,9 +88,7 @@ export function findPort() {
     } catch {
         return null;
     }
-    if (names.length === 0) return null;
-    names.sort();
-    return `/dev/${names[0]}`;
+    return pickDataPort(names);
 }
 
 export class Deck extends EventEmitter {
@@ -185,6 +222,16 @@ export class Deck extends EventEmitter {
                     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
                     continue;
                 }
+                // **The fd can die without anyone noticing.** When the board
+                // re-enumerates -- a reset, a replug, a flash -- this fd keeps pointing
+                // at a device that no longer exists. Every write then fails with
+                // EBADF/ENXIO **while `connected` still reports true**, because that
+                // getter only checks `fd !== null`. Observed live: the plugin kept
+                // rendering on every tool call (spawning render.py each time) and threw
+                // the frame away, and `deck_connect` could not rescue it either, since it
+                // early-returns when `connected`. Closing here makes the state honest
+                // again, so `deck_connect` reopens the port instead of lying about it.
+                this.close();
                 throw e;
             }
         }

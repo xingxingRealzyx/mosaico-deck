@@ -34,7 +34,13 @@ for a in "$@"; do
     esac
 done
 
-PY="${ESPTOOL_PY:-$HOME/.espressif/python_env/idf6.1_py3.11_env/bin/python}"
+# env 目录名里带 python 版本，不要写死（见 flash.sh 里的同一条注释）。
+if [ -z "${ESPTOOL_PY:-}" ]; then
+    for _py in "$HOME"/.espressif/python_env/idf*_env/bin/python; do
+        [ -x "$_py" ] && { ESPTOOL_PY="$_py"; break; }
+    done
+fi
+PY="${ESPTOOL_PY:-$(command -v python3)}"
 [ -x "$PY" ] || PY="$(command -v python3)"
 
 echo "=================== 板子状态检查 ==================="
@@ -79,7 +85,16 @@ else
     if OUT="$("$PY" -m esptool --chip esp32s31 -p "$PORT" \
               --before no-reset --after no-reset chip-id 2>&1)"; then
         MAC="$(printf '%s' "$OUT" | sed -nE 's/.*MAC: *([0-9a-f:]+).*/\1/p' | head -1)"
-        echo "                 ✅ 在 ROM 下载模式${MAC:+（MAC $MAC）}"
+        # **The braces are required.** macOS ships bash 3.2, which folds a following
+        # multibyte character into the variable name: `$MAC）` is read as the variable
+        # `MAC）`, and under `set -u` that is a hard "unbound variable" error. So this
+        # line used to crash on the *success* path -- exactly the branch that reports the
+        # one answer this script exists to give. `${MAC}` delimits the name.
+        if [ -n "$MAC" ]; then
+            echo "                 ✅ 在 ROM 下载模式（MAC ${MAC}）"
+        else
+            echo "                 ✅ 在 ROM 下载模式"
+        fi
         echo "                 -> 直接跑 ./flash-rom.sh"
     else
         echo "                 ❌ 连不上 —— 芯片在跑应用固件，或者 USB 链路有问题"

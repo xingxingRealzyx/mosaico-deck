@@ -71,8 +71,16 @@ if [ -f "$HOME/esp/esp-idf/export.sh" ]; then
     # shellcheck disable=SC1091
     . "$HOME/esp/esp-idf/export.sh" > /dev/null 2>&1 || true
 fi
-ESPTOOL_PY="${ESPTOOL_PY:-$HOME/.espressif/python_env/idf6.1_py3.11_env/bin/python}"
-if [ ! -x "$ESPTOOL_PY" ]; then
+# **env 目录名里带 python 版本**（作者机器上是 idf6.1_py3.11_env，这台是
+# idf6.1_py3.12_env）。写死会在别的机器上静默退回到系统 python3 —— 而系统
+# python3 通常没有 esptool，报错会出现在很远的地方（导入包装器时）。
+ESPTOOL_PY="${ESPTOOL_PY:-}"
+if [ -z "$ESPTOOL_PY" ]; then
+    for _py in "$HOME"/.espressif/python_env/idf*_env/bin/python; do
+        [ -x "$_py" ] && { ESPTOOL_PY="$_py"; break; }
+    done
+fi
+if [ ! -x "${ESPTOOL_PY:-}" ]; then
     ESPTOOL_PY="$(command -v python3 || true)"
 fi
 if [ -z "$ESPTOOL_PY" ] || [ ! -x "$ESPTOOL_PY" ]; then

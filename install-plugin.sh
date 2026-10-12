@@ -28,7 +28,14 @@ DEST="$DSH_HOME/profiles/$PROFILE/node_modules/dsh-mosaico-deck"
 # Always copy the files (the installed copy is what the host actually loads,
 # and edits to the repo do not propagate on their own).
 mkdir -p "$DEST"
+# **`rm -rf` first.** `cp -R src dst` copies *into* dst once dst exists, so a second
+# install produced `lib/lib/` and left the real `lib/` on the previous version's code
+# -- and the load self-test below then validated that stale copy, printing "safe to
+# restart" for code the host would never load. Removing first makes this a true
+# update and drops files that no longer exist in the repo.
+rm -rf "$DEST/lib"
 cp -R "$HERE/plugin/lib" "$DEST/lib"
+rm -f "$DEST/render.py" "$DEST/package.json" "$DEST/cordis.patch.yml" "$DEST/selftest.mjs"
 cp "$HERE/plugin/render.py" "$DEST/render.py"
 cp "$HERE/plugin/package.json" "$DEST/package.json"
 cp "$HERE/plugin/cordis.patch.yml" "$DEST/cordis.patch.yml"

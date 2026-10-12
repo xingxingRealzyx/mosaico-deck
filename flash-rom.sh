@@ -97,7 +97,13 @@ fi
 echo "端口: $FOUND"
 echo "开始烧录（一次烧完，中途绝不打断）..."
 
-ESPTOOL_PY="${ESPTOOL_PY:-$HOME/.espressif/python_env/idf6.1_py3.11_env/bin/python}"
+# env 目录名里带 python 版本，不要写死（见 flash.sh 里的同一条注释）。
+if [ -z "${ESPTOOL_PY:-}" ]; then
+    for _py in "$HOME"/.espressif/python_env/idf*_env/bin/python; do
+        [ -x "$_py" ] && { ESPTOOL_PY="$_py"; break; }
+    done
+fi
+ESPTOOL_PY="${ESPTOOL_PY:-}"
 PY="${PY:-}"
 if [ -z "$PY" ]; then
     if [ -x "$ESPTOOL_PY" ]; then PY="$ESPTOOL_PY"; else PY="$(command -v python3)"; fi

@@ -7,7 +7,7 @@
 //
 // 1. The screen follows the agent automatically, with zero cooperation from the
 //    model. It listens to agent/status, tools/pre-execute, tools/post-execute
-//    and assistant/message, so the display moves on its own.
+//    and session/event, so the display moves on its own.
 //
 // 2. What is shown is host-observed fact, not the model's self-report. The tool
 //    name comes from the runtime; "I am running the tests" comes from the model
@@ -24,11 +24,17 @@
 //
 //     Cannot read properties of undefined (reading 'kind')
 //
-// Actual signatures, from dsh-tools/lib/types:
+// Actual signatures, from dsh-tools/lib/types, dsh-agent/lib/types and
+// dsh-session/lib/types:
 //   tools/pre-execute   (exec, next) => Promise<PreToolDecision>           waterfall
 //   tools/post-execute  (exec, result, next) => Promise<PostToolDecision>  waterfall
 //   agent/status        (payload: { agent, status }) => void                emit
-//   agent/error         (payload) => void                                   emit
+//   agent/error         (payload: { agent, turn, step, error }) => void     emit
+//   session/event       (session, event: SessionEvent) => void              emit
+//
+// `assistant/message` is an event **type** carried by `session/event`, not an event
+// name -- see the handler below, and the name guard in selftest.mjs that keeps this
+// class of mistake from passing the load self-test again.
 //
 // Handlers below forward `next` when it exists and return undefined when it
 // does not, which is correct for both modes.
@@ -43,21 +49,21 @@ export const inject = ['tools'];
 
 // Port polling policy: **at most one attempt at startup, then nothing.**
 //
-// There is only one CDC port on this board (CONFIG_TINYUSB_CDC_COUNT=1), so the
-// plugin and the flasher cannot share it. Even a couple of retries is enough to
-// yank a chip out of ROM download mode at the wrong moment.
+// The firmware splits USB CDC into a flashing port and a data port
+// (CONFIG_TINYUSB_CDC_COUNT=2), so the plugin and a flasher no longer contend for
+// one node. Opening the *flashing* node is still the reset signal, though, and
+// this plugin must never risk touching it. Two rules keep it off:
 //
-// On this board, opening /dev/cu.usbmodem* asserts DTR and RTS -- that is a
-// hardware fact, not a firmware quirk (flash-rom.sh documents the same trap).
-// While the chip sits in ROM download mode those lines ARE the reset signal, so
-// a plugin that periodically opens the port to "see if the board is there"
-// kicks the chip straight back out of download mode. Observed symptom: the
-// board re-enumerates every few seconds, never stays in ROM mode, and flashing
-// becomes impossible.
+//   . findPort() (device.js) accepts only the higher node of a *pair*, so a board
+//     that is absent or sitting in ROM download mode -- where the composite device
+//     is gone and at most one node exists -- yields no port at all.
+//   . we try once at startup and then stop. Even a retry against a half-enumerated
+//     device is enough to yank the chip out of ROM mode at the wrong moment;
+//     observed symptom was the board re-enumerating every few seconds, never
+//     staying in ROM mode, and flashing becoming impossible.
 //
-// So: try at startup, then back off hard and stop retrying. If the board shows
-// up later, the user can reconnect from the host; what must never happen is
-// this plugin fighting an ongoing flash.
+// So: try at startup, then back off hard. If the board shows up later, the user
+// calls deck_connect; what must never happen is this plugin fighting an ongoing flash.
 const TICK_MS = 1000;
 
 // Wait this long after connecting before pushing the first frame. The board is
@@ -212,9 +218,20 @@ export function apply(ctx) {
         return typeof next === 'function' ? next() : undefined;
     });
 
-    ctx.on('assistant/message', (payload, next) => {
+    // `assistant/message` is a **session event type, not a bus event**: the bus carries
+    // it inside `session/event`, whose second argument is the logged event.
+    //
+    //     session/event(session, event)                                        emit
+    //     event = { type: 'assistant/message', turn, step, message, stream, usage? }
+    //
+    // Subscribing to the bare name was dead code: it never fired, so the assistant
+    // text and the "replied" log line never appeared on the device. It went unnoticed
+    // because the load self-test fires handlers by name; selftest.mjs now also asserts
+    // that every subscribed name is part of the host's real event surface.
+    ctx.on('session/event', (_session, event) => {
+        if (event?.type !== 'assistant/message') return;
         try {
-            const content = payload?.message?.content;
+            const content = event.message?.content;
             const text = Array.isArray(content)
                 ? content.map((c) => c?.text ?? '').join('')
                 : '';
@@ -227,7 +244,6 @@ export function apply(ctx) {
             /* ignore */
         }
         void paint();
-        return typeof next === 'function' ? next() : undefined;
     });
 
     ctx.on('agent/error', () => {
@@ -247,26 +263,36 @@ export function apply(ctx) {
 
     if (!connect()) {
         ctx.logger?.info?.(
-            'mosaico-deck: board not found. Not probing again -- opening the port '
-            + 'asserts DTR/RTS and would kick a chip out of ROM download mode. '
+            'mosaico-deck: board not found -- a pair of /dev/cu.usbmodem* nodes is '
+            + 'required, so a board that is unplugged or in ROM download mode is '
+            + 'ignored. Not probing again (opening the flashing node asserts DTR/RTS). '
             + 'Call deck_connect once the board is running.',
         );
     }
 
-    const tickTimer = setInterval(() => {
-        if (!deck.connected) return;
-        const next = state.status === 'idle'
-            ? 0
-            : Math.floor((Date.now() - state.startedAt) / 1000);
-        if (next !== state.elapsed) {
-            state.elapsed = next;
-            void paint();
-        }
-    }, TICK_MS);
+    // Cleanup must go through `ctx.effect()`.
+    //
+    // **Cordis never emits a `dispose` event** -- there is no such name in any of the
+    // host's `Events` interfaces -- so `ctx.on('dispose', ...)` silently never ran and
+    // both the interval and the open serial fd outlived the plugin. That is how a
+    // stale process kept holding /dev/cu.usbmodem21201 across a restart. Listener
+    // registrations unwind with the fiber on their own; raw resources do not.
+    ctx.effect(() => {
+        const tickTimer = setInterval(() => {
+            if (!deck.connected) return;
+            const next = state.status === 'idle'
+                ? 0
+                : Math.floor((Date.now() - state.startedAt) / 1000);
+            if (next !== state.elapsed) {
+                state.elapsed = next;
+                void paint();
+            }
+        }, TICK_MS);
 
-    ctx.on('dispose', () => {
-        clearInterval(tickTimer);
-        deck.close();
+        return () => {
+            clearInterval(tickTimer);
+            deck.close();
+        };
     });
 
     // -----------------------------------------------------------------------
@@ -289,7 +315,13 @@ export function apply(ctx) {
         output: textOutput((v) => v.message),
         async execute() {
             if (deck.connected) return { message: 'already connected' };
-            if (!connect()) return { message: `no board found on ${findPort() ?? 'any port'}` };
+            if (!connect()) {
+                return {
+                    message: 'no mosaico-deck data port found: the board must be running '
+                        + '(not in ROM download mode) and enumerate as a pair of '
+                        + '/dev/cu.usbmodem* nodes; the higher node of the pair is used',
+                };
+            }
             return { message: `connected to ${deck.port}` };
         },
         presentCall: () => ({ card: 'generic', kind: 'read', title: 'Connect to device' }),
