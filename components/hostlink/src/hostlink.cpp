@@ -64,6 +64,7 @@ constexpr uint32_t kAudioPayloadMax = 256 * 1024;
 std::atomic<bool> g_capturing{false};
 
 display::Panel* g_panel = nullptr;
+hostlink::CtrlSink g_ctrl_sink = nullptr;
 Stats g_stats;
 
 // Lock for sending messages. **Mandatory**: usb_console::Write has no internal lock (its
@@ -181,19 +182,90 @@ void SendAudioUp(const void* data, size_t len) {
     usb_console::Write(static_cast<const uint8_t*>(data), len);
 }
 
+namespace {
+
+// Pull one value out of our own three-key control JSON, e.g.
+// {"cmd":"volume","value":70}.
+//
+// **Deliberately not a JSON parser.** The payload is written by the PC side of this same
+// repository, the shape is fixed, and a real parser would be a dependency for two
+// fields. What matters instead is that malformed input cannot misbehave: every scan is
+// bounded, so a truncated or hostile frame just fails to parse.
+bool FindString(const char* text, const char* key, char* out, size_t out_size) {
+    const char* at = strstr(text, key);
+    if (at == nullptr) {
+        return false;
+    }
+    at = strchr(at + strlen(key), ':');
+    if (at == nullptr) {
+        return false;
+    }
+    while (*++at == ' ' || *at == '\t') {
+    }
+    if (*at != '"') {
+        return false;
+    }
+    ++at;
+    size_t i = 0;
+    while (*at != '\0' && *at != '"' && i + 1 < out_size) {
+        out[i++] = *at++;
+    }
+    out[i] = '\0';
+    return *at == '"';
+}
+
+bool FindInt(const char* text, const char* key, int* out) {
+    const char* at = strstr(text, key);
+    if (at == nullptr) {
+        return false;
+    }
+    at = strchr(at + strlen(key), ':');
+    if (at == nullptr) {
+        return false;
+    }
+    while (*++at == ' ' || *at == '\t') {
+    }
+    if (*at < '0' || *at > '9') {
+        return false;              // these values are never negative
+    }
+    int value = 0;
+    while (*at >= '0' && *at <= '9') {
+        value = value * 10 + (*at - '0');
+        if (value > 1000000) {
+            return false;          // bounded: no overflow, no runaway scan
+        }
+        ++at;
+    }
+    *out = value;
+    return true;
+}
+
+}  // namespace
+
 void HandleCtrl(const uint8_t* payload, size_t len) {
-    // Currently there is only one: print the payload as-is as one line of JSON, so the PC
-    // side can confirm what the board received. Real control commands will get their
-    // branches here later.
-    //
-    // Note that the payload does not necessarily end with '\0' (the protocol carries no
+    // The payload does not necessarily end with '\0' (the protocol carries no
     // terminator), so copy it into a stack buffer first.
     char text[kCtrlMax + 1];
     const size_t n = (len < kCtrlMax) ? len : kCtrlMax;
     memcpy(text, payload, n);
     text[n] = '\0';
-    ESP_LOGI(kTag, "control message: %s", text);
-    SendLine("{\"t\":\"ack\",\"ctrl\":true}");
+
+    char cmd[16];
+    int value = 0;
+    if (!FindString(text, "\"cmd\"", cmd, sizeof(cmd)) || !FindInt(text, "\"value\"", &value)) {
+        ESP_LOGW(kTag, "control message without cmd/value: %s", text);
+        SendLine("{\"t\":\"err\",\"msg\":\"bad control payload\"}");
+        return;
+    }
+    if (g_ctrl_sink == nullptr || !g_ctrl_sink(cmd, value)) {
+        ESP_LOGW(kTag, "control command not handled: %s=%d", cmd, value);
+        SendLine("{\"t\":\"err\",\"msg\":\"unknown control command\"}");
+        return;
+    }
+    ESP_LOGI(kTag, "control %s=%d", cmd, value);
+    // Echo the command back: the PC side uses this to confirm the board actually applied
+    // it rather than merely receiving the frame.
+    SendLine("{\"t\":\"ack\",\"ctrl\":\"%s\",\"value\":%d}", cmd, value);
 }
 
 // Receive one band's pixels **as a stream** into the band buffer.
@@ -446,6 +518,10 @@ void RxTask(void* arg) {
 
 }  // namespace
 
+void SetCtrlSink(CtrlSink sink) {
+    g_ctrl_sink = sink;
+}
+
 void SetPanel(void* panel) {
     g_panel = static_cast<display::Panel*>(panel);
 }
@@ -500,6 +576,10 @@ void SendTouch(bool down, int x, int y) {
     } else {
         SendLine("{\"t\":\"touch\",\"ev\":\"up\"}");
     }
+}
+
+void SendTouchMove(int x, int y) {
+    SendLine("{\"t\":\"touch\",\"ev\":\"move\",\"x\":%d,\"y\":%d}", x, y);
 }
 
 void SendKey(const char* ev) {

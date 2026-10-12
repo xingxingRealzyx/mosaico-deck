@@ -44,6 +44,14 @@
 
 namespace {
 
+// Speaker volume at boot, 0-100.
+//
+// **Nothing ever set this.** The codec played at its power-on default, which is why
+// speech was too quiet to hear from across a desk -- the effect was there the whole time,
+// it was just never turned up.
+inline constexpr int kDefaultVolume = 85;
+
+
 constexpr const char* kTag = "deck";
 
 display::Panel g_panel;
@@ -424,14 +432,33 @@ void TouchTask(void* arg) {
     (void)arg;
     bool was_active = false;
     bool rec_held = false;
+    int last_x = -1;
+    int last_y = -1;
+    int64_t last_move_us = 0;
     int64_t last_button_us = osal::TimeUs();
     for (;;) {
         g_touch.Poll();
         const fluidbox::touch::State ts = g_touch.Get();
         if (ts.active != was_active) {
             was_active = ts.active;
+            last_x = ts.x;
+            last_y = ts.y;
             hostlink::SendTouch(ts.active, ts.x, ts.y);
             ESP_LOGI(kTag, "touch %s (%d,%d)", ts.active ? "down" : "up", ts.x, ts.y);
+        } else if (ts.active) {
+            // Movement while the finger is down. Touch is polled every 3ms and the PC
+            // only needs enough samples to follow a finger, so report on real movement
+            // (3px) at a bounded rate -- this is what makes dragging a slider and the
+            // pull-down gesture possible at all.
+            const int64_t move_us = osal::TimeUs();
+            const int dx = ts.x > last_x ? ts.x - last_x : last_x - ts.x;
+            const int dy = ts.y > last_y ? ts.y - last_y : last_y - ts.y;
+            if ((dx >= 3 || dy >= 3) && move_us - last_move_us >= 25 * 1000) {
+                last_x = ts.x;
+                last_y = ts.y;
+                last_move_us = move_us;
+                hostlink::SendTouchMove(ts.x, ts.y);
+            }
         }
 
         // The button is polled here too -- spinning up a separate task just to read a GPIO every 25ms is not worth it.
@@ -596,6 +623,9 @@ extern "C" void app_main(void) {
     if (g_i2c_bus != nullptr) {
         if (audio::Init(g_i2c_bus) != ESP_OK) {
             ESP_LOGW(kTag, "audio init failed, the device can neither speak nor listen");
+        } else {
+            // Set an audible default: see kDefaultVolume.
+            audio::SetVolume(kDefaultVolume);
         }
     }
 
@@ -604,6 +634,24 @@ extern "C" void app_main(void) {
     // Passing nullptr when the panel is not ready is also legal: link keeps receiving frames and simply does not
     // display them (otherwise the stream would get out of sync).
     hostlink::SetPanel(g_panel.ready() ? &g_panel : nullptr);
+
+    // Commands from the PC. link parsed the wire; **main decides what they mean**, so
+    // link never has to know that audio or display exist. Both take 0-100 on the wire
+    // even though the panel's own scale is 0-255: one scale at the boundary, converted
+    // once, here.
+    hostlink::SetCtrlSink([](const char* cmd, int value) -> bool {
+        if (value < 0 || value > 100) {
+            return false;
+        }
+        if (strcmp(cmd, "volume") == 0) {
+            return audio::SetVolume(value) == ESP_OK;
+        }
+        if (strcmp(cmd, "brightness") == 0) {
+            return g_panel.SetBrightness(static_cast<uint8_t>(value * 255 / 100)) == ESP_OK;
+        }
+        return false;
+    });
+
     hostlink::Init();
 
     // ---- start tasks ----

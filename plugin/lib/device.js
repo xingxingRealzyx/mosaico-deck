@@ -34,6 +34,7 @@ const BAND_PIXELS = H_RES * BAND_ROWS;
 
 const MAGIC = Buffer.from([0xde, 0xad]);
 const TYPE_BAND = 0x01;
+const TYPE_CTRL = 0x10;
 const TYPE_AUDIO = 0x20;
 
 const AUDIO_BYTES_PER_SEC = 48000 * 4; // 48kHz interleaved stereo 16-bit
@@ -101,6 +102,19 @@ export class Deck extends EventEmitter {
         this._pendingAudio = 0;
         this._timer = null;
         this.stats = { bands: 0, bytes: 0, lastMs: 0, fulls: 0 };
+    }
+
+    /** Send one control command, e.g. { cmd: 'volume', value: 70 }.
+     *
+     * Uses the protocol's control frame (0x10, one line of JSON) -- the channel that
+     * existed from the start and was never used. The board answers with
+     * `{"t":"ack","ctrl":"volume","value":70}`, so the caller can confirm it was applied
+     * rather than merely received.
+     */
+    sendCtrl(cmd, value) {
+        if (this.fd === null) return false;
+        this._frame(TYPE_CTRL, Buffer.from(JSON.stringify({ cmd, value }), 'utf8'));
+        return true;
     }
 
     get connected() {

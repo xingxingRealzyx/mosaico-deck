@@ -142,6 +142,11 @@ export function apply(ctx) {
         // Last numbers read from the host's session projections (see readStats), plus
         // the root session they belong to.
         rootSession: null,
+        // Control centre. Levels are the plugin's model of the board's state: the board
+        // does not report them back, so they start at the values the firmware boots with
+        // (kDefaultVolume and 90/255 brightness).
+        panel: false,
+        levels: { volume: 85, brightness: 35 },
         voiceName: process.env.DECK_VOICE_NAME || undefined,   // macOS voice, e.g. Tingting
         stats: {
             context: 0,       // pressure the compaction threshold is measured against
@@ -159,7 +164,12 @@ export function apply(ctx) {
 
     const deck = new Deck(null);
     let buttons = [];
+    let panelHits = [];
     let painting = false;
+    // A paint request that arrived while one was in flight. Dropping it silently leaves
+    // the panel showing a stale value -- hit squarely by dragging a slider, where the
+    // updates come faster than a frame renders. One trailing repaint fixes it.
+    let repaintWanted = null;
 
     // Log entries carry **what kind of thing happened**, not just a string: the
     // renderer turns the kind (and the tool name) into a colour emoji, which is what
@@ -199,14 +209,19 @@ export function apply(ctx) {
     }
 
     async function paint({ force = false } = {}) {
-        if (!deck.connected || painting) return 0;
+        if (!deck.connected) return 0;
+        if (painting) {
+            repaintWanted = { force: force || (repaintWanted?.force ?? false) };
+            return 0;
+        }
         painting = true;
         try {
-            const { rgb } = await render({
+            const { rgb, hits } = await render({
                 // A picture is drawn as a preview *inside* the status page, not as a
                 // full-screen takeover: the state label stays readable above it.
-                page: 'status',
-                image: state.image,
+                page: state.panel ? 'panel' : 'status',
+                levels: state.panel ? state.levels : undefined,
+                image: state.panel ? null : state.image,
                 imageLeft: secondsOfImageLeft(),
                 caption: state.caption,
                 caption: state.caption,
@@ -223,6 +238,11 @@ export function apply(ctx) {
                 // them otherwise is noise, and a stray tap is expensive.
                 buttons: state.asking ? null : undefined,
             });
+            // The panel's own tap/drag rectangles, refreshed with every frame so a
+            // finger always lands on the geometry that is actually on screen.
+            if (state.panel) {
+                panelHits = hits;
+            }
             return deck.sendRgb(rgb, { force });
         } catch (err) {
             // A broken screen must never take the agent down with it.
@@ -230,6 +250,11 @@ export function apply(ctx) {
             return 0;
         } finally {
             painting = false;
+            if (repaintWanted) {
+                const next = repaintWanted;
+                repaintWanted = null;
+                void paint(next);
+            }
         }
     }
 
@@ -388,7 +413,81 @@ export function apply(ctx) {
         }
     }
 
+    // ---- control centre -------------------------------------------------------
+    //
+    // Opened by pulling down from the top edge and dragged like a phone's, because that
+    // is the interaction everyone already knows for "this thing is too loud / too dim".
+    // It only works at all because the firmware now reports `move` events.
+    const PULL_EDGE = 60;      // a pull has to start within this many px of the top
+    const PULL_DIST = 70;      // ... and travel this far before the panel opens
+    let touchStart = null;
+    let dragging = null;       // 'volume' | 'brightness' while a slider is held
+    let lastCtrlAt = 0;
+
+    /** Tell the board. Throttled: a drag produces samples every ~25ms and the board only
+     *  needs the value it ends on -- the last one is sent again on release. */
+    function sendLevel(key, pct, { force = false } = {}) {
+        const now = Date.now();
+        if (!force && now - lastCtrlAt < 50) return;
+        lastCtrlAt = now;
+        deck.sendCtrl(key, pct);
+    }
+
+    function setPanel(open) {
+        if (state.panel === open) return;
+        state.panel = open;
+        panelHits = [];
+        dragging = null;
+        // force: the panel is a full-page swap, and while the agent is idle nothing else
+        // would repaint the old frame away.
+        void paint({ force: true });
+    }
+
+    function levelFromX(hit, x) {
+        const pct = Math.max(0, Math.min(100,
+            Math.round((x - hit.x) / hit.w * 100)));
+        if (state.levels[dragging] === pct) return;
+        state.levels[dragging] = pct;
+        sendLevel(dragging, pct);
+        void paint();
+    }
+
     deck.on('event', (ev) => {
+        if (ev.t === 'touch') {
+            if (ev.ev === 'down') {
+                touchStart = { x: ev.x, y: ev.y };
+                if (state.panel) {
+                    const hit = panelHits.find((h) => ev.x >= h.x - 10
+                        && ev.x <= h.x + h.w + 10 && ev.y >= h.y - 10
+                        && ev.y <= h.y + h.h + 10);
+                    if (hit) {
+                        dragging = String(hit.value);
+                        levelFromX(hit, ev.x);
+                    } else {
+                        setPanel(false);       // tapping anywhere else closes it
+                    }
+                    return;
+                }
+            } else if (ev.ev === 'move') {
+                if (state.panel && dragging) {
+                    const hit = panelHits.find((h) => String(h.value) === dragging);
+                    if (hit) levelFromX(hit, ev.x);
+                }
+                return;
+            } else if (ev.ev === 'up') {
+                if (!state.panel && touchStart && touchStart.y <= PULL_EDGE
+                    && ev.y - touchStart.y >= PULL_DIST) {
+                    setPanel(true);
+                } else if (dragging) {
+                    // The throttled stream may have dropped the final value.
+                    sendLevel(dragging, state.levels[dragging], { force: true });
+                }
+                dragging = null;
+                touchStart = null;
+                return;
+            }
+        }
+
         if (ev.t === 'touch' && ev.ev === 'down' && state.asking) {
             const hit = buttons.find(
                 (b) => ev.x >= b.x - 6 && ev.x <= b.x + b.w + 6
@@ -815,6 +914,56 @@ export function apply(ctx) {
             };
         },
         presentCall: () => ({ card: 'generic', kind: 'read', title: 'Deck voice' }),
+    }));
+
+    ctx.tools.register(defineTool({
+        name: 'deck_control',
+        description:
+            'Set the mosaico-deck volume and/or brightness (0-100). Also adjustable on the '
+            + 'device itself by pulling down from the top edge, so this is for scripting it '
+            + 'rather than for routine use.',
+        parameters: {
+            volume: { type: 'number', description: '0-100.' },
+            brightness: { type: 'number', description: '0-100.' },
+        },
+        output: textOutput((v) => v.message),
+        async execute(args) {
+            if (!deck.connected) return { message: 'device not connected' };
+            const done = [];
+            for (const key of ['volume', 'brightness']) {
+                const v = args[key];
+                if (v === undefined) continue;
+                const pct = Math.max(0, Math.min(100, Math.round(Number(v))));
+                state.levels[key] = pct;
+                sendLevel(key, pct, { force: true });
+                done.push(`${key}=${pct}`);
+            }
+            if (done.length === 0) {
+                return { message: `volume=${state.levels.volume} brightness=${state.levels.brightness}` };
+            }
+            void paint();
+            return { message: `set ${done.join(' ')}` };
+        },
+        presentCall: () => ({ card: 'generic', kind: 'read', title: 'Deck volume/brightness' }),
+    }));
+
+    ctx.tools.register(defineTool({
+        name: 'deck_panel',
+        description:
+            'Open or close the mosaico-deck control centre (volume and brightness). Mostly '
+            + 'useful for showing the user the panel; they can also pull it down from the '
+            + 'top edge of the screen.',
+        parameters: {
+            open: { type: 'boolean', description: 'Omit to toggle.' },
+        },
+        output: textOutput((v) => v.message),
+        async execute(args) {
+            if (!deck.connected) return { message: 'device not connected' };
+            const open = args.open === undefined ? !state.panel : Boolean(args.open);
+            setPanel(open);
+            return { message: open ? 'control centre open' : 'control centre closed' };
+        },
+        presentCall: () => ({ card: 'generic', kind: 'read', title: 'Deck control centre' }),
     }));
 
     ctx.logger?.info?.(

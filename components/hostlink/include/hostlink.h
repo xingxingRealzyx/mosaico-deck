@@ -86,7 +86,24 @@ bool Capturing();
 // Report input. Called by the touch/key tasks -- it locks internally, so multiple tasks
 // may call it concurrently.
 void SendTouch(bool down, int x, int y);
+
+// A finger moved while still down.
+//
+// **Without this the panel can only be tapped.** A slider would jump from one value to
+// the next instead of following the finger, and a pull-down gesture -- "start at the top
+// edge and drag" -- cannot be expressed at all. The PC side gets throttled samples.
+void SendTouchMove(int x, int y);
+
 void SendKey(const char* ev);
+
+// Sink for control commands link does not own.
+//
+// Volume lives in the audio component and brightness in the display, and link must
+// depend on neither -- so main decides who handles what, exactly like SetPanel. `cmd` is
+// a NUL-terminated key (`"volume"`, `"brightness"`, ...) and `value` is already parsed.
+// Returning false makes link answer with an error, which is what the PC side shows.
+using CtrlSink = bool (*)(const char* cmd, int value);
+void SetCtrlSink(CtrlSink sink);
 
 // Whether the PC has ever sent a frame.
 //

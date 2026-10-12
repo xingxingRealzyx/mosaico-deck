@@ -525,6 +525,56 @@ def render_image(job):
     return render_status(job)
 
 
+def draw_slider(d, x, y, w, value, color):
+    """One phone-style slider: track, filled part, knob. Returns nothing.
+
+    The knob is what makes it read as draggable rather than as a progress bar.
+    """
+    h = 16
+    d.rounded_rectangle((x, y, x + w, y + h), radius=h // 2, fill=BG,
+                        outline=BORDER, width=1)
+    frac = max(0.0, min(1.0, value / 100.0))
+    if frac > 0:
+        d.rounded_rectangle((x, y, x + max(int(w * frac), h), y + h), radius=h // 2,
+                            fill=color)
+    cx = x + int(w * frac)
+    cy = y + h // 2
+    d.ellipse((cx - 13, cy - 13, cx + 13, cy + 13), fill=BG, outline=color, width=3)
+
+
+def render_panel(job):
+    """Control centre: volume and brightness, dragged like a phone's.
+
+    Only two controls, so it does not try to look like a settings app -- it is the
+    "something is too quiet / too bright" panel, and it is opened by pulling down from
+    the top edge (see index.js).
+    """
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    levels = job.get("levels") or {}
+    hits = []
+
+    d.text((28, 30), "控制中心", font=font(26), fill=TEXT)
+    d.text((W - 28, 38), "点空白关闭", font=font(S_FOOTER), fill=TEXT_SOFT,
+           anchor="ra")
+
+    rows = (("音量", "volume", 132, ACCENT), ("亮度", "brightness", 272, WARN))
+    for label, key, y, color in rows:
+        value = int(levels.get(key, 0))
+        d.text((28, y), label, font=font(26), fill=TEXT)
+        d.text((W - 28, y + 4), f"{value}%", font=font(S_PROGRESS, True),
+               fill=TEXT_SOFT, anchor="ra")
+        track_y = y + 46
+        draw_slider(d, 28, track_y, W - 56, value, color)
+        # A generous touch row: the track is 16px but a finger is not.
+        hits.append({"x": 20, "y": track_y - 18, "w": W - 40, "h": 54, "value": key})
+
+    d.line((28, H - 58, W - 28, H - 58), fill=BORDER, width=1)
+    d.text((28, H - 44), "从顶部边缘下拉打开 · 拖动滑块调节",
+           font=font(S_FOOTER), fill=TEXT_SOFT)
+    return img, hits
+
+
 def render_ask(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
@@ -603,7 +653,7 @@ def render_boot(job):
 
 
 PAGES = {"status": render_status, "image": render_image, "ask": render_ask,
-         "boot": render_boot}
+         "boot": render_boot, "panel": render_panel}
 
 
 def main():

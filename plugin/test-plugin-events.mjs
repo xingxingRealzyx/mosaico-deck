@@ -49,8 +49,10 @@ export class Deck {
     get connected() { return true; }
     open() { return true; }
     close() {}
-    on() { return this; }
+    on(ev, fn) { (this._h = this._h || {})[ev] = ((this._h || {})[ev] || []).concat(fn); globalThis.__deck = this; return this; }
+    emit(ev, ...a) { for (const f of ((this._h || {})[ev] || [])) f(...a); }
     sendRgb() { globalThis.__frames = (globalThis.__frames || 0) + 1; return 1; }
+    sendCtrl(cmd, value) { (globalThis.__ctrl = globalThis.__ctrl || []).push([cmd, value]); return true; }
 }
 `);
 
@@ -68,7 +70,14 @@ export function checkEnvironment() { return { python: 'stub', script: 'stub', ex
 export function render(job) {
     globalThis.__jobs = globalThis.__jobs || [];
     globalThis.__jobs.push(JSON.parse(JSON.stringify(job)));
-    return Promise.resolve({ rgb: Buffer.alloc(PAGE_BYTES), hits: [] });
+    // The touch handler hit-tests whatever the renderer last reported, so the stub has to
+    // return the panel's real rows -- an empty list makes the panel untouchable here.
+    // render.py owns the geometry and plugin/test_render_layout.py pins these numbers.
+    const hits = job.page === 'panel'
+        ? [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
+           { x: 20, y: 300, w: 440, h: 54, value: 'brightness' }]
+        : [];
+    return Promise.resolve({ rgb: Buffer.alloc(PAGE_BYTES), hits });
 }
 `);
 
@@ -132,8 +141,8 @@ check(typeof mod.build === 'string' && mod.build.length === 7,
       `导出 build 指纹：${mod.build}（用来判断进程里跑的是哪份代码）`);
 
 console.log('注册的工具');
-check(registered.length === 6,
-    `6 个工具：${registered.map((t) => t.name).join(', ')}`);
+check(registered.length === 8,
+    `8 个工具：${registered.map((t) => t.name).join(', ')}`);
 check(registered.some((t) => t.name === 'deck_image'), 'deck_image 已注册');
 
 console.log('工具调用 -> 渲染 job');
@@ -297,6 +306,43 @@ await fire('agent/error', { error: new Error('静音后的失败') });
 await new Promise((r) => setTimeout(r, 80));
 check((globalThis.__spoken || []).length === 0, '关掉之后不再出声');
 await voiceTool.execute({ enabled: true });
+
+console.log('控制中心：顶部下拉打开 / 拖动滑块 / 点空白关闭');
+const touch = (ev, x, y) => globalThis.__deck.emit('event', { t: 'touch', ev, x, y });
+touch('down', 200, 30);
+touch('move', 200, 70);
+touch('up', 200, 140);
+await new Promise((r) => setTimeout(r, 60));
+check(job().page === 'panel', `从顶部下拉会打开控制中心（page=${job().page}）`);
+check(job().levels?.volume === 85, `面板带着当前档位：音量 ${job().levels?.volume}%`);
+
+// 滑块之外的点按是"关闭"，所以拖拽测试必须紧接着打开状态进行。
+
+globalThis.__ctrl = [];
+touch('down', 100, 190);          // 音量滑块那一行
+touch('move', 240, 190);          // 拖到中间
+touch('up', 240, 190);
+await new Promise((r) => setTimeout(r, 60));
+const vol = job().levels?.volume;
+check(vol >= 45 && vol <= 55, `拖动滑块把音量调到 ${vol}%`);
+check((globalThis.__ctrl || []).some(([c, v]) => c === 'volume' && Math.abs(v - vol) <= 6),
+    `命令也发给了板子：${JSON.stringify(globalThis.__ctrl)}`);
+
+globalThis.__ctrl = [];
+touch('down', 240, 430);          // 滑块之外
+await new Promise((r) => setTimeout(r, 60));
+check(job().page === 'status', '点空白处关闭面板');
+
+console.log('deck_control / deck_panel');
+check(registered.some((t) => t.name === 'deck_control'), 'deck_control 已注册');
+check(registered.some((t) => t.name === 'deck_panel'), 'deck_panel 已注册');
+const ctrlTool = registered.find((t) => t.name === 'deck_control');
+globalThis.__ctrl = [];
+const res = await ctrlTool.execute({ brightness: 80 });
+check((globalThis.__ctrl || []).some(([c, v]) => c === 'brightness' && v === 80),
+    `deck_control 直接改亮度并发命令：${res.message}`);
+check((await ctrlTool.execute({})).message.includes('brightness=80'),
+    '不带参数时报告当前档位');
 
 for (const dispose of effects) {
     if (typeof dispose === 'function') dispose();
