@@ -62,6 +62,7 @@ export async function textToPcm(text) {
     globalThis.__spoken.push(text);
     return Buffer.alloc(4800);          // 50ms 的假 PCM，不用真合成
 }
+export function normalize(pcm) { return pcm; }
 `);
 
 fs.writeFileSync(path.join(root, 'lib', 'render.js'), `
