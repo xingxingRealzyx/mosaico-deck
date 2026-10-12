@@ -77,3 +77,12 @@ fi
 echo
 echo "✅ 装好了。**需要重启 DeepSeek Harness** 才会加载（profile 的 bundle 只在启动时组装）。"
 echo "   设备连上后，屏幕上会自动出现状态 —— 不需要模型调任何工具。"
+
+# Which build is now on disk. The running plugin writes `loaded-build`; render.py
+# compares the two and puts a banner on the panel when they differ, so that
+# "the new button is there but does nothing" announces itself instead of looking
+# like a bug in the button. See staleness_banner in render.py.
+if [ -f "$DEST/lib/index.js" ]; then
+    printf '%s' "$(shasum -a 256 "$DEST/lib/index.js" | cut -c1-7)" \
+        > "$DEST/lib/deployed-build"
+fi

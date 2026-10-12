@@ -91,15 +91,6 @@ export const deps = (() => {
     };
 })();
 
-// Leave a note about which build is *running*. The renderer reads it and warns on the
-// panel when the files on disk are newer -- see staleness_banner in render.py.
-try {
-    fsSync.writeFileSync(
-        path.join(path.dirname(fileURLToPath(import.meta.url)), 'loaded-build'), build);
-} catch {
-    /* not fatal: the banner simply will not appear */
-}
-
 export const name = 'mosaico-deck';
 // `agents` tells the root conversation from the subagent sessions on the same bus;
 // `sessionProjections` is the host's own fold of the session numbers the strip shows.
@@ -1557,6 +1548,20 @@ export function apply(ctx) {
         },
         presentCall: () => ({ card: 'generic', kind: 'read', title: 'Deck control centre' }),
     }));
+
+    // Leave a note about which build is *running*, so the renderer (which is read from
+    // disk on every paint, unlike this file) can tell the user when the two disagree.
+    //
+    // **Written here rather than at module load, and loud if it fails**: the first version
+    // was a top-level write with an empty catch, and the file simply never appeared --
+    // a silent no-op in the very mechanism meant to expose silent mismatches.
+    try {
+        const here = path.dirname(fileURLToPath(import.meta.url));
+        fsSync.writeFileSync(path.join(here, 'loaded-build'), build);
+    } catch (err) {
+        ctx.logger?.warn?.(`mosaico-deck: could not record the running build `
+            + `(${err?.message ?? err}); the "needs restart" banner will not work`);
+    }
 
     ctx.logger?.info?.(
         `mosaico-deck: build=${build} python=${checkEnvironment().python} `
