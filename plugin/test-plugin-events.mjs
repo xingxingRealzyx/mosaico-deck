@@ -567,9 +567,12 @@ console.log('语音开关：下拉栏里能关掉播报');
 await openPanel();
 check(job().voice === true, `默认是开：voice=${job().voice}`);
 globalThis.__spoken = [];
-touch('down', 380, 380);          // 落在开关上
+// 360 落在开关热区的上沿、同时也是亮度滑块热区的下沿 —— 重叠处必须判给开关
+touch('down', 380, 360);
 await new Promise((r) => setTimeout(r, 120));
-check(job().voice === false, `点一下就关：voice=${job().voice}`);
+check(job().voice === false, `重叠处也判给开关（不误调亮度）：voice=${job().voice}`);
+check(job().levels?.brightness === 40 || job().levels?.brightness === undefined,
+    `亮度没有被误改：${job().levels?.brightness}`);
 globalThis.__spoken = [];
 await fire('agent/error', { error: new Error('关掉之后不该播报') });
 await new Promise((r) => setTimeout(r, 120));

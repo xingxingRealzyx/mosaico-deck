@@ -861,9 +861,16 @@ export function apply(ctx) {
                 lastTouch = { x: ev.x, y: ev.y };
                 if (state.panel) {
                     panelTouchedAt = Date.now();
-                    const hit = panelHits.find((h) => ev.x >= h.x - 10
-                        && ev.x <= h.x + h.w + 10 && ev.y >= h.y - 10
-                        && ev.y <= h.y + h.h + 10);
+                    // **Toggles and the close button win over the sliders.** Their hit
+                    // regions overlap by a few pixels (the voice switch sits just under
+                    // the brightness track) and `find` returns whichever comes first, so
+                    // a tap on the switch's top edge would adjust brightness instead of
+                    // toggling voice.
+                    const inside = (h) => ev.x >= h.x - 10 && ev.x <= h.x + h.w + 10
+                        && ev.y >= h.y - 10 && ev.y <= h.y + h.h + 10;
+                    const hit = panelHits.find((h) => inside(h)
+                        && (h.kind === 'toggle' || h.kind === 'close'))
+                        ?? panelHits.find(inside);
                     if (hit && hit.kind === 'close') {
                         setPanel(false);
                     } else if (hit && hit.kind === 'toggle') {
