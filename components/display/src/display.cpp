@@ -408,8 +408,15 @@ esp_err_t Panel::CommitFrame() {
     if (panel_ == nullptr || g_frame_buf == nullptr || g_dirty_mask == 0) {
         return ESP_ERR_INVALID_STATE;   // nothing staged, nothing to do
     }
+    // **Clear only the bits being pushed, not the whole word.**
+    //
+    // Reading the mask and then zeroing it loses any band staged in between -- which is a
+    // window of ~30 ms here (a TE wait plus the SPI transfer), while the PC keeps sending
+    // bands. A lost band is lost for good: the PC diffs against what it has already sent,
+    // so that row is never sent again and the picture freezes with it. That is exactly
+    // what "the screen is stuck and the clock stopped" was.
     const uint16_t mask = g_dirty_mask;
-    g_dirty_mask = 0;
+    g_dirty_mask = static_cast<uint16_t>(g_dirty_mask & ~mask);
 
     // Align with the panel's scanout before starting. This is the half that removes the
     // visible seam; a single transfer alone would still begin at an arbitrary point in
@@ -440,10 +447,13 @@ esp_err_t Panel::CommitFrame() {
                 fluidbox::config::kLcdHRes, y1,
                 g_frame_buf + static_cast<size_t>(y0) * fluidbox::config::kLcdHRes);
             if (err != ESP_OK) {
-                // Loud on purpose: a failed push means rows on screen stay stale, and the
-                // PC will not send them again (it diffs against what it already sent).
-                ESP_LOGE(kTag, "commit rows %d..%d failed: %s", y0, y1,
-                         esp_err_to_name(err));
+                // **Put the rows back as dirty.** A failed push means those pixels never
+                // reached the panel, and since the PC diffs against what it has already
+                // sent, it will never offer them again. Retrying here is the only thing
+                // that can recover the picture.
+                g_dirty_mask = static_cast<uint16_t>(g_dirty_mask | mask);
+                ESP_LOGE(kTag, "commit rows %d..%d failed: %s (rows kept dirty)",
+                         y0, y1, esp_err_to_name(err));
                 return err;
             }
         }
