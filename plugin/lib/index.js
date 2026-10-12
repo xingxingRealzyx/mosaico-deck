@@ -733,8 +733,16 @@ export function apply(ctx) {
     //
     // Reasoning deltas are shown too: when a model exposes its thinking, that answers
     // "what is it doing" far better than the word 思考中.
+    const STREAM_PAINT_MS = 250;   // how often the streaming text may repaint the panel
     let streamTail = '';
     let streamPaintedAt = 0;
+    let streamTimer = null;
+    function paintStream() {
+        state.status = 'thinking';
+        state.tool = null;
+        state.detail = streamTail.replace(/\s+/g, ' ').trim().slice(-60);
+        void paint();
+    }
     ctx.on('agent/assistant-stream', (payload) => {
         if (!isRootAgent(payload?.agent)) return;
         const chunk = payload?.frame?.chunk;
@@ -743,12 +751,21 @@ export function apply(ctx) {
         streamTail = (streamTail + chunk.text).slice(-400);
         // Chunks arrive per token; the panel cannot and need not keep up with that.
         const now = Date.now();
-        if (now - streamPaintedAt < 250) return;
-        streamPaintedAt = now;
-        state.status = 'thinking';
-        state.tool = null;
-        state.detail = streamTail.replace(/\s+/g, ' ').trim().slice(-60);
-        void paint();
+        const waited = now - streamPaintedAt;
+        if (waited >= STREAM_PAINT_MS) {
+            streamPaintedAt = now;
+            paintStream();
+        } else if (streamTimer === null) {
+            // **Trailing paint.** Dropping everything inside the window loses the last
+            // delta before a pause, so the line sits behind what the model has actually
+            // written -- visible as text that stops a few characters short. Same lesson as
+            // the repaint coalescing in paint().
+            streamTimer = setTimeout(() => {
+                streamTimer = null;
+                streamPaintedAt = Date.now();
+                paintStream();
+            }, STREAM_PAINT_MS - waited);
+        }
     });
 
     ctx.on('agent/error', (payload) => {
@@ -809,6 +826,7 @@ export function apply(ctx) {
     // stale process kept holding /dev/cu.usbmodem21201 across a restart. Listener
     // registrations unwind with the fiber on their own; raw resources do not.
     ctx.effect(() => {
+        // (the streaming timer is cleared with the rest, below)
         const tickTimer = setInterval(() => {
             if (!deck.connected) return;
             const next = state.status === 'idle'

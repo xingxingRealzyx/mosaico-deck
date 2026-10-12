@@ -287,10 +287,11 @@ await stream('面板上的字');
 check(job().state === 'thinking', '生成中状态是 thinking');
 check((job().detail || '').includes('面板上的字'),
     `正在生成的文字出现在 detail 行：${JSON.stringify(job().detail)}`);
+// 紧跟在前一次绘制之后（节流窗口内）也要最终显示出来 —— 这正是尾随重绘要解决的
 await stream('继续写', 'reasoning-delta');
-await new Promise((r) => setTimeout(r, 300));
+await new Promise((r) => setTimeout(r, 400));
 check((job().detail || '').includes('继续写'),
-    `reasoning-delta 也显示：${JSON.stringify(job().detail)}`);
+    `节流窗口内的最后一个增量也会显示（尾随重绘）：${JSON.stringify(job().detail)}`);
 await fire('agent/assistant-stream', { agent: SUBAGENT_AGENT,
     frame: { type: 'chunk', chunk: { type: 'text-delta', text: '子代理不该出现' } } });
 await new Promise((r) => setTimeout(r, 300));
