@@ -81,13 +81,21 @@ export function render(job) {
     // The touch handler hit-tests whatever the renderer last reported, so the stub has to
     // return the panel's real rows -- an empty list makes the panel untouchable here.
     // render.py owns the geometry and plugin/test_render_layout.py pins these numbers.
-    const hits = job.page === 'panel'
-        ? [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
-           { x: 20, y: 300, w: 440, h: 54, value: 'brightness' },
-           { x: 408, y: 10, w: 64, h: 64, value: 'close', kind: 'close' }]
-        : (job.replies || []).map((c, i, all) => ({
+    // 每个页面的热区都要有分支：漏掉一个页面，那一页的点击就会静默变成"没有热区"，
+    // 看起来像插件 bug（之前正是这样找错了两轮）。真实几何由 test_render_layout.py 钉住。
+    let hits;
+    if (job.page === 'panel') {
+        hits = [{ x: 20, y: 160, w: 440, h: 54, value: 'volume' },
+                { x: 20, y: 300, w: 440, h: 54, value: 'brightness' },
+                { x: 408, y: 10, w: 64, h: 64, value: 'close', kind: 'close' }];
+    } else if (job.page === 'ask') {
+        hits = (job.options || []).map((o, i) => ({
+            x: 28, y: 260 + i * 80, w: 424, h: 64, value: o }));
+    } else {
+        hits = (job.replies || []).map((c, i) => ({
             x: 28 + i * (140 + 10), y: 360, w: 140, h: 46,
             value: c.text, kind: c.kind }));
+    }
     return Promise.resolve({ rgb: Buffer.alloc(PAGE_BYTES), hits });
 }
 `);
@@ -507,8 +515,8 @@ await fire('session/event', ROOT_SESSION, { type: 'turn/start', turn: 21 });
 await fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => {});
 await new Promise((r) => setTimeout(r, 60));
 chipsNow = (job().replies || []).map((c) => `${c.text}:${c.kind}`);
-check(chipsNow.join('/') === '停下:cancel',
-    `干活时只给"停下"，而且是 cancel：${chipsNow.join('/')}`);
+check(chipsNow.join('/') === '停止本轮:cancel',
+    `干活时只给"停止本轮"，而且是 cancel：${chipsNow.join('/')}`);
 globalThis.__cancels = [];
 globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 60, y: 380 });
 await new Promise((r) => setTimeout(r, 80));
@@ -552,6 +560,33 @@ globalThis.__deck.emit('ack', { t: 'ack', rec: true });
 globalThis.__deck.emit('key', { t: 'key', ev: 'voice_end' });
 await new Promise((r) => setTimeout(r, 120));
 check(job().state === 'idle', '过短的按压（<50ms）直接回到空闲，不做无用的识别');
+
+console.log('提问镜像到设备：看得到、点得选');
+await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 30 });
+await new Promise((r) => setTimeout(r, 60));
+// 宿主自己的提问工具被调用时，问题要出现在设备上
+await fire('tools/pre-execute', {
+    name: 'ask_user_question',
+    arguments: { questions: [{ id: 'q1', question: '要用哪种方案？',
+                              options: [{ label: '方案甲' }, { label: '方案乙' }] }] },
+}, () => {});
+await new Promise((r) => setTimeout(r, 80));
+check(job().page === 'ask', `提问会切到设备上的问题页：page=${job().page}`);
+check((job().question || '').includes('要用哪种方案'), `问题内容在设备上：${job().question}`);
+check(JSON.stringify(job().options) === JSON.stringify(['方案甲', '方案乙']),
+    `选项也在：${JSON.stringify(job().options)}`);
+// 点选项 -> 作为一条用户消息发出（与用户自己打字的同一条路）
+globalThis.__prompts = [];
+globalThis.__deck.emit('event', { t: 'touch', ev: 'down', x: 240, y: 300 });
+await new Promise((r) => setTimeout(r, 120));
+const answered = globalThis.__prompts || [];
+check(answered.length === 1 && answered[0].content?.[0]?.text === '方案甲',
+    `点选项会作答：${JSON.stringify(answered[0]?.content)}`);
+check(job().page !== 'ask', '答完问题页就撤掉');
+// 子代理的提问不该打断主会话
+await fire('agent/status', { status: 'running' });
+await fire('tools/pre-execute', { name: 'bash', arguments: { command: 'ls' } }, () => {});
+check(job().page !== 'ask', '普通工具调用不会触发问题页');
 
 console.log('deck_control / deck_panel');
 check(registered.some((t) => t.name === 'deck_control'), 'deck_control 已注册');

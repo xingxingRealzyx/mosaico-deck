@@ -189,6 +189,7 @@ export function apply(ctx) {
         lastReply: '',      // opening of the last reply, spoken when the turn ends
         lastSent: '',       // last text sent from the device (chip press or voice)
         chips: [],          // quick-reply hit regions from the last status frame
+        question: null,     // a question from the agent, mirrored for the device
         panel: false,
         levels: { volume: 85, brightness: 35 },
         voiceName: process.env.DECK_VOICE_NAME || undefined,   // macOS voice, e.g. Tingting
@@ -266,7 +267,9 @@ export function apply(ctx) {
             const { rgb, hits } = await render({
                 // A picture is drawn as a preview *inside* the status page, not as a
                 // full-screen takeover: the state label stays readable above it.
-                page: state.panel ? 'panel' : 'status',
+                page: state.question ? 'ask' : (state.panel ? 'panel' : 'status'),
+                question: state.question?.question,
+                options: state.question?.options,
                 levels: state.panel ? state.levels : undefined,
                 image: state.panel ? null : state.image,
                 imageLeft: secondsOfImageLeft(),
@@ -289,7 +292,9 @@ export function apply(ctx) {
             });
             // The panel's own tap/drag rectangles, refreshed with every frame so a
             // finger always lands on the geometry that is actually on screen.
-            if (state.panel) {
+            if (state.question) {
+                questionHits = hits;
+            } else if (state.panel) {
                 panelHits = hits;
             } else if (!state.asking) {
                 state.chips = hits;
@@ -384,6 +389,7 @@ export function apply(ctx) {
     }
 
     function endTurn() {
+        clearQuestion();
         const elapsed = state.startedAt ? Date.now() - state.startedAt : 0;
         state.status = 'idle';
         state.tool = null;
@@ -558,6 +564,8 @@ export function apply(ctx) {
         const controller = ctx.sessionController;
         if (!session?.id || typeof controller?.cancel !== 'function') {
             ctx.logger?.warn?.('mosaico-deck: no session controller, cannot cancel');
+            pushLog({ kind: 'error', text: 'no session' });
+            void paint({ force: true });
             return false;
         }
         try {
@@ -566,9 +574,48 @@ export function apply(ctx) {
             void paint({ force: true });
             return true;
         } catch (err) {
+            // **Visible, not just logged.** "I pressed stop and nothing happened" is
+            // unanswerable from the panel if the only trace is a log line.
             ctx.logger?.warn?.(`mosaico-deck: cancel failed: ${err?.message ?? err}`);
+            pushLog({ kind: 'error', text: 'stop failed' });
+            void paint({ force: true });
             return false;
         }
+    }
+
+    /** A question the agent asked, mirrored onto the panel.
+     *
+     * **Why mirror instead of intercept.** The agent's own question tool is the one that
+     * gets used in practice; `deck_ask` is only reached when the model remembers to call
+     * it, which is the same "automatic things must not depend on the model" lesson as the
+     * voice announcements. So the panel watches for that tool being called and shows the
+     * same question.
+     *
+     * The two surfaces stay **parallel**: answering here sends the choice as an ordinary
+     * user message (the path a chip press already takes), so it arrives even while the
+     * dialog is still open at the keyboard. It deliberately does *not* block the tool
+     * call -- that would break answering at the keyboard, and a device that eats the
+     * question is worse than one that only shows it.
+     */
+    const ASK_TOOL = /^(ask_user_question|ask)$/;
+    let questionHits = [];
+
+    function clearQuestion() {
+        if (!state.question) return;
+        state.question = null;
+        questionHits = [];
+    }
+
+    function mirrorQuestion(args) {
+        const q = (args?.questions ?? [])[0];
+        if (!q?.question) return;
+        const options = (q.options ?? []).map((o) => String(o?.label ?? o));
+        if (options.length === 0) return;
+        state.question = { question: String(q.question), options, multi: Boolean(q.multi_select) };
+        state.status = 'waiting';
+        state.tool = null;
+        state.detail = '';
+        void paint({ force: true });
     }
 
     /** Which chips to show right now.
@@ -581,7 +628,7 @@ export function apply(ctx) {
     function quickReplies() {
         if (state.asking) return [];
         if (state.status !== 'idle' && state.status !== 'error') {
-            return [{ text: '停下', kind: 'cancel' }];
+            return [{ text: '停止本轮', kind: 'cancel' }];
         }
         return [{ text: '继续', kind: 'prompt' }, { text: '详细说说', kind: 'prompt' }];
     }
@@ -786,6 +833,20 @@ export function apply(ctx) {
         if (ev.t === 'touch') {
             markActivity();
             if (ev.ev === 'down') {
+                // A mirrored question takes the taps while it is up.
+                if (state.question) {
+                    const opt = questionHits.find((h) => ev.x >= h.x - 10
+                        && ev.x <= h.x + h.w + 10 && ev.y >= h.y - 10
+                        && ev.y <= h.y + h.h + 10);
+                    if (opt) {
+                        const chosen = String(opt.value);
+                        clearQuestion();
+                        void sendPrompt(chosen);
+                        void paint({ force: true });
+                    }
+                    return;
+                }
+
                 // Quick replies first: they are the one control on the status page.
                 const chip = !state.panel && !state.asking
                     && state.chips.find((h) => ev.x >= h.x - 6 && ev.x <= h.x + h.w + 6
@@ -925,7 +986,9 @@ export function apply(ctx) {
         try {
             const { toolName, target } = describeTool(exec);
             state.status = 'tool';
-            state.tool = toolName;
+            // Mirror the agent's own questions onto the panel; see mirrorQuestion.
+        if (ASK_TOOL.test(toolName)) mirrorQuestion(exec.arguments);
+        state.tool = toolName;
             state.detail = `Calling ${toolName}`;
             if (target) state.target = target.slice(0, 40);
             state.progress = null;
@@ -992,6 +1055,7 @@ export function apply(ctx) {
             // Session events are the channel that demonstrably works (assistant/message
             // arrives on it), so the turn lifecycle is driven from here.
             if (isRootSession(session)) {
+                clearQuestion();
                 state.startedAt = Date.now();
                 state.log = [];
                 state.lastReply = '';
