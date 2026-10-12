@@ -20,6 +20,7 @@
 # None of it needs a board: the tap rectangles come back over stderr, and the font
 # and palette are pure functions.
 
+import json
 import importlib.util
 import os
 import pathlib
