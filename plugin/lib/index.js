@@ -91,6 +91,15 @@ export const deps = (() => {
     };
 })();
 
+// Leave a note about which build is *running*. The renderer reads it and warns on the
+// panel when the files on disk are newer -- see staleness_banner in render.py.
+try {
+    fsSync.writeFileSync(
+        path.join(path.dirname(fileURLToPath(import.meta.url)), 'loaded-build'), build);
+} catch {
+    /* not fatal: the banner simply will not appear */
+}
+
 export const name = 'mosaico-deck';
 // `agents` tells the root conversation from the subagent sessions on the same bus;
 // `sessionProjections` is the host's own fold of the session numbers the strip shows.

@@ -47,6 +47,7 @@
 #    second one is bright; hierarchy comes from size and weight.
 
 import json
+import pathlib
 import sys
 import os
 
@@ -743,6 +744,34 @@ PAGES = {"status": render_status, "image": render_image, "ask": render_ask,
          "boot": render_boot, "panel": render_panel}
 
 
+def staleness_banner(img, d):
+    """Say it on the panel when the code on disk is newer than the code running.
+
+    **This exact confusion has cost three rounds of "the button is there but does
+    nothing".** `render.py` is read from disk on every paint, while `lib/*.js` is loaded
+    once per process -- so a newly deployed button appears on the panel and is inert,
+    which looks exactly like a bug in the button.
+
+    The renderer is the half that is always current, so it is the half that can notice.
+    It compares what the running plugin wrote at startup with what the installer wrote.
+    """
+    try:
+        loaded_file = os.environ.get("DECK_LOADED_BUILD_FILE") or str(
+            pathlib.Path(__file__).resolve().parent / "lib" / "loaded-build")
+        deployed_file = os.environ.get("DECK_DEPLOYED_BUILD_FILE") or str(
+            pathlib.Path(__file__).resolve().parent / "lib" / "deployed-build")
+        loaded = pathlib.Path(loaded_file).read_text().strip()
+        deployed = pathlib.Path(deployed_file).read_text().strip()
+    except Exception:
+        return
+    if not loaded or not deployed or loaded == deployed:
+        return
+    d.rectangle((0, 0, W, 40), fill=BG)
+    d.line((0, 40, W, 40), fill=WARN, width=2)
+    d.text((28, 20), "插件已更新 · 需要重启 Harness",
+           font=font(S_LOG, True), fill=WARN, anchor="lm")
+
+
 def main():
     line = sys.stdin.readline()
     if not line:
@@ -769,6 +798,8 @@ def main():
         canvas.paste(img, (dx, dy))
         img = canvas
         hits = [dict(h, x=h["x"] + dx, y=h["y"] + dy) for h in hits]
+
+    staleness_banner(img, ImageDraw.Draw(img))
 
     if job.get("hits"):
         # The caller wants button positions: send the hit regions over a
