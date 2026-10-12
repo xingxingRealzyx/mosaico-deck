@@ -573,7 +573,11 @@ export function apply(ctx) {
     // -----------------------------------------------------------------------
     ctx.on('agent/status', (payload) => {
         if (payload?.status === 'running') {
-            if (state.status === 'idle') {
+            // A new turn: restamp the clock and clear the log ring. **'error' counts as a
+            // turn boundary too** -- a turn that ended in a failure leaves the status at
+            // 'error', and only checking for 'idle' meant the next turn kept the previous
+            // turn's startedAt and reported its duration instead of its own.
+            if (state.status === 'idle' || state.status === 'error') {
                 state.startedAt = Date.now();
                 state.log = [];
             }
