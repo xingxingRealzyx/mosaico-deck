@@ -58,6 +58,7 @@ export class Deck {
     emit(ev, ...a) { for (const f of ((this._h || {})[ev] || [])) f(...a); }
     sendRgb() { globalThis.__frames = (globalThis.__frames || 0) + 1; return 1; }
     sendCtrl(cmd, value) { (globalThis.__ctrl = globalThis.__ctrl || []).push([cmd, value]); return true; }
+    invalidate() { globalThis.__invalidated = (globalThis.__invalidated || 0) + 1; }
 }
 `);
 
@@ -586,6 +587,15 @@ check((globalThis.__spoken || []).some((t) => t.includes('语音已开启')),
     `打开时用语音本身确认：${JSON.stringify(globalThis.__spoken)}`);
 setPanelClosedNote();
 await openPanel();
+
+console.log('设备丢数据时自愈：清空差分缓存并重发整帧');
+globalThis.__invalidated = 0;
+globalThis.__deck.emit('dropped', { t: 'dropped', n: 3 });
+await new Promise((r) => setTimeout(r, 100));
+check(globalThis.__invalidated === 1,
+    `收到 dropped 会清空差分缓存（否则丢掉的行走永远是旧的）：${globalThis.__invalidated}`);
+check(JSON.stringify(job().log || []).includes('reframe'),
+    `面板上能看到这次自愈：${JSON.stringify(job().log)}`);
 
 console.log('提问镜像到设备：看得到、点得选');
 await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 30 });

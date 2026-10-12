@@ -121,6 +121,17 @@ export class Deck extends EventEmitter {
     // matters more than it looks -- a board reset wipes the panel but not this cache, and
     // diffs against a picture the board no longer has would leave rows blank for ever.
 
+    /** Forget the last frame so the next one is sent in full.
+     *
+     * **Every band dropped on the board is a row that stays stale for ever**, because
+     * this side only ever sends what changed since the last frame *it* sent -- it has no
+     * way to know part of that frame never arrived. Only the board knows, which is why it
+     * says so; this is the handler for that.
+     */
+    invalidate() {
+        this._last = null;
+    }
+
     get connected() {
         return this.fd !== null;
     }

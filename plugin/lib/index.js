@@ -944,6 +944,17 @@ export function apply(ctx) {
         }
     });
 
+    // The board lost part of a frame (see usb_console::RxOverflowCount on its side).
+    // Without this the screen keeps a stale row for ever and no amount of repainting
+    // fixes it -- that is the "the clock is stuck at 25s" failure, four times over.
+    deck.on('dropped', (ev) => {
+        deck.invalidate();
+        pushLog({ kind: 'error', text: `reframe (${ev?.n ?? '?'} lost)` });
+        ctx.logger?.warn?.(`mosaico-deck: board dropped data (${ev?.n ?? '?'}),`
+            + ' resending a full frame');
+        void paint({ force: true });
+    });
+
     deck.on('key', (ev) => {
         // Hold-to-talk release: the firmware says so, and the audio has already arrived.
         if (ev?.ev === 'voice_end') {

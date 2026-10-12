@@ -518,7 +518,15 @@ void RxTask(void* arg) {
     // headers after it no longer match. Here we look for DE AD byte by byte and
     // resynchronize when we find it.
     uint8_t prev = 0;
+    // **Tell the PC when data was lost.** See the note on `dropped` in the plugin.
+    uint32_t seen_overflow = usb_console::RxOverflowCount();
     for (;;) {
+        const uint32_t overflow_now = usb_console::RxOverflowCount();
+        if (overflow_now != seen_overflow) {
+            SendLine("{\"t\":\"dropped\",\"n\":%u}",
+                     static_cast<unsigned>(overflow_now - seen_overflow));
+            seen_overflow = overflow_now;
+        }
         // Fallback commit; see kBatchIdleUs. Only reached when the PC did not say
         // `commit` itself.
         if (g_panel != nullptr && g_panel->HasStaged() && g_last_band_us != 0
