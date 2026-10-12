@@ -29,11 +29,20 @@
 #    stayed live, and the fourth overlapped the footer. Every vertical budget here
 #    is subtracted from what is actually left, and text is truncated to fit rather
 #    than allowed to run over.
-# 2. **Measure text in pixels and pick the font per string.** Characters are not a
-#    unit of width (a CJK glyph is ~2x an ASCII one), so wrapping by `len()` both
-#    wasted space and cut lines off. Worse, the monospace face has **no CJK
-#    glyphs**: a path containing Chinese rendered as blank gaps. Any string with a
-#    non-ASCII character now uses the CJK face, whatever it is used for.
+# 2. **Measure text in pixels.** Characters are not a unit of width -- a CJK glyph
+#    is ~2x an ASCII one -- so wrapping by `len()` both wasted space and cut lines
+#    off past the edge.
+#
+# Why there is no monospace face, and no thin one
+# -----------------------------------------------
+# Paths and timers used to be drawn with `SFNSMono`. Two problems, both visible on
+# the panel: that face has **no CJK glyphs**, so a Chinese directory in a path
+# vanished and left stray slashes behind; and at 20-24px its strokes are thin enough
+# that grey on black stops being readable at desk distance.
+#
+# So: one single face for everything, and it is the **bold** one. Legibility on a
+# 480x480 panel comes from stroke weight and brightness, not from a second family.
+# Nothing here draws a column of aligned text, so monospace bought nothing anyway.
 
 import json
 import sys
@@ -44,15 +53,16 @@ from PIL import Image, ImageDraw, ImageFont
 W = H = 480
 
 BG = (0, 0, 0)              # Pure black: emits nothing on AMOLED, max contrast
-BORDER = (62, 71, 90)       # Panel outlines only -- surfaces stay black
-TEXT = (246, 249, 253)      # Near-white: the primary reading colour
-TEXT_DIM = (182, 192, 210)
-TEXT_FAINT = (138, 148, 168)
-ACCENT = (92, 200, 255)
-OK = (78, 232, 166)
-WARN = (255, 192, 98)
-ERR = (255, 110, 136)
-IDLE = (152, 162, 182)
+BORDER = (84, 95, 116)      # Panel outlines only -- surfaces stay black
+TEXT = (252, 253, 255)      # Primary reading colour: white, not "light grey"
+TEXT_SOFT = (214, 223, 238)  # Secondary. Still bright -- dimming is what made the
+#                              old grey-on-black text unreadable, so there is exactly
+#                              one step down from white and it is a small one.
+ACCENT = (110, 200, 255)
+OK = (90, 236, 172)
+WARN = (255, 200, 110)
+ERR = (255, 120, 145)
+IDLE = (176, 186, 206)
 
 STATE_COLORS = {
     "idle": IDLE, "thinking": ACCENT, "running": ACCENT, "editing": ACCENT,
@@ -71,32 +81,55 @@ STATE_LABELS = {
 S_PROJECT = 26
 S_ELAPSED = 24
 S_LABEL = 48
-S_TARGET = 22
-S_DETAIL = 26
-S_PROGRESS = 20
-S_LOG = 20
+S_TARGET = 24
+S_DETAIL = 28
+S_PROGRESS = 21
+S_LOG = 22
 S_ASK_LABEL = 24
 S_ASK_Q = 30
 S_ASK_OPT = 30
-S_ASK_OPT_SMALL = 24
-S_FOOTER = 18
+S_ASK_OPT_SMALL = 25
+S_FOOTER = 19
 S_BOOT = 36
 
-_CJK = ["/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/Library/Fonts/Arial Unicode.ttf"]
-_MONO = ["/System/Library/Fonts/SFNSMono.ttf",
-         "/System/Library/Fonts/Supplemental/Andale Mono.ttf"]
+# Every entry is (path, face index inside the file).
+#
+# **Index 2, not 1.** This .ttc holds four faces and the numbering is a trap:
+#
+#     index 0  Hiragino Sans GB / W3                (the thin default this used before)
+#     index 1  .Hiragino Sans GB Interface / W3     (thinner still -- a UI variant)
+#     index 2  Hiragino Sans GB / W6                <- 41% more ink than W3
+#     index 3  .Hiragino Sans GB Interface / W6
+#
+# Index 1 looks bold-ish next to index 0 in a screenshot and is in fact *lighter*;
+# only measuring the drawn ink settles it. plugin/test_render_layout.py asserts the
+# chosen face stays heavier than W3 so this cannot silently regress.
+_FACES = [("/System/Library/Fonts/Hiragino Sans GB.ttc", 2),
+          ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
+          ("/Library/Fonts/Arial Unicode.ttf", 0)]
 _cache = {}
 
 
 def font(size, mono=False):
-    key = (size, mono)
-    if key in _cache:
-        return _cache[key]
-    path = next((p for p in (_MONO if mono else _CJK) if os.path.exists(p)), None)
-    f = ImageFont.truetype(path, size) if path else ImageFont.load_default()
-    _cache[key] = f
+    """The one face, at `size`.
+
+    `mono` is accepted and ignored so call sites read the same as before; see the
+    note at the top for why the monospace family is gone.
+    """
+    if size in _cache:
+        return _cache[size]
+    f = None
+    for path, index in _FACES:
+        if not os.path.exists(path):
+            continue
+        try:
+            f = ImageFont.truetype(path, size, index=index)
+            break
+        except Exception:
+            continue
+    if f is None:
+        f = ImageFont.load_default()
+    _cache[size] = f
     return f
 
 
@@ -106,15 +139,14 @@ def width_of(text, f):
 
 
 def font_for(text, size, mono=False):
-    """The font that can actually draw `text`.
+    """Kept for call-site clarity; there is only one face now.
 
-    The monospace face is ASCII-only: handing it a Chinese path draws the ASCII
-    parts and silently drops the rest, which reads as garbled text on the panel.
-    So the monospace request yields to the CJK face as soon as the string needs it.
+    This used to switch away from the monospace family whenever `text` contained a
+    non-ASCII character, because that face could not draw them. One bold CJK-capable
+    face makes the switch unnecessary, but the call sites still read as "the font for
+    this string", so the wrapper stays.
     """
-    if mono and any(ord(c) > 0x7F for c in str(text)):
-        mono = False
-    return font(size, mono)
+    return font(size)
 
 
 def fit(text, f, max_w):
@@ -170,7 +202,7 @@ def draw_status(d, img, job):
     stamp = f"{secs // 60}:{secs % 60:02d}"
     f_stamp = font(S_ELAPSED, True)
     stamp_w = width_of(stamp, f_stamp)
-    d.text((W - 24, cy), stamp, font=f_stamp, fill=TEXT_DIM, anchor="rm")
+    d.text((W - 24, cy), stamp, font=f_stamp, fill=TEXT_SOFT, anchor="rm")
     f_project = font_for(job.get("project", "agent"), S_PROJECT)
     d.text((cx + r + 14, cy), fit(job.get("project", "agent"), f_project,
                                   W - 24 - stamp_w - 24 - (cx + r + 14)),
@@ -184,7 +216,7 @@ def draw_status(d, img, job):
 
     if job.get("target"):
         f = font_for(job["target"], S_TARGET, mono=True)
-        d.text((28, y), fit(job["target"], f, W - 56), font=f, fill=TEXT_DIM)
+        d.text((28, y), fit(job["target"], f, W - 56), font=f, fill=TEXT_SOFT)
         y += S_TARGET + 12
     if job.get("detail"):
         f = font_for(job["detail"], S_DETAIL)
@@ -201,7 +233,7 @@ def draw_status(d, img, job):
             d.rounded_rectangle((28, y, 28 + max(int(bar_w * frac), 14), y + 14),
                                 radius=7, fill=color)
         d.text((W - 28, y + 7), f"{frac * 100:.0f}%", font=font(S_PROGRESS, True),
-               fill=TEXT_DIM, anchor="rm")
+               fill=TEXT_SOFT, anchor="rm")
         y += 34
 
     # Log tail. It yields to the buttons: those sit at H-100, so a log that ran
@@ -221,7 +253,7 @@ def draw_status(d, img, job):
         for line in log[-n:] if n else []:
             d.text((28, ly), "·", font=f_log, fill=ACCENT)
             d.text((48, ly), fit(line, f_log, W - 48 - 28), font=f_log,
-                   fill=TEXT_DIM)
+                   fill=TEXT_SOFT)
             ly += step
 
 
@@ -321,7 +353,7 @@ def render_ask(job):
 
     if footer:
         d.text((28, H - 12), fit(footer, font(S_FOOTER), W - 56),
-               font=font(S_FOOTER), fill=TEXT_FAINT, anchor="ls")
+               font=font(S_FOOTER), fill=TEXT_SOFT, anchor="ls")
     return img, hits
 
 
@@ -331,7 +363,7 @@ def render_boot(job):
     d.text((W // 2, H // 2 - 30), "mosaico-deck", font=font(S_BOOT), fill=TEXT,
            anchor="mm")
     d.text((W // 2, H // 2 + 28), "等待 Harness…", font=font(S_ASK_LABEL),
-           fill=TEXT_DIM, anchor="mm")
+           fill=TEXT_SOFT, anchor="mm")
     return img, []
 
 
