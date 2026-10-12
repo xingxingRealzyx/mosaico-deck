@@ -28,6 +28,9 @@ if (!fs.existsSync(DSH_MODULES)) {
     process.exit(0);
 }
 
+// Watch the picture expiry for real, in milliseconds rather than ten seconds.
+process.env.DECK_IMAGE_HOLD_MS = '300';
+
 // ---------------------------------------------------------------- scratch copy
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'deck-events-'));
 fs.mkdirSync(path.join(root, 'lib'), { recursive: true });
@@ -107,26 +110,33 @@ check(job().log?.[0]?.kind === 'tool' && job().log?.[0]?.tool === 'bash',
     '日志条目是结构化的（渲染器据此选 emoji）');
 check(job().target === 'pytest -q', 'target 取自命令');
 
-console.log('读图片 -> 图片页');
+console.log('读图片 -> 状态页上的图片预览');
 await pre('read_image', { file_path: '/tmp/deck-demo.png' });
-check(job().page === 'image', '读图片切到 image 页');
 check(job().image === '/tmp/deck-demo.png', 'image 是那张图的绝对路径');
+check(job().page === 'status',
+    '图片画在状态页里（保留状态头），不是整屏接管');
+check(job().imageLeft > 0, `带倒计时：${job().imageLeft}s 后自动清除`);
 
 await reply('这张图里有个 bug');
-check(job().page === 'image' && job().image === '/tmp/deck-demo.png',
+check(job().image === '/tmp/deck-demo.png',
     '助手回复**不**清掉图片（用户正是在这时要看着图读解释）');
 
 await pre('read', { file_path: '/tmp/notes.py' });
-check(job().page === 'status' && job().image === null,
-    '读非图片文件回到状态页');
+check(job().image === null, '读非图片文件把图撤下');
 
 await pre('write', { file_path: '/tmp/out.png' });
-check(job().page === 'status', '写入 .png 不会把图弹上屏（只认读）');
+check(job().image === null, '写入 .png 不会把图弹上屏（只认读）');
+
+console.log('图片会自动清除（不等下一次工具调用）');
+await pre('read_image', { file_path: '/tmp/b.png' });
+check(job().image === '/tmp/b.png', '先显示出来');
+await new Promise((r) => setTimeout(r, Number(process.env.DECK_IMAGE_HOLD_MS) + 250));
+check(job().image === null && job().page === 'status',
+    `${Number(process.env.DECK_IMAGE_HOLD_MS)}ms 后自己消失并回到状态页`);
 
 await pre('read_image', { file_path: '/tmp/a.png' });
 await pre('bash', { command: 'echo hi' });
-check(job().page === 'status' && job().image === null,
-    '读图之后的下一次普通工具调用换回状态页');
+check(job().image === null, '读图之后的下一次普通工具调用也会撤图');
 
 console.log('相对路径与边界');
 await pre('read_image', { file_path: 'shots/a.png' });

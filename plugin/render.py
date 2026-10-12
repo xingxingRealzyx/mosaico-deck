@@ -134,6 +134,11 @@ S_ASK_OPT_SMALL = 25
 S_FOOTER = 19
 S_BOOT = 36
 
+# Picture preview box, inside the status page. Tuned by eye on the panel: big enough
+# to recognise a screenshot's layout, small enough that the status stays readable.
+IMG_MAX_W = W - 56
+IMG_MAX_H = 250
+
 # Every entry is (path, face index inside the file).
 #
 # **Index 2, not 1.** This .ttc holds four faces and the numbering is a trap:
@@ -286,6 +291,35 @@ def parse_log(entry):
     return "info", str(entry), None
 
 
+def draw_image_preview(img, d, path, y):
+    """Fit the picture at `path` into the preview box whose top edge is `y`.
+
+    Returns (drawn height, "WxH" of the source, error string).
+
+    Deliberately **not** a full-screen takeover: the status header and the state label
+    stay visible above it. An earlier version replaced the whole panel with the
+    picture, which hid exactly the information the panel exists to show.
+    """
+    box_w, box_h = IMG_MAX_W, IMG_MAX_H
+    try:
+        with Image.open(path) as src:
+            # draft() lets libjpeg decode straight to a smaller size, so a 50MP photo
+            # does not cost seconds and hundreds of MB on the way to 480px.
+            src.draft("RGB", (box_w * 2, box_h * 2))
+            pic = ImageOps.exif_transpose(src).convert("RGB")
+        dims = f"{pic.width}×{pic.height}"
+        pic.thumbnail((box_w, box_h), Image.LANCZOS)
+        x = (W - pic.width) // 2
+        img.paste(pic, (x, y))
+        # A thin outline: a dark screenshot on a black background would otherwise have
+        # no visible edge at all.
+        d.rectangle((x - 1, y - 1, x + pic.width, y + pic.height),
+                    outline=BORDER, width=1)
+        return pic.height, dims, ""
+    except Exception as exc:
+        return 0, "", str(exc)
+
+
 def draw_status(d, img, job):
     state = job.get("state", "idle")
     label = job.get("label") or STATE_LABELS.get(state, state)
@@ -321,14 +355,35 @@ def draw_status(d, img, job):
     d.text((tx, y), fit(label, f_label, W - 28 - tx), font=f_label, fill=color)
     y += S_LABEL + 24
 
-    if job.get("target"):
-        f = font_for(job["target"], S_TARGET, mono=True)
-        d.text((28, y), fit(job["target"], f, W - 56), font=f, fill=TEXT_SOFT)
-        y += S_TARGET + 12
-    if job.get("detail"):
-        f = font_for(job["detail"], S_DETAIL)
-        d.text((28, y), fit(job["detail"], f, W - 56), font=f, fill=TEXT)
-        y += S_DETAIL + 18
+    # With a picture up, the path and the "Calling x" line are noise -- the caption
+    # under the picture already names the file, and the room is better spent on the
+    # picture itself. The header and the state label stay: they are what tells the
+    # user *why* a picture is on the panel.
+    picture = job.get("image")
+    if not picture:
+        if job.get("target"):
+            f = font_for(job["target"], S_TARGET, mono=True)
+            d.text((28, y), fit(job["target"], f, W - 56), font=f, fill=TEXT_SOFT)
+            y += S_TARGET + 12
+        if job.get("detail"):
+            f = font_for(job["detail"], S_DETAIL)
+            d.text((28, y), fit(job["detail"], f, W - 56), font=f, fill=TEXT)
+            y += S_DETAIL + 18
+
+    if picture:
+        sy = y + 4
+        d.line((28, sy, W - 28, sy), fill=BORDER, width=1)
+        used, dims, err = draw_image_preview(img, d, picture, sy + 18)
+        bits = [os.path.basename(str(picture)) or str(picture)]
+        if dims:
+            bits.append(dims)
+        left = job.get("imageLeft")
+        if isinstance(left, int) and left > 0:
+            bits.append(f"{left}s")     # auto-clears; say when
+        f_cap = font(S_FOOTER)
+        d.text((28, sy + 18 + used + 12), fit(" · ".join(bits), f_cap, W - 56),
+               font=f_cap, fill=ERR if err else TEXT_SOFT)
+        return
 
     progress = job.get("progress")
     if progress is not None:
@@ -404,60 +459,20 @@ def render_status(job):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
     draw_status(d, img, job)
-    hits = draw_buttons(d, job)
+    # A picture owns the lower half; tap targets belong to questions, not pictures.
+    hits = [] if job.get("image") else draw_buttons(d, job)
     return img, hits
 
 
 def render_image(job):
-    """One picture from disk, fitted, with a caption strip.
+    """Deprecated alias -- the picture is now a preview *inside* the status page.
 
-    This is why the panel is worth having: when the agent looks at a screenshot or a
-    photo, the thing it is looking at appears on the desk instead of staying a path
-    in a transcript. The picture is letterboxed rather than cropped -- a cropped
-    screenshot is worse than a small one.
+    It used to take over the whole panel, which hid the very information the panel
+    exists to show, and it stayed up until the next tool call. Keeping the alias means
+    an older caller (or a stale page name) still draws something sensible instead of
+    silently falling back to a bare status page.
     """
-    img = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(img)
-    cap = 96
-    area_w, area_h = W, H - cap
-    path = str(job.get("image") or "")
-    state = job.get("state", "tool")
-    tool = job.get("tool")
-    icon, color = style_for(tool) if tool else (
-        STATE_ICONS.get(state, ICON_TOOL), STATE_COLORS.get(state, IDLE))
-    label = job.get("caption") or job.get("label") or STATE_LABELS.get(state, state)
-
-    dims, problem = "", ""
-    try:
-        with Image.open(path) as src:
-            # draft() lets libjpeg decode straight to a smaller size, so a 50MP
-            # photo does not cost seconds and hundreds of MB on the way to 480px.
-            src.draft("RGB", (area_w * 2, area_h * 2))
-            pic = ImageOps.exif_transpose(src).convert("RGB")
-        pic.thumbnail((area_w, area_h), Image.LANCZOS)
-        img.paste(pic, ((area_w - pic.width) // 2, (area_h - pic.height) // 2))
-        dims = f"{pic.width}×{pic.height}"
-    except Exception as exc:
-        problem = str(exc)
-
-    d.line((28, H - cap, W - 28, H - cap), fill=BORDER, width=1)
-    y = H - cap + 16
-    iw = draw_emoji(img, icon, 28, y, S_DETAIL + 4)
-    tx = 28 + (iw + 14 if iw else 0)
-    f_label = font(S_DETAIL)
-    d.text((tx, y), fit(label, f_label, W - tx - 150), font=f_label, fill=color)
-    if dims:
-        d.text((W - 28, y + 10), dims, font=font(S_PROGRESS), fill=TEXT_SOFT,
-               anchor="ra")
-    name = os.path.basename(path) or path
-    f_name = font(S_FOOTER)
-    if problem:
-        d.text((28, y + 44), fit(f"读不出这张图: {name}", f_name, W - 56),
-               font=f_name, fill=ERR)
-    else:
-        d.text((28, y + 44), fit(name, f_name, W - 56), font=f_name,
-               fill=TEXT_SOFT)
-    return img, []
+    return render_status(job)
 
 
 def render_ask(job):

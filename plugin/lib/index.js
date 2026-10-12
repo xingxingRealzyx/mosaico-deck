@@ -92,6 +92,16 @@ export const build = (() => {
 // calls deck_connect; what must never happen is this plugin fighting an ongoing flash.
 const TICK_MS = 1000;
 
+// How long a picture stays on the panel before it clears itself.
+//
+// It used to stay until the next tool call, which in a quiet conversation means
+// forever -- the user asked for it to go away on its own. Ten seconds is long enough
+// to look at a screenshot and short enough that it never becomes the resting state.
+//
+// The env override exists so plugin/test-plugin-events.mjs can watch the expiry happen
+// in milliseconds instead of sleeping ten seconds.
+const IMAGE_HOLD_MS = Number(process.env.DECK_IMAGE_HOLD_MS || 10000);
+
 // Wait this long after connecting before pushing the first frame. The board is
 // running its boot animation (~1.9s) and painting over it would fight for the
 // SPI bus. The animation ends at boot::kScatterEndUs in main.cpp and then idles
@@ -106,8 +116,10 @@ export function apply(ctx) {
         detail: '',
         target: '',
         tool: null,     // current tool name, so the panel can pick an icon + colour
-        image: null,    // a picture being looked at; render.py draws it full-panel
+        image: null,    // a picture being looked at; drawn as a preview on status
         caption: null,  // optional line under a picture the model asked to show
+        imageUntil: 0,  // wall clock at which the picture clears itself
+        imageLeft: 0,   // last countdown value painted, so the ticker can notice
         progress: null,
         elapsed: 0,
         startedAt: 0,
@@ -128,15 +140,46 @@ export function apply(ctx) {
         state.log = state.log.slice(-6);
     };
 
+    // ---- picture lifetime ------------------------------------------------------
+    // A picture is shown as a preview and then **clears itself**. The earlier rule was
+    // "until the next tool call", which in a quiet conversation means it never goes
+    // away at all -- the user asked for it to expire on its own.
+    let imageTimer = null;
+
+    const secondsOfImageLeft = () => (state.imageUntil > Date.now()
+        ? Math.ceil((state.imageUntil - Date.now()) / 1000)
+        : 0);
+
+    function showImage(p, caption = null) {
+        if (imageTimer) {
+            clearTimeout(imageTimer);
+            imageTimer = null;
+        }
+        state.image = p;
+        state.caption = caption;
+        state.imageUntil = p ? Date.now() + IMAGE_HOLD_MS : 0;
+        if (p) {
+            imageTimer = setTimeout(() => {
+                imageTimer = null;
+                state.image = null;
+                state.caption = null;
+                state.imageUntil = 0;
+                void paint();
+            }, IMAGE_HOLD_MS);
+        }
+    }
+
     async function paint({ force = false } = {}) {
         if (!deck.connected || painting) return 0;
         painting = true;
         try {
             const { rgb } = await render({
-                // An image being looked at takes over the whole panel; anything else
-                // is the status page.
-                page: state.image ? 'image' : 'status',
+                // A picture is drawn as a preview *inside* the status page, not as a
+                // full-screen takeover: the state label stays readable above it.
+                page: 'status',
                 image: state.image,
+                imageLeft: secondsOfImageLeft(),
+                caption: state.caption,
                 caption: state.caption,
                 project: state.project,
                 state: state.status,
@@ -257,10 +300,9 @@ export function apply(ctx) {
             state.detail = `Calling ${toolName}`;
             if (target) state.target = target.slice(0, 40);
             state.progress = null;
-            // A read of a picture puts the picture itself on the panel; any other
-            // call clears whatever was there.
-            state.image = imageBeingRead(toolName, target);
-            state.caption = null;
+            // A read of a picture shows the picture (and it clears itself); any other
+            // call takes it down.
+            showImage(imageBeingRead(toolName, target));
             pushLog({ kind: 'tool', tool: toolName, text: `called ${toolName}` });
             if (state.image) {
                 pushLog({ kind: 'image', tool: toolName, text: 'showing image' });
@@ -357,14 +399,19 @@ export function apply(ctx) {
             const next = state.status === 'idle'
                 ? 0
                 : Math.floor((Date.now() - state.startedAt) / 1000);
-            if (next !== state.elapsed) {
+            // The picture countdown has to tick while the agent is idle too, so it
+            // cannot ride on the elapsed-seconds check alone.
+            const left = secondsOfImageLeft();
+            if (next !== state.elapsed || left !== state.imageLeft) {
                 state.elapsed = next;
+                state.imageLeft = left;
                 void paint();
             }
         }, TICK_MS);
 
         return () => {
             clearInterval(tickTimer);
+            if (imageTimer) clearTimeout(imageTimer);
             deck.close();
         };
     });
@@ -535,15 +582,14 @@ export function apply(ctx) {
             if (!deck.connected) return { message: 'device not connected' };
             const p = String(args.path ?? '');
             if (!p) return { message: 'no path given' };
-            state.image = path.isAbsolute(p) ? p : path.resolve(p);
-            state.caption = args.caption ? String(args.caption) : null;
-            if (args.caption) state.detail = String(args.caption);
             state.status = 'tool';
             state.tool = 'deck_image';
+            showImage(path.isAbsolute(p) ? p : path.resolve(p),
+                      args.caption ? String(args.caption) : null);
             const n = await paint({ force: true });
             return {
                 message: n
-                    ? `showing ${state.image} (${n} bands)`
+                    ? `showing ${state.image} for ${IMAGE_HOLD_MS / 1000}s (${n} bands)`
                     : `asked for ${state.image}, but the panel did not change`,
             };
         },

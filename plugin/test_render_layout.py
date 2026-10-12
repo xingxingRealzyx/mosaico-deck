@@ -145,20 +145,45 @@ check(r.style_for("完全没见过的工具")[1] == r.ACCENT, "未知工具回�
 for st in r.STATE_LABELS:
     check(bool(r.STATE_ICONS.get(st)), f"状态 {st} 有对应 emoji")
 
-print("图片页")
+print("图片预览：画在状态页里，**不整屏接管**")
 tmp_img = "/tmp/_deck_test_image.png"
-Image.new("RGB", (320, 200), (200, 40, 40)).save(tmp_img)
-img, hits = r.PAGES["image"]({"page": "image", "image": tmp_img,
-                              "state": "tool", "tool": "read_image"})
-band = img.crop((0, 0, r.W, 380)).tobytes()
-n_pic = sum(1 for i in range(0, len(band), 3) if band[i] or band[i + 1] or band[i + 2])
-check(n_pic > 40000, f"图片本体被画出来（非黑像素 {n_pic}）")
-check(hits == [], "图片页没有热区，点屏幕不会误触")
-img_bad, _ = r.PAGES["image"]({"page": "image", "image": "/nope/missing.png",
-                               "state": "tool"})
-check(img_bad.size == (r.W, r.H), "文件读不出来时降级成提示行，不抛异常")
-band_bad = img_bad.crop((0, 392, r.W, 440)).tobytes()
-check(any(band_bad), "坏路径会显示一行错误说明")
+# 纯白图：这样"图片画到了哪一行"可以直接用白色像素数判断。
+Image.new("RGB", (400, 400), (255, 255, 255)).save(tmp_img)
+
+
+def white_run(im, y):
+    row = im.crop((0, y, r.W, y + 1)).tobytes()
+    return sum(1 for i in range(0, len(row), 3)
+               if row[i] > 200 and row[i + 1] > 200 and row[i + 2] > 200)
+
+
+img, hits = r.PAGES["status"]({"page": "status", "image": tmp_img,
+                               "state": "tool", "tool": "read_image", "imageLeft": 7})
+check(white_run(img, 300) > 200,
+      f"图片画在下方的预览区（y=300 处白色像素 {white_run(img, 300)}）")
+# 这条是"太大"那个问题的回归测试：整屏接管时这一行会被图片铺满。
+check(white_run(img, 100) < 100,
+      f"状态标签那一行仍归状态用，没被图片占满（y=100 处白色像素 {white_run(img, 100)}）")
+check(hits == [], "图片模式没有热区，点屏幕不会误触")
+check(r.IMG_MAX_H <= 300, f"预览高度上限 {r.IMG_MAX_H}px，不是整屏 480")
+
+print("倒计时必须真的画出来（用户要知道它什么时候消失）")
+img9, _ = r.PAGES["status"]({"page": "status", "image": tmp_img,
+                             "state": "tool", "imageLeft": 9})
+img3, _ = r.PAGES["status"]({"page": "status", "image": tmp_img,
+                             "state": "tool", "imageLeft": 3})
+check(img9.tobytes() != img3.tobytes(), "倒计时数字变化会改变画面")
+
+print("坏图片路径")
+img_bad, _ = r.PAGES["status"]({"page": "status", "image": "/nope/missing.png",
+                                "state": "tool"})
+check(img_bad.size == (r.W, r.H), "文件读不出来时不抛异常")
+check(any(img_bad.crop((0, 180, r.W, 240)).tobytes()), "坏路径显示一行错误说明")
+
+print("旧的 image 页名仍然可用（现在等同于状态页 + 预览）")
+img_alias, _ = r.PAGES["image"]({"page": "image", "image": tmp_img, "state": "tool"})
+img_new, _ = r.PAGES["status"]({"page": "status", "image": tmp_img, "state": "tool"})
+check(img_alias.tobytes() == img_new.tobytes(), "旧页名不会退化成一张空白状态页")
 
 print("日志条目：字符串与结构化对象都要能画")
 img_mix, _ = r.PAGES["status"]({"state": "tool", "tool": "bash",
