@@ -317,6 +317,24 @@ await fire('session/event', SUBAGENT_SESSION, { type: 'turn/end', turn: 1 });
 check(job().state !== 'idle', '子代理的 turn/end 不会把主会话标成空闲');
 await fire('agent/status', { status: 'idle' });
 
+console.log('回合生命周期由 session 事件驱动（agent/status 可能根本不投递）');
+globalThis.__spoken = [];
+await fire('session/event', ROOT_SESSION, { type: 'turn/start', turn: 12 });
+await fire('session/event', ROOT_SESSION, {
+    type: 'assistant/message', turn: 12, step: 1,
+    message: { content: [{ type: 'text', text: '缓存命中的口径改好了。另外还有一件事。' }] },
+});
+// 只有 turn/end，中间不经过任何 agent/status
+await fire('session/event', ROOT_SESSION, { type: 'turn/end', turn: 12 });
+await new Promise((r) => setTimeout(r, 120));
+const spokenTurn = globalThis.__spoken || [];
+check(spokenTurn.length === 1,
+    `每轮结束都播报（不依赖 agent/status）：${JSON.stringify(spokenTurn)}`);
+check((spokenTurn[0] || '').startsWith('完成'),
+    `播报的是结果：${JSON.stringify(spokenTurn[0])}`);
+check((spokenTurn[0] || '').includes('缓存命中的口径改好了'),
+    '结果里带上了回复的开头（而不是只说"完成"）');
+
 console.log('语音：关键节点自动出声（不再等模型主动想起来调 deck_speak）');
 check(mod.shouldAnnounce({ voiceOn: true, elapsedMs: 31000, sinceLastMs: 99999,
                            minMs: 30000, minGapMs: 4000 }),

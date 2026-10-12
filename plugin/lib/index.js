@@ -145,6 +145,7 @@ export function apply(ctx) {
         // Control centre. Levels are the plugin's model of the board's state: the board
         // does not report them back, so they start at the values the firmware boots with
         // (kDefaultVolume and 90/255 brightness).
+        lastReply: '',      // opening of the last reply, spoken when the turn ends
         panel: false,
         levels: { volume: 85, brightness: 35 },
         voiceName: process.env.DECK_VOICE_NAME || undefined,   // macOS voice, e.g. Tingting
@@ -266,7 +267,9 @@ export function apply(ctx) {
     // was a tool the model had to remember to call, and it never did. Same lesson as
     // the screen -- **anything that should happen by itself must be driven by host
     // events, not by the model's goodwill.**
-    const ANNOUNCE_MIN_MS = Number(process.env.DECK_ANNOUNCE_MS || 30000);
+    // **Every turn is announced**, at the user's request. The threshold still exists
+    // because the tests need it, and because it is the knob if this ever gets noisy.
+    const ANNOUNCE_MIN_MS = Number(process.env.DECK_ANNOUNCE_MS || 0);
     // Both are env-overridable so the tests can watch a real announcement happen in
     // milliseconds instead of sleeping thirty seconds.
     const SPEAK_GAP_MS = Number(process.env.DECK_SPEAK_GAP_MS || 4000);
@@ -289,7 +292,10 @@ export function apply(ctx) {
                 lastSpokeAt = Date.now();
                 await deck.speakPcm(pcm);
             } catch (err) {
-                ctx.logger?.debug?.(`mosaico-deck: speech failed: ${err.message}`);
+                // **Loud on purpose.** A silent failure here is a feature that looks
+                // broken with no evidence anywhere -- which is exactly what happened: the
+                // board's audio counter was the only thing that could disprove "it spoke".
+                ctx.logger?.warn?.(`mosaico-deck: speech failed: ${err?.message ?? err}`);
             }
         });
     }
@@ -307,19 +313,29 @@ export function apply(ctx) {
      * Announcements are gap-guarded, so when both arrive milliseconds apart only one is
      * ever spoken.
      */
+    /** What to say when a turn ends: the outcome, not just the word "done". */
+    function announcement(elapsed) {
+        const mins = Math.floor(elapsed / 60000);
+        const head = mins >= 1 ? `完成，用时 ${mins} 分` : '完成';
+        // The opening sentence is what tells you whether to come back to the desk.
+        const summary = String(state.lastReply ?? '').replace(/\s+/g, ' ').trim();
+        const first = summary.split(/[。！？!?]/)[0]?.trim().slice(0, 40) ?? '';
+        return first ? `${head}。${first}` : head;
+    }
+
     function endTurn() {
         const elapsed = state.startedAt ? Date.now() - state.startedAt : 0;
         state.status = 'idle';
         state.tool = null;
-        if (shouldAnnounce({
+        // An error was already announced, loudly, when it happened.
+        if (state.status !== 'error' && shouldAnnounce({
             voiceOn,
             elapsedMs: elapsed,
             sinceLastMs: Date.now() - lastSpokeAt,
             minMs: ANNOUNCE_MIN_MS,
             minGapMs: SPEAK_GAP_MS,
         })) {
-            const mins = Math.floor(elapsed / 60000);
-            say(mins >= 1 ? `完成，用时 ${mins} 分` : '完成', { respectGap: true });
+            say(announcement(elapsed), { respectGap: true });
         }
         void paint();
     }
@@ -693,6 +709,27 @@ export function apply(ctx) {
     ctx.on('session/event', (session, event) => {
         // The session log's own end-of-turn marker: a second, independent "the turn is
         // over" signal. See endTurn().
+        if (event?.type === 'turn/start') {
+            // **The turn clock is started here, not from `agent/status`.**
+            //
+            // That was the bug behind "no voice at all": `startedAt` was only set on
+            // `agent/status {status:'running'}`, and the panel looked right anyway because
+            // `tools/post-execute` also paints 思考中 -- so nothing suggested the event was
+            // missing. With `startedAt` stuck at null, `elapsed` was always 0 and the
+            // announcement condition could never be true. The evidence that settled it:
+            // the board's own `audio playback` counter did not move by a single block
+            // across several turns.
+            //
+            // Session events are the channel that demonstrably works (assistant/message
+            // arrives on it), so the turn lifecycle is driven from here.
+            if (isRootSession(session)) {
+                state.startedAt = Date.now();
+                state.log = [];
+                state.lastReply = '';
+                streamTail = '';
+            }
+            return;
+        }
         if (event?.type === 'turn/end') {
             if (isRootSession(session)) endTurn();
             return;
@@ -712,6 +749,7 @@ export function apply(ctx) {
                 // exactly the wrong moment -- the user reading the explanation wants
                 // the image still on the desk. Only the next non-image tool call
                 // replaces it.
+                state.lastReply = text.replace(/\s+/g, ' ').slice(0, 120);
                 state.detail = text.replace(/\s+/g, ' ').slice(0, 34);
                 pushLog({ kind: 'reply', text: 'replied' });
             }
