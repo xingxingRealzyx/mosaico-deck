@@ -278,7 +278,11 @@ export function apply(ctx) {
             if (text) {
                 state.status = 'running';
                 state.tool = null;
-                state.image = null;      // the reply replaces whatever picture was up
+                // **The picture stays.** A reply is usually *about* the picture the
+                // agent just looked at, so clearing it here would blank the panel at
+                // exactly the wrong moment -- the user reading the explanation wants
+                // the image still on the desk. Only the next non-image tool call
+                // replaces it.
                 state.detail = text.replace(/\s+/g, ' ').slice(0, 34);
                 pushLog({ kind: 'reply', text: 'replied' });
             }
