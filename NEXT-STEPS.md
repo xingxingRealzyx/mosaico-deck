@@ -149,6 +149,7 @@ now handle it directly, so treat this as the fallback.
     ./install-plugin.sh                copies the plugin and runs its load self-test
     node plugin/test-port-selection.mjs  port choice; needs no hardware
     node plugin/test-dead-fd.mjs       dead-fd recovery; needs no hardware
+    <dsh python> plugin/test_render_layout.py   panel layout/font; needs no hardware
     ./flash.sh                         app is running; knocks first
     ./flash-rom.sh                     already in ROM mode; does NOT knock
     idf.py build                       needs ESP-IDF v6.1; the scripts find its python env
