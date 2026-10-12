@@ -211,6 +211,13 @@ namespace {
 // repository, the shape is fixed, and a real parser would be a dependency for two
 // fields. What matters instead is that malformed input cannot misbehave: every scan is
 // bounded, so a truncated or hostile frame just fails to parse.
+// Set by the receive path, drained by CommitTask. **Never do the commit inline**: it
+// waits for a TE edge (up to 20ms) and then occupies the bus for ~12ms, and the receive
+// task is the only thing draining USB. Blocking it there overflowed the receive ring
+// (measured: RX overflow 1743 during one full frame) and dropped bands, which on screen
+// is a picture with pieces missing.
+std::atomic<bool> g_commit_requested{false};
+
 // When the last band was staged. File scope because the band handler and the receive
 // loop are separate functions; both run on the same task, so no locking is needed.
 int64_t g_last_band_us = 0;
@@ -379,7 +386,7 @@ void HandleBand(bool full_frame) {
             }
             g_panel->StageBand(band, buf);
         }
-        g_panel->CommitFrame();
+        g_commit_requested.store(true);
         g_last_band_us = 0;
         g_stats.full = g_stats.full + 1;
         g_stats.bands = g_stats.bands + fluidbox::config::kBandCount;
@@ -472,6 +479,22 @@ void CaptureTask(void* arg) {
     }
 }
 
+void CommitTask(void* arg) {
+    (void)arg;
+    for (;;) {
+        if (!g_commit_requested.load()) {
+            osal::Delay(2);
+            continue;
+        }
+        g_commit_requested.store(false);
+        if (g_panel == nullptr) {
+            continue;
+        }
+        osal::LockGuard<osal::Mutex> guard(g_panel->DrawMutex());
+        g_panel->CommitFrame();
+    }
+}
+
 void RxTask(void* arg) {
     (void)arg;
     ESP_LOGI(kTag, "link receive task started");
@@ -486,8 +509,7 @@ void RxTask(void* arg) {
         // `commit` itself.
         if (g_panel != nullptr && g_panel->HasStaged() && g_last_band_us != 0
             && osal::TimeUs() - g_last_band_us >= kBatchIdleUs) {
-            osal::LockGuard<osal::Mutex> guard(g_panel->DrawMutex());
-            g_panel->CommitFrame();
+            g_commit_requested.store(true);
             g_last_band_us = 0;
         }
         uint8_t b = 0;
@@ -567,6 +589,8 @@ void RxTask(void* arg) {
 
 }  // namespace
 
+void RequestCommit() { g_commit_requested.store(true); }
+
 void SetCtrlSink(CtrlSink sink) {
     g_ctrl_sink = sink;
 }
@@ -603,6 +627,13 @@ esp_err_t Init() {
     // Give it 6144 of stack: this task walks all three paths, HandleAudio / HandleBand /
     // HandleCtrl, which are all heavier than "just receive one line of JSON". Previously
     // 4096 paired with a 4096 stack buffer blew up directly.
+    // The commit lives on its own task so the receive path never blocks on the panel:
+    // it only raises the flag. Priority below rx (6) and above idle.
+    static osal::Task commit_task;
+    commit_task.Create(CommitTask, nullptr,
+                       {.name = "link_commit", .stack_size = 4096, .priority = 4,
+                        .core = osal::CoreAffinity::kCore1});
+
     static osal::Task rx_task;
     rx_task.Create(RxTask, nullptr,
                    {.name = "link_rx", .stack_size = 6144, .priority = 6,

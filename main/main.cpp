@@ -650,8 +650,8 @@ extern "C" void app_main(void) {
             // The PC has finished sending this update's bands; put them on the glass as
             // one transfer. The draw mutex is shared with the band path, which runs on
             // the same task but on a different message.
-            osal::LockGuard<osal::Mutex> guard(g_panel.DrawMutex());
-            return g_panel.CommitFrame() == ESP_OK;
+            hostlink::RequestCommit();   // asynchronous: see RequestCommit
+            return true;
         }
         if (strcmp(cmd, "brightness") == 0) {
             return g_panel.SetBrightness(static_cast<uint8_t>(value * 255 / 100)) == ESP_OK;

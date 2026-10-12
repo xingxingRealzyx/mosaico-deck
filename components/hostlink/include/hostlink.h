@@ -105,6 +105,12 @@ void SendKey(const char* ev);
 using CtrlSink = bool (*)(const char* cmd, int value);
 void SetCtrlSink(CtrlSink sink);
 
+// Put everything staged so far on the glass, from the commit task.
+//
+// Asynchronous on purpose: the caller (the receive path, or the control-command sink)
+// must not wait for a TE edge or occupy the bus. See g_commit_requested.
+void RequestCommit();
+
 // Whether the PC has ever sent a frame.
 //
 // **The screen can only have one owner.** If the local self-test pattern and the frames
