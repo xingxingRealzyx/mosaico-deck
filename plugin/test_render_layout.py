@@ -175,6 +175,80 @@ img_alias, _ = r.PAGES["image"]({"page": "image", "image": tmp_img, "state": "to
 img_new, _ = r.PAGES["status"]({"page": "status", "image": tmp_img, "state": "tool"})
 check(img_alias.tobytes() == img_new.tobytes(), "旧页名不会退化成一张空白状态页")
 
+print("底部会话数字条")
+check(r.kfmt(950) == "950" and r.kfmt(48213) == "48.2K" and r.kfmt(128000) == "128K"
+      and r.kfmt(1_300_000) == "1.3M",
+      f"紧凑计数：48213 -> {r.kfmt(48213)}，128000 -> {r.kfmt(128000)}，1300000 -> {r.kfmt(1_300_000)}")
+check(r.kfmt(None) == "—" and r.kfmt(-5) == "—", "缺失/负数显示占位符而不是崩")
+
+# 高度必须装得下两行 —— 之前算少了一行，第二行被屏幕边缘切掉（"23 步"直接不见了）。
+last_line_bottom = (r.H - r.STATS_H + 6) + 10 + (r.S_STATS + 8) + r.S_STATS
+check(last_line_bottom <= r.H - 6,
+      f"两行都装得下：最后一行底部 {last_line_bottom}px ≤ {r.H}px")
+
+# 宽度同样要装得下。修好纵向之后横向又溢出了（"23 步"被右边切掉），所以
+# 现在改成按优先级装箱，并在这里做一组极端取值的属性断言。
+fstats = r.font(r.S_STATS)
+for label, st, expect in (
+    ("典型", {"context": 48213, "contextWindow": 128000, "input": 210000,
+              "output": 48000, "cacheRead": 160000, "turn": 7, "steps": 23},
+     "缓存"),
+    ("极端大", {"context": 999999, "contextWindow": 1000000, "input": 99999999,
+                "output": 99999999, "cacheRead": 99999999, "turn": 999, "steps": 9999},
+     "累计"),
+    ("只有累计", {"context": 1000, "input": 123456, "output": 789}, "累计"),
+):
+    items = []
+    if st.get("input"):
+        items.append(f"累计 {r.kfmt(st['input'])}/{r.kfmt(st['output'])}")
+    if st.get("input") and st.get("cacheRead"):
+        items.append(f"缓存{round(100 * st['cacheRead'] / st['input'])}%")
+    turns = "".join(x for x in (
+        f"{st['turn']}轮" if st.get("turn") else "",
+        f"{st['steps']}步" if st.get("steps") else "",
+    ) if x)
+    if turns:
+        items.append(turns)
+    line = r.pack_items(items, fstats, r.W - 56)
+    check(r.width_of(line, fstats) <= r.W - 56,
+          f"{label}：装箱后 {r.width_of(line, fstats):.0f}px ≤ {r.W - 56}px（{line}）")
+    check(expect in line, f"{label}：保住了「{expect}」")
+packed_typical = r.pack_items(["累计 210K/48.0K", "缓存76%", "7轮23步"],
+                              fstats, r.W - 56)
+check("累计" in packed_typical and "缓存" in packed_typical and "23步" in packed_typical,
+      f"典型值下四项都在：{packed_typical}")
+check("累计" in r.pack_items(["累计 1/2", "第 1 轮", "1 步"], fstats, r.W - 56),
+      "放得下时不丢任何一项")
+check(r.pack_items(["累计 1/2", "第 1 轮"], fstats, 30) == "",
+      "连第一项都放不下时返回空串，而不是画到屏幕外")
+check(r.width_of("上下文 128K / 1000K", fstats) <= r.W - 56 - 60,
+      "含窗口的上下文行也给百分比留了位置")
+
+
+def bottom_ink(im, h=70):
+    band = im.crop((0, r.H - h, r.W, r.H)).tobytes()
+    return sum(1 for i in range(0, len(band), 3) if band[i] or band[i + 1] or band[i + 2])
+
+
+no_stats, _ = r.PAGES["status"]({"state": "tool", "detail": "x"})
+with_stats, _ = r.PAGES["status"]({
+    "state": "tool", "detail": "x",
+    "stats": {"context": 48213, "contextWindow": 128000, "input": 210000,
+              "output": 48000, "cacheRead": 160000, "turn": 7, "steps": 23}})
+check(bottom_ink(no_stats) == 0, "没有数字时底部留白，不画空条")
+check(bottom_ink(with_stats) > 400,
+      f"有数字时底部画出统计条（非黑像素 {bottom_ink(with_stats)}）")
+
+print("上下文占比：接近上限要变色提醒")
+near = r.PAGES["status"]({"state": "tool",
+                          "stats": {"context": 102000, "contextWindow": 128000}})[0]
+over = r.PAGES["status"]({"state": "tool",
+                          "stats": {"context": 110000, "contextWindow": 128000}})[0]
+check(near.tobytes() != over.tobytes(), "跨过 80% 时画面变化（转警告色）")
+only_ctx = r.PAGES["status"]({"state": "tool", "stats": {"context": 5000}})[0]
+check(only_ctx.size == (r.W, r.H), "没有窗口大小时不画百分比、也不崩")
+check(bottom_ink(only_ctx) > 100, "只有上下文用量时也画出那一行")
+
 print("日志条目：字符串与结构化对象都要能画")
 img_mix, _ = r.PAGES["status"]({"state": "tool", "tool": "bash",
                                 "log": ["纯字符串", {"kind": "tool", "tool": "edit",

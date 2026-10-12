@@ -66,8 +66,13 @@ export function render(job) {
 const listeners = new Map();
 const registered = [];
 const effects = [];
+// The root conversation vs a subagent's session. Usage from the first must be counted
+// and from the second ignored, so the mock registry has to tell them apart.
+const ROOT_SESSION = { who: 'root' };
+const SUBAGENT_SESSION = { who: 'subagent' };
 const ctx = {
     tools: { register: (t) => registered.push(t) },
+    agents: { roots: () => [{ session: ROOT_SESSION }] },
     on: (ev, fn) => {
         if (!listeners.has(ev)) listeners.set(ev, []);
         listeners.get(ev).push(fn);
@@ -92,7 +97,7 @@ const fire = async (ev, ...args) => {
 };
 const job = () => (globalThis.__jobs || []).at(-1) || {};
 const pre = (name, args) => fire('tools/pre-execute', { name, arguments: args }, () => {});
-const reply = (text) => fire('session/event', null,
+const reply = (text) => fire('session/event', ROOT_SESSION,
     { type: 'assistant/message', message: { content: [{ type: 'text', text }] } });
 
 console.log('构建指纹');
@@ -179,6 +184,50 @@ await fire('agent/error', { error: circular });
 check(typeof job().detail === 'string', '循环引用的错误对象不会让处理函数抛异常');
 await fire('agent/error', { error: new Error('x'.repeat(200)) });
 check(job().detail.length <= 40, `超长错误信息被截断到 ${job().detail.length} 字`);
+
+console.log('会话数字（上下文 / token 用量 / 轮次）');
+// 前面的读图/回复已经产生过 assistant/message，所以步数用相对基准断言，
+// 免得把"测试自己早先制造的步数"算进来。
+const baseSteps = job().stats?.steps ?? 0;
+await fire('session/event', ROOT_SESSION,
+    { type: 'request/context', provider: 'deepseek', model: 'x', contextWindow: 128000 });
+check(job().stats?.contextWindow === 128000,
+    `窗口来自 request/context 事件：${job().stats?.contextWindow}`);
+
+await fire('session/event', ROOT_SESSION, {
+    type: 'assistant/message', turn: 3, step: 2,
+    usage: { inputTokens: 40000, outputTokens: 1200, cacheReadTokens: 32000 },
+});
+let st = job().stats;
+check(st?.context === 41200, `上下文用量 = 最近一次请求+回复：${st?.context}`);
+check(st?.input === 40000 && st?.output === 1200, `累计 in/out：${st?.input}/${st?.output}`);
+check(st?.cacheRead === 32000, `缓存读取累计：${st?.cacheRead}`);
+check(st?.turn === 3 && st?.steps === baseSteps + 1,
+    `轮次与步数：第 ${st?.turn} 轮 / 共 ${st?.steps} 步`);
+
+await fire('session/event', ROOT_SESSION, {
+    type: 'assistant/message', turn: 3, step: 3,
+    usage: { inputTokens: 45000, outputTokens: 800 },
+});
+st = job().stats;
+check(st?.input === 85000 && st?.steps === baseSteps + 2,
+    `多次调用会累加：in=${st?.input} steps=${st?.steps}`);
+check(st?.context === 45800, `上下文跟随最新一次：${st?.context}`);
+
+await fire('session/event', SUBAGENT_SESSION, {
+    type: 'assistant/message', turn: 1, step: 1,
+    usage: { inputTokens: 999999, outputTokens: 999999 },
+});
+check(job().stats?.input === 85000,
+    `子代理会话的用量被排除在外（in 仍是 ${job().stats?.input}）`);
+check(job().stats?.steps === baseSteps + 2, '子代理的消息也不计步数');
+await fire('session/event', SUBAGENT_SESSION,
+    { type: 'request/context', contextWindow: 8000 });
+check(job().stats?.contextWindow === 128000, '子代理的窗口也不会覆盖根会话的');
+
+await fire('session/event', ROOT_SESSION, { type: 'assistant/message', turn: 4, step: 1 });
+check(job().stats?.steps === baseSteps + 3, '没有 usage 的消息只计步数');
+check(job().stats?.input === 85000, '没有 usage 的消息不会把累计清零或重复计');
 
 for (const dispose of effects) {
     if (typeof dispose === 'function') dispose();

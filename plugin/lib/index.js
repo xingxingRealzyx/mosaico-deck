@@ -50,7 +50,9 @@ import { Deck, findPort } from './device.js';
 import { render, checkEnvironment } from './render.js';
 
 export const name = 'mosaico-deck';
-export const inject = ['tools'];
+// `agents` is used only to tell the root conversation from the subagent sessions that
+// emit on the same bus: without that check a subagent's tokens land in the user's totals.
+export const inject = ['tools', 'agents'];
 
 /** Short hash of this very file, reported at load and by deck_connect.
  *
@@ -124,6 +126,18 @@ export function apply(ctx) {
         elapsed: 0,
         startedAt: 0,
         log: [],
+        // Numbers for the bottom strip. All of it arrives on host events -- the window
+        // from `request/context`, the counts from `assistant/message`'s usage -- so
+        // nothing here is estimated.
+        stats: {
+            context: 0,       // tokens the latest request+reply actually occupied
+            contextWindow: 0, // adapter-declared capacity, when advertised
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            turn: 0,
+            steps: 0,
+        },
         asking: null, // { resolve, options } while waiting for a tap
         audio: Buffer.alloc(0), // captured PCM while the user holds the key
     };
@@ -189,6 +203,7 @@ export function apply(ctx) {
                 progress: state.progress,
                 elapsed: state.elapsed,
                 log: state.log,
+                stats: state.stats,
                 // Tap targets exist only while a question is pending. Drawing
                 // them otherwise is noise, and a stray tap is expensive.
                 buttons: state.asking ? null : undefined,
@@ -201,6 +216,46 @@ export function apply(ctx) {
         } finally {
             painting = false;
         }
+    }
+
+    /** Is this the user's own conversation, rather than a subagent's?
+     *
+     * Every live agent shares this event bus, so a subagent reading files and running
+     * tests emits `assistant/message` just like the main loop does. Counting those
+     * would quietly inflate the numbers the user is reading as *their* session. When
+     * the registry cannot answer, count it: a slightly high number beats a blank panel.
+     */
+    function isRootSession(session) {
+        try {
+            const roots = ctx.agents?.roots?.();
+            if (!Array.isArray(roots) || roots.length === 0) return true;
+            return roots.some((a) => a?.session === session);
+        } catch {
+            return true;
+        }
+    }
+
+    /** Fold one `assistant/message`'s usage into the session totals. */
+    function accumulateUsage(event) {
+        const u = event?.usage;
+        if (u && typeof u === 'object') {
+            const inTok = numOr0(u.inputTokens);
+            const outTok = numOr0(u.outputTokens);
+            state.stats.input += inTok;
+            state.stats.output += outTok;
+            state.stats.cacheRead += numOr0(u.cacheReadTokens);
+            // Latest request pressure = what the provider just charged for this
+            // prompt and its reply. That is the honest "how full is the context".
+            const total = numOr0(u.totalTokens) || (inTok + outTok);
+            if (total > 0) state.stats.context = total;
+        }
+        if (Number.isInteger(event?.turn)) state.stats.turn = event.turn;
+        if (Number.isInteger(event?.step)) state.stats.step = event.step;
+        state.stats.steps += 1;
+    }
+
+    function numOr0(v) {
+        return Number.isFinite(v) ? v : 0;
     }
 
     /** Pull a readable tool name and argument out of a ToolExecution.
@@ -336,13 +391,30 @@ export function apply(ctx) {
     //
     //     session/event(session, event)                                        emit
     //     event = { type: 'assistant/message', turn, step, message, stream, usage? }
+    //     event = { type: 'request/context', provider, model, contextWindow? }
     //
     // Subscribing to the bare name was dead code: it never fired, so the assistant
     // text and the "replied" log line never appeared on the device. It went unnoticed
     // because the load self-test fires handlers by name; selftest.mjs now also asserts
     // that every subscribed name is part of the host's real event surface.
-    ctx.on('session/event', (_session, event) => {
-        if (event?.type !== 'assistant/message') return;
+    ctx.on('session/event', (session, event) => {
+        if (!event?.type) return;
+
+        // The adapter's declared capacity for this route, logged whenever the route or
+        // its capacity changes -- which is where the percentage on the strip comes
+        // from. No model lookup, no guessing.
+        if (event.type === 'request/context') {
+            if (isRootSession(session)
+                && Number.isInteger(event.contextWindow) && event.contextWindow > 0
+                && event.contextWindow !== state.stats.contextWindow) {
+                state.stats.contextWindow = event.contextWindow;
+                void paint();
+            }
+            return;
+        }
+
+        if (event.type !== 'assistant/message') return;
+        if (isRootSession(session)) accumulateUsage(event);
         try {
             const content = event.message?.content;
             const text = Array.isArray(content)

@@ -102,6 +102,15 @@ S_BOOT = 36
 IMG_MAX_W = W - 56
 IMG_MAX_H = 250
 
+# Bottom strip: where the conversation stands -- context pressure, cumulative tokens,
+# turn and step. Always visible, because "how full is the context" is the one number a
+# user cannot get without switching windows, which is the reason this panel exists.
+#
+# The height is a budget, not a guess: divider + two text lines + a bottom margin. An
+# earlier value clipped the second line at the panel edge ("23 步" simply was not there).
+S_STATS = 20
+STATS_H = 78
+
 # Every entry is (path, face index inside the file).
 #
 # **Index 2, not 1.** This .ttc holds four faces and the numbering is a trap:
@@ -194,7 +203,89 @@ def parse_log(entry):
     return "info", str(entry), None
 
 
-def draw_image_preview(img, d, path, y):
+def kfmt(n):
+    """Compact token counts: 950 -> "950", 48213 -> "48.2K", 128000 -> "128K"."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 0:
+        return "—"
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        # One decimal only while it still adds information: 48.2K, but 128K not 128.0K.
+        return f"{n / 1000:.1f}K" if n < 100_000 else f"{round(n / 1000)}K"
+    return f"{n / 1_000_000:.1f}M" if n < 10_000_000 else f"{round(n / 1_000_000)}M"
+
+
+def pack_items(items, f, max_w):
+    """Join `items` with ' · ', dropping from the end until the line fits.
+
+    Dropping the least important number beats both alternatives: drawing past the edge
+    (which silently cut "23 步" off the panel) and ellipsising the whole line (which
+    loses the important number to save the trivial one). Items are passed in priority
+    order, so a session with very large counts sheds the trailing extras and keeps
+    the token totals.
+    """
+    out = [str(x) for x in items if x]
+    while out:
+        text = " · ".join(out)
+        if width_of(text, f) <= max_w:
+            return text
+        out.pop()
+    return ""
+
+
+def draw_stats(d, job):
+    """Two lines of session numbers pinned to the bottom. Returns the height used.
+
+    Nothing here is invented: the window comes from the host's `request/context`
+    session event and the counts from `assistant/message`'s usage field.
+    """
+    s = job.get("stats") or {}
+    context = int(s.get("context") or 0)
+    if not context:
+        return 0
+    top = H - STATS_H + 6
+    d.line((28, top, W - 28, top), fill=BORDER, width=1)
+    f = font(S_STATS)
+    y = top + 10
+
+    window = int(s.get("contextWindow") or 0)
+    head = f"上下文 {kfmt(context)}" + (f" / {kfmt(window)}" if window else "")
+    d.text((28, y), head, font=f, fill=TEXT)
+    if window:
+        pct = min(999, round(100 * context / window))
+        # Warn as the window fills: that is when the host starts compacting.
+        d.text((W - 28, y), f"{pct}%", font=f,
+               fill=WARN if pct >= 80 else TEXT_SOFT, anchor="ra")
+
+    y += S_STATS + 8
+    # One packed line, most important first. A fixed two-column split was tried and
+    # overflowed silently at large counts.
+    items = []
+    if s.get("input"):
+        items.append(f"累计 {kfmt(s['input'])}/{kfmt(s['output'])}")
+    if s.get("input") and s.get("cacheRead"):
+        items.append(f"缓存{round(100 * s['cacheRead'] / s['input'])}%")
+    # Turn and step as one item: they answer one question ("how far along is this"), and
+    # keeping them together is what leaves room for the cache figure too. No spaces
+    # between number and unit -- that is ~20px, which is the difference between fitting
+    # all four items and silently shedding one.
+    turns = "".join(x for x in (
+        f"{s['turn']}轮" if s.get("turn") else "",
+        f"{s['steps']}步" if s.get("steps") else "",
+    ) if x)
+    if turns:
+        items.append(turns)
+    line = pack_items(items, f, W - 56)
+    if line:
+        d.text((28, y), line, font=f, fill=TEXT_SOFT)
+    return STATS_H
+
+
+def draw_image_preview(img, d, path, y, max_h=None):
     """Fit the picture at `path` into the preview box whose top edge is `y`.
 
     Returns (drawn height, "WxH" of the source, error string).
@@ -203,7 +294,8 @@ def draw_image_preview(img, d, path, y):
     stay visible above it. An earlier version replaced the whole panel with the
     picture, which hid exactly the information the panel exists to show.
     """
-    box_w, box_h = IMG_MAX_W, IMG_MAX_H
+    box_w = IMG_MAX_W
+    box_h = min(IMG_MAX_H, max_h) if max_h else IMG_MAX_H
     try:
         with Image.open(path) as src:
             # draft() lets libjpeg decode straight to a smaller size, so a 50MP photo
@@ -211,7 +303,7 @@ def draw_image_preview(img, d, path, y):
             src.draft("RGB", (box_w * 2, box_h * 2))
             pic = ImageOps.exif_transpose(src).convert("RGB")
         dims = f"{pic.width}×{pic.height}"
-        pic.thumbnail((box_w, box_h), Image.LANCZOS)
+        pic.thumbnail((max(box_w, 1), max(box_h, 1)), Image.LANCZOS)
         x = (W - pic.width) // 2
         img.paste(pic, (x, y))
         # A thin outline: a dark screenshot on a black background would otherwise have
@@ -272,10 +364,16 @@ def draw_status(d, img, job):
             d.text((28, y), fit(job["detail"], f, W - 56), font=f, fill=TEXT)
             y += S_DETAIL + 18
 
+    # The stats strip is always present, so the picture is fitted into whatever is
+    # left above it rather than a fixed box.
+    stats_h = STATS_H if (job.get("stats") or {}).get("context") else 0
+
     if picture:
         sy = y + 4
         d.line((28, sy, W - 28, sy), fill=BORDER, width=1)
-        used, dims, err = draw_image_preview(img, d, picture, sy + 18)
+        py = sy + 18
+        room = (H - stats_h - 16) - py - 36          # caption gets the last 36px
+        used, dims, err = draw_image_preview(img, d, picture, py, max(80, room))
         bits = [os.path.basename(str(picture)) or str(picture)]
         if dims:
             bits.append(dims)
@@ -283,8 +381,9 @@ def draw_status(d, img, job):
         if isinstance(left, int) and left > 0:
             bits.append(f"{left}s")     # auto-clears; say when
         f_cap = font(S_FOOTER)
-        d.text((28, sy + 18 + used + 12), fit(" · ".join(bits), f_cap, W - 56),
+        d.text((28, py + used + 12), fit(" · ".join(bits), f_cap, W - 56),
                font=f_cap, fill=ERR if err else TEXT_SOFT)
+        draw_stats(d, job)
         return
 
     progress = job.get("progress")
@@ -306,7 +405,7 @@ def draw_status(d, img, job):
     f_log = font(S_LOG)
     step = S_LOG + 14
     buttons = job.get("buttons") or []
-    floor = (H - 100 - 14) if buttons else (H - 22)
+    floor = (H - 100 - 14) if buttons else (H - 22 - stats_h)
 
     if log:
         sy = y + 6
@@ -323,6 +422,8 @@ def draw_status(d, img, job):
             d.text((48, ly), fit(text, f_log, W - 48 - 28), font=f_log,
                    fill=TEXT_SOFT)
             ly += step
+
+    draw_stats(d, job)
 
 
 def draw_buttons(d, job):
